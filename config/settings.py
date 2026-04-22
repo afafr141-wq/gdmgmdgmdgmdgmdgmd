@@ -1,6 +1,9 @@
 """
 Central configuration: loads env vars and provides symbol precision helpers.
 
+On Railway, all variables are injected directly into the process environment —
+load_dotenv() is a no-op there but still works for local development.
+
 Precision data is fetched once from MEXC /api/v3/exchangeInfo and cached
 so every module can call get_precision(symbol) without extra HTTP calls.
 """
@@ -9,21 +12,29 @@ import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # no-op on Railway; used for local .env files
 
 logger = logging.getLogger(__name__)
 
 # ── Credentials ────────────────────────────────────────────────────────────────
 MEXC_API_KEY: str = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY: str = os.getenv("MEXC_SECRET_KEY", "")
-
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-# Comma-separated list of Telegram user IDs allowed to control the bot
+# Comma-separated Telegram user IDs allowed to control the bot
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: set[int] = {
     int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip().isdigit()
 }
+
+# ── Runtime paths ──────────────────────────────────────────────────────────────
+# On Railway, mount a persistent volume at /data and set STATE_PATH=/data/state.json
+# so state survives deploys. Falls back to local data/ for development.
+STATE_PATH: str = os.getenv("STATE_PATH", "data/state.json")
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+# Set LOG_LEVEL=DEBUG in Railway dashboard for verbose output during debugging.
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
 # ── MEXC REST endpoints ────────────────────────────────────────────────────────
 MEXC_BASE_URL: str = "https://api.mexc.com"
@@ -31,13 +42,13 @@ MEXC_WS_URL: str = "wss://wbs.mexc.com/ws"
 
 # ── WebSocket settings ─────────────────────────────────────────────────────────
 WS_HEARTBEAT_INTERVAL: int = 20   # seconds between PING frames
-WS_RECONNECT_DELAY: int = 5       # seconds before reconnect attempt
+WS_RECONNECT_DELAY: int = 5       # seconds before first reconnect attempt
 
 # ── Strategy defaults (overridden per /setup call) ────────────────────────────
 DEFAULT_WALL_MULTIPLIER: float = 3.0   # volume > avg * multiplier → wall
 DEFAULT_SMA_PERIOD: int = 20
-DEFAULT_STOP_LOSS_PCT: float = 0.985   # 1.5 % below entry
-DEFAULT_TAKE_PROFIT_PCT: float = 1.02  # 2 % above entry
+DEFAULT_STOP_LOSS_PCT: float = 0.985   # 1.5% below entry
+DEFAULT_TAKE_PROFIT_PCT: float = 1.02  # 2% above entry
 
 # ── Precision cache ────────────────────────────────────────────────────────────
 # Populated at startup by fetch_precision(); shape:

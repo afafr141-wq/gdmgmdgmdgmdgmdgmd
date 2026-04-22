@@ -14,11 +14,16 @@ Commands:
 
 All commands are restricted to ALLOWED_USER_IDS from .env.
 The bot uses python-telegram-bot v20+ (Application / async handlers).
+
+Public functions used by main.py:
+    build_application() -> Application
+    recover_state(app)  -> None   (called from post_init hook on every startup)
 """
 
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -30,18 +35,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from config.settings import ALLOWED_USER_IDS, TELEGRAM_BOT_TOKEN
+from config.settings import (
+    ALLOWED_USER_IDS,
+    STATE_PATH,
+    TELEGRAM_BOT_TOKEN,
+    get_precision,
+)
 from core import trade_exec
 from core.analyzer import MarketAnalyzer
 from core.mexc_ws import MexcWebSocket
-from config.settings import get_precision
 
 if TYPE_CHECKING:
     from core.trade_exec import VirtualStopLossWatcher
 
 logger = logging.getLogger(__name__)
-
-STATE_PATH = "data/state.json"
 
 
 # ── Shared bot state ───────────────────────────────────────────────────────────
@@ -58,7 +65,6 @@ class BotState:
         self.fill_poll_task: asyncio.Task | None = None
         self.running: bool = False
 
-        # Loaded from / persisted to state.json
         self.config: dict = {}
         self.trade: dict = {}
         self.session: dict = {}
@@ -66,18 +72,27 @@ class BotState:
         self._load()
 
     def _load(self) -> None:
+        """Load persisted state from disk. Safe to call at any time."""
         try:
+            os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
             with open(STATE_PATH) as f:
                 data = json.load(f)
             self.config = data.get("config", {})
             self.trade = data.get("trade", {})
             self.session = data.get("session", {})
+            logger.info(
+                "State loaded: trade_status=%s symbol=%s",
+                self.trade.get("status", "idle"),
+                self.config.get("symbol", "—"),
+            )
         except (FileNotFoundError, json.JSONDecodeError):
             self.config = {}
             self.trade = {"status": "idle"}
             self.session = {"total_trades": 0, "total_pnl": 0.0, "wins": 0, "losses": 0}
+            logger.info("No existing state found — starting fresh")
 
     def save(self) -> None:
+        os.makedirs(os.path.dirname(STATE_PATH) or ".", exist_ok=True)
         with open(STATE_PATH, "w") as f:
             json.dump(
                 {"config": self.config, "trade": self.trade, "session": self.session},
@@ -98,6 +113,7 @@ class BotState:
             "pnl": None,
             "exit_reason": None,
         }
+        self.running = False
         self.save()
 
 
@@ -114,13 +130,10 @@ async def _deny(update: Update) -> None:
     await update.message.reply_text("⛔ Unauthorized.")
 
 
-# ── Telegram notifier (used by VirtualSL and other modules) ───────────────────
+# ── Telegram notifier ──────────────────────────────────────────────────────────
 
 async def send_alert(text: str, application: Application | None = None) -> None:
-    """
-    Send a Markdown message to all allowed users.
-    Falls back to logging if the application is not available.
-    """
+    """Send a Markdown message to all ALLOWED_USER_IDS."""
     if not ALLOWED_USER_IDS:
         logger.warning("No ALLOWED_USER_IDS configured — cannot send alert")
         return
@@ -139,12 +152,9 @@ async def send_alert(text: str, application: Application | None = None) -> None:
 # ── WebSocket handlers ─────────────────────────────────────────────────────────
 
 async def _on_ticker(msg: dict) -> None:
-    """
-    Handle spot@public.miniTicker.v3.api messages.
-    Updates the analyzer price and feeds the SL watcher.
-    """
+    """Handle miniTicker messages: update analyzer price and SL watcher."""
     data = msg.get("d", {})
-    price_str = data.get("c") or data.get("p")  # last price or close
+    price_str = data.get("c") or data.get("p")
     if not price_str:
         return
     try:
@@ -153,13 +163,12 @@ async def _on_ticker(msg: dict) -> None:
         return
 
     _state.analyzer.update_price(price)
-
     if _state.sl_watcher:
         _state.sl_watcher.update_price(price)
 
 
 async def _on_depth(msg: dict) -> None:
-    """Handle spot@public.increase.depth.v3.api order-book messages."""
+    """Handle order-book depth messages."""
     data = msg.get("d", {})
     bids = data.get("bids", [])
     asks = data.get("asks", [])
@@ -167,24 +176,64 @@ async def _on_depth(msg: dict) -> None:
         _state.analyzer.update_depth(bids, asks)
 
 
+# ── Internal helpers ───────────────────────────────────────────────────────────
+
+def _start_ws(symbol: str) -> None:
+    """Subscribe to WS streams and start the connection task if not running."""
+    _state.ws.subscribe(f"spot@public.miniTicker.v3.api@{symbol}", _on_ticker)
+    _state.ws.subscribe(f"spot@public.increase.depth.v3.api@{symbol}@5", _on_depth)
+    if _state.ws_task is None or _state.ws_task.done():
+        _state.ws_task = asyncio.create_task(_state.ws.run())
+        logger.info("WebSocket task started for %s", symbol)
+
+
+def _arm_sl_watcher(
+    symbol: str,
+    entry_price: float,
+    entry_qty: float,
+    exit_order_id: str | None,
+    sl_pct: float,
+    application: Application,
+) -> None:
+    """Create and start the Virtual Stop-Loss watcher task."""
+
+    async def _notifier(text: str) -> None:
+        await send_alert(text, application)
+
+    async def _on_sl_triggered() -> None:
+        _state.reset_trade()
+        _state.sl_watcher = None
+
+    watcher = trade_exec.VirtualStopLossWatcher(
+        symbol=symbol,
+        entry_price=entry_price,
+        qty=entry_qty,
+        exit_order_id=exit_order_id,
+        stop_loss_pct=sl_pct,
+        notifier=_notifier,
+        on_triggered=_on_sl_triggered,
+    )
+    _state.sl_watcher = watcher
+    _state.sl_task = asyncio.create_task(watcher.run())
+    logger.info(
+        "Virtual SL watcher armed: entry=%.8f sl=%.8f", entry_price, entry_price * sl_pct
+    )
+
+
 # ── Strategy orchestration ─────────────────────────────────────────────────────
 
 async def _on_order_filled(order: dict, application: Application) -> None:
     """
     Called when the limit buy order is confirmed FILLED.
-    1. Records entry details in state.
-    2. Places the limit take-profit sell.
-    3. Arms the Virtual Stop-Loss watcher.
+    Places the take-profit limit sell and arms the Virtual SL watcher.
     """
     symbol: str = _state.config["symbol"]
     entry_price = float(order.get("price", 0))
     entry_qty = float(order.get("executedQty", 0))
     sl_pct: float = _state.config.get("stop_loss_pct", 0.985)
     tp_pct: float = _state.config.get("take_profit_pct", 1.02)
-
     tp_price = round(entry_price * tp_pct, get_precision(symbol)["price_precision"])
 
-    # Place take-profit limit sell
     try:
         tp_resp = await trade_exec.place_limit_sell(symbol, tp_price, entry_qty)
         exit_order_id = tp_resp.get("orderId")
@@ -192,7 +241,6 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         logger.error("Failed to place TP sell: %s", exc)
         exit_order_id = None
 
-    # Persist trade state
     _state.trade.update({
         "status": "open",
         "entry_price": entry_price,
@@ -214,26 +262,7 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         application,
     )
 
-    # Arm Virtual Stop-Loss
-    async def _notifier(text: str) -> None:
-        await send_alert(text, application)
-
-    async def _on_sl_triggered() -> None:
-        _state.reset_trade()
-        _state.sl_watcher = None
-
-    watcher = trade_exec.VirtualStopLossWatcher(
-        symbol=symbol,
-        entry_price=entry_price,
-        qty=entry_qty,
-        exit_order_id=exit_order_id,
-        stop_loss_pct=sl_pct,
-        notifier=_notifier,
-        on_triggered=_on_sl_triggered,
-    )
-    _state.sl_watcher = watcher
-    _state.sl_task = asyncio.create_task(watcher.run())
-    logger.info("Virtual SL watcher task created")
+    _arm_sl_watcher(symbol, entry_price, entry_qty, exit_order_id, sl_pct, application)
 
 
 async def _start_strategy(application: Application) -> None:
@@ -245,28 +274,16 @@ async def _start_strategy(application: Application) -> None:
     quote_amount: float = _state.config["quote_amount"]
     tick_size: float = float(get_precision(symbol)["tick_size"])
 
-    # Subscribe to ticker and depth streams
-    ticker_topic = f"spot@public.miniTicker.v3.api@{symbol}"
-    depth_topic = f"spot@public.increase.depth.v3.api@{symbol}@5"
+    _start_ws(symbol)
+    await asyncio.sleep(3)  # allow initial market data to arrive
 
-    _state.ws.subscribe(ticker_topic, _on_ticker)
-    _state.ws.subscribe(depth_topic, _on_depth)
-
-    if _state.ws_task is None or _state.ws_task.done():
-        _state.ws_task = asyncio.create_task(_state.ws.run())
-        logger.info("WebSocket task started")
-
-    # Wait briefly for initial data
-    await asyncio.sleep(3)
-
-    # Reconfigure analyzer with current settings
     _state.analyzer = MarketAnalyzer(
         wall_multiplier=_state.config.get("wall_multiplier", 3.0),
         sma_period=_state.config.get("sma_period", 20),
         price_precision=get_precision(symbol)["price_precision"],
     )
 
-    # Scan for entry signal (retry loop — waits for SMA to warm up)
+    # Retry loop — waits for SMA-20 to warm up (up to 60 s)
     signal = None
     for attempt in range(30):
         signal = _state.analyzer.find_entry_signal(tick_size)
@@ -281,13 +298,14 @@ async def _start_strategy(application: Application) -> None:
             "Check market conditions or adjust wall multiplier.",
             application,
         )
+        _state.running = False
         return
 
-    # Place limit buy
     try:
         buy_resp = await trade_exec.place_limit_buy(symbol, signal.entry_price, quote_amount)
     except Exception as exc:
         await send_alert(f"❌ *Limit buy failed:* `{exc}`", application)
+        _state.running = False
         return
 
     order_id = buy_resp.get("orderId")
@@ -308,12 +326,145 @@ async def _start_strategy(application: Application) -> None:
         application,
     )
 
-    # Start fill poller
     async def _filled_cb(order: dict) -> None:
         await _on_order_filled(order, application)
 
     _state.fill_poll_task = asyncio.create_task(
         trade_exec.poll_order_fill(symbol, order_id, _filled_cb)
+    )
+
+
+# ── State recovery (called on every startup via post_init) ─────────────────────
+
+async def recover_state(application: Application) -> None:
+    """
+    Re-attach live monitoring after a restart without requiring a new /setup.
+
+    Three cases based on trade.status in state.json:
+
+    idle          → nothing to recover; send a clean-start notification.
+
+    pending_fill  → the limit buy was placed but not yet filled before the
+                    restart. Re-attach the fill poller so we still catch the
+                    fill and arm the SL watcher when it happens.
+
+    open          → the position is live. Re-attach the WebSocket and re-arm
+                    the Virtual Stop-Loss watcher immediately using the entry
+                    price and qty already stored in state.
+    """
+    trade_status = _state.trade.get("status", "idle")
+    symbol = _state.config.get("symbol")
+
+    logger.info("recover_state: trade_status=%s symbol=%s", trade_status, symbol)
+
+    # ── Case 1: nothing active ─────────────────────────────────────────────────
+    if trade_status == "idle" or not symbol:
+        await send_alert(
+            "🚀 *Bot started.*\n\nNo active trade found. Use /setup to begin.",
+            application,
+        )
+        return
+
+    # Precision lives only in memory — must be re-fetched on every cold start.
+    try:
+        await trade_exec.fetch_precision(symbol)
+    except Exception as exc:
+        logger.error("Could not fetch precision on recovery: %s", exc)
+        await send_alert(
+            f"⚠️ *Bot restarted* but failed to fetch precision for `{symbol}`.\n"
+            f"Error: `{exc}`\n\nUse /emergency_stop then /setup to restart safely.",
+            application,
+        )
+        return
+
+    # ── Case 2: waiting for limit buy to fill ──────────────────────────────────
+    if trade_status == "pending_fill":
+        order_id = _state.trade.get("entry_order_id")
+        if not order_id:
+            logger.warning("pending_fill state but no entry_order_id — resetting")
+            _state.reset_trade()
+            await send_alert(
+                "⚠️ *Bot restarted.* Inconsistent pending_fill state — trade reset.\n"
+                "Use /setup to begin a new trade.",
+                application,
+            )
+            return
+
+        _state.running = True
+        _start_ws(symbol)
+
+        async def _filled_cb(order: dict) -> None:
+            await _on_order_filled(order, application)
+
+        _state.fill_poll_task = asyncio.create_task(
+            trade_exec.poll_order_fill(symbol, order_id, _filled_cb)
+        )
+
+        await send_alert(
+            "🚀 *Bot restarted and synchronised with current state.*\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Status: Waiting for fill on order `{order_id}`\n"
+            f"Entry price: `{_state.trade.get('entry_price')}`\n\n"
+            "WebSocket and fill poller re-attached.",
+            application,
+        )
+        logger.info("Recovery: fill poller re-attached for order %s", order_id)
+        return
+
+    # ── Case 3: position is open — re-arm SL watcher ──────────────────────────
+    if trade_status == "open":
+        entry_price = _state.trade.get("entry_price")
+        entry_qty = _state.trade.get("entry_qty")
+        exit_order_id = _state.trade.get("exit_order_id")
+        sl_pct: float = _state.config.get("stop_loss_pct", 0.985)
+
+        if not entry_price or not entry_qty:
+            logger.warning("open state but missing entry_price/qty — resetting")
+            _state.reset_trade()
+            await send_alert(
+                "⚠️ *Bot restarted.* Open trade state is incomplete — trade reset.\n"
+                "Check your MEXC account manually, then use /setup.",
+                application,
+            )
+            return
+
+        _state.running = True
+        _start_ws(symbol)
+        _arm_sl_watcher(
+            symbol=symbol,
+            entry_price=float(entry_price),
+            entry_qty=float(entry_qty),
+            exit_order_id=exit_order_id,
+            sl_pct=sl_pct,
+            application=application,
+        )
+
+        sl_price = round(float(entry_price) * sl_pct, 8)
+        tp_price = _state.trade.get("take_profit_price", "—")
+
+        await send_alert(
+            "🚀 *Bot restarted and synchronised with current state.*\n\n"
+            f"Symbol: `{symbol}`\n"
+            f"Entry: `{entry_price}`\n"
+            f"Qty: `{entry_qty}`\n"
+            f"Stop-loss: `{sl_price}`\n"
+            f"Take-profit: `{tp_price}`\n\n"
+            "WebSocket and Virtual Stop-Loss watcher re-attached.",
+            application,
+        )
+        logger.info(
+            "Recovery: SL watcher re-armed for %s entry=%.8f sl=%.8f",
+            symbol, float(entry_price), sl_price,
+        )
+        return
+
+    # ── Unexpected status ──────────────────────────────────────────────────────
+    logger.warning("Unrecognised trade status '%s' on recovery — resetting", trade_status)
+    _state.reset_trade()
+    await send_alert(
+        f"⚠️ *Bot restarted.* Unknown trade status `{trade_status}` — state reset.\n"
+        "Use /setup to begin.",
+        application,
     )
 
 
@@ -352,14 +503,15 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⚠️ Bot is already running. Use /emergency_stop first.")
         return
 
-    # Fetch precision from MEXC
-    await update.message.reply_text(f"🔍 Fetching precision for `{symbol}`…",
-                                    parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        f"🔍 Fetching precision for `{symbol}`…", parse_mode=ParseMode.MARKDOWN
+    )
     try:
         await trade_exec.fetch_precision(symbol)
     except Exception as exc:
-        await update.message.reply_text(f"❌ Failed to fetch symbol info: `{exc}`",
-                                        parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            f"❌ Failed to fetch symbol info: `{exc}`", parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     prec = get_precision(symbol)
@@ -406,20 +558,24 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     sma = _state.analyzer.sma()
     sma_str = f"`{sma:.8f}`" if sma else "_not ready_"
 
+    current_price = _state.analyzer._current_price
+    price_str = f"`{current_price:.8f}`" if current_price else "_no data_"
+
     lines = [
-        f"📊 *Bot Status*",
-        f"",
+        "📊 *Bot Status*",
+        "",
         f"*Symbol:* `{symbol}`",
         f"*Running:* `{_state.running}`",
         f"*Trade status:* `{trade.get('status', 'idle')}`",
-        f"",
+        "",
+        f"*Live price:* {price_str}",
+        f"*SMA-20:* {sma_str}",
+        "",
         f"*Entry price:* `{trade.get('entry_price', '—')}`",
         f"*Entry qty:* `{trade.get('entry_qty', '—')}`",
         f"*Stop-loss:* `{trade.get('stop_loss_price', '—')}`",
         f"*Take-profit:* `{trade.get('take_profit_price', '—')}`",
-        f"",
-        f"*SMA-20:* {sma_str}",
-        f"",
+        "",
         f"*Session trades:* `{sess.get('total_trades', 0)}`",
         f"*Session P&L:* `{sess.get('total_pnl', 0.0):.4f}`",
         f"*Wins / Losses:* `{sess.get('wins', 0)} / {sess.get('losses', 0)}`",
@@ -433,45 +589,56 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _deny(update)
         return
 
-    await update.message.reply_text("🛑 *Emergency stop initiated…*", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🛑 *Emergency stop initiated…*", parse_mode=ParseMode.MARKDOWN
+    )
 
     symbol = _state.config.get("symbol")
     if not symbol:
         await update.message.reply_text("No active symbol configured.")
+        _state.reset_trade()
         return
 
-    # Cancel SL watcher
+    # 1. Disarm SL watcher first to prevent a race with the market sell below
     if _state.sl_watcher:
         _state.sl_watcher.cancel()
         _state.sl_watcher = None
 
-    # Cancel fill poller
+    # 2. Cancel fill poller
     if _state.fill_poll_task and not _state.fill_poll_task.done():
         _state.fill_poll_task.cancel()
 
-    # Cancel open entry order if still pending
+    # 3. Cancel pending entry order
     entry_order_id = _state.trade.get("entry_order_id")
     if entry_order_id and _state.trade.get("status") == "pending_fill":
         try:
             await trade_exec.cancel_order(symbol, entry_order_id)
-            await update.message.reply_text(f"✅ Entry order `{entry_order_id}` cancelled.",
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"✅ Entry order `{entry_order_id}` cancelled.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception as exc:
-            await update.message.reply_text(f"⚠️ Could not cancel entry order: `{exc}`",
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"⚠️ Could not cancel entry order: `{exc}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
-    # Cancel open exit order
+    # 4. Cancel open take-profit order
     exit_order_id = _state.trade.get("exit_order_id")
     if exit_order_id and _state.trade.get("status") == "open":
         try:
             await trade_exec.cancel_order(symbol, exit_order_id)
-            await update.message.reply_text(f"✅ Exit order `{exit_order_id}` cancelled.",
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"✅ Exit order `{exit_order_id}` cancelled.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception as exc:
-            await update.message.reply_text(f"⚠️ Could not cancel exit order: `{exc}`",
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"⚠️ Could not cancel exit order: `{exc}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
-    # Market sell if position is open
+    # 5. Market sell open position
     entry_qty = _state.trade.get("entry_qty")
     if entry_qty and _state.trade.get("status") == "open":
         try:
@@ -481,30 +648,28 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception as exc:
-            await update.message.reply_text(f"❌ Market sell failed: `{exc}`",
-                                            parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"❌ Market sell failed: `{exc}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
-    # Stop WebSocket
+    # 6. Stop WebSocket
     _state.ws.stop()
     if _state.ws_task and not _state.ws_task.done():
         _state.ws_task.cancel()
 
-    _state.running = False
     _state.reset_trade()
 
-    await update.message.reply_text("🔴 *Bot stopped. All positions closed.*",
-                                    parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🔴 *Bot stopped. All positions closed.*", parse_mode=ParseMode.MARKDOWN
+    )
 
 
 # ── Application factory ────────────────────────────────────────────────────────
 
 def build_application() -> Application:
-    """Build and return the configured telegram Application."""
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
+    """Build and return the configured Telegram Application."""
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("emergency_stop", cmd_emergency_stop))
