@@ -1,0 +1,12 @@
+# Railway build configuration
+# Forces Nixpacks to treat this as a Python project and use the correct version.
+# This file is the most reliable way to prevent Railway from misdetecting the language.
+
+[phases.setup]
+nixPkgs = ["python310"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python main.py"
