@@ -81,7 +81,7 @@ def main() -> None:
     # run_polling() manages its own event loop and handles graceful shutdown
     # on SIGINT / SIGTERM automatically (python-telegram-bot v20+).
     app.run_polling(
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
         drop_pending_updates=True,
     )
 

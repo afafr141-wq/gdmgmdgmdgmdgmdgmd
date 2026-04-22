@@ -1,17 +1,9 @@
 """
-Telegram bot interface.
-
-Commands:
-    /setup  <symbol> <quote_amount> [sl_pct] [tp_pct]
-    /status
-    /emergency_stop
-
-All commands are restricted to ALLOWED_USER_IDS.
-State is persisted to Supabase via utils.db_manager — no local file I/O.
+Telegram bot interface — inline-button dashboard edition.
 
 Public functions used by main.py:
     build_application() -> Application
-    recover_state(app)  -> None   (called from post_init hook on every startup)
+    recover_state(app)  -> None
 """
 
 import asyncio
@@ -19,9 +11,18 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ConversationHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from config.settings import ALLOWED_USER_IDS, TELEGRAM_BOT_TOKEN, get_precision
 from core import trade_exec
@@ -34,16 +35,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ── Conversation states ────────────────────────────────────────────────────────
+SETUP_SYMBOL, SETUP_CAPITAL, SETUP_STRATEGY = range(3)
+
+# ── Callback data constants ────────────────────────────────────────────────────
+CB_STATUS        = "cb_status"
+CB_SETTINGS      = "cb_settings"
+CB_ESTOP         = "cb_estop"
+CB_ESTOP_CONFIRM = "cb_estop_confirm"
+CB_ESTOP_CANCEL  = "cb_estop_cancel"
+CB_REFRESH       = "cb_refresh"
+CB_SETUP         = "cb_setup"
+CB_BACK_MENU     = "cb_back_menu"
+CB_STRAT_NORMAL  = "cb_strat_normal"
+CB_STRAT_AGGR    = "cb_strat_aggr"
+CB_STRAT_CONS    = "cb_strat_cons"
 
 # ── In-memory runtime state ────────────────────────────────────────────────────
 
 class BotState:
-    """
-    Volatile runtime state (tasks, watcher handles, cached config).
-    Authoritative persistent state lives in Supabase — this is only
-    the in-process view needed to manage asyncio tasks.
-    """
-
     def __init__(self) -> None:
         self.ws = MexcWebSocket()
         self.analyzer = MarketAnalyzer()
@@ -52,9 +62,11 @@ class BotState:
         self.sl_task: asyncio.Task | None = None
         self.fill_poll_task: asyncio.Task | None = None
         self.running: bool = False
-
-        # Mirrors the Supabase config jsonb column; populated on /setup or recovery
         self.config: dict = {}
+        # For live-edit status message
+        self.status_chat_id: int | None = None
+        self.status_message_id: int | None = None
+        self.monitor_task: asyncio.Task | None = None
 
 
 _state = BotState()
@@ -63,11 +75,121 @@ _state = BotState()
 # ── Auth guard ─────────────────────────────────────────────────────────────────
 
 def _is_allowed(update: Update) -> bool:
-    return update.effective_user is not None and update.effective_user.id in ALLOWED_USER_IDS
+    user = update.effective_user
+    return user is not None and user.id in ALLOWED_USER_IDS
 
 
 async def _deny(update: Update) -> None:
-    await update.message.reply_text("⛔ Unauthorized.")
+    if update.callback_query:
+        await update.callback_query.answer("⛔ Unauthorized.", show_alert=True)
+    elif update.message:
+        await update.message.reply_text("⛔ Unauthorized.")
+
+
+# ── Keyboard builders ──────────────────────────────────────────────────────────
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Live Status",    callback_data=CB_STATUS),
+            InlineKeyboardButton("⚙️ Quick Settings", callback_data=CB_SETTINGS),
+        ],
+        [
+            InlineKeyboardButton("🛑 EMERGENCY STOP", callback_data=CB_ESTOP),
+            InlineKeyboardButton("🔄 Refresh Stats",  callback_data=CB_REFRESH),
+        ],
+    ])
+
+
+def _estop_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, stop now", callback_data=CB_ESTOP_CONFIRM),
+            InlineKeyboardButton("❌ Cancel",         callback_data=CB_ESTOP_CANCEL),
+        ],
+    ])
+
+
+def _strategy_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Normal  (SL 1.5% / TP 2%)",      callback_data=CB_STRAT_NORMAL)],
+        [InlineKeyboardButton("⚡ Aggressive (SL 1% / TP 3%)",     callback_data=CB_STRAT_AGGR)],
+        [InlineKeyboardButton("🛡️ Conservative (SL 2% / TP 1.5%)", callback_data=CB_STRAT_CONS)],
+        [InlineKeyboardButton("« Back to menu",                     callback_data=CB_BACK_MENU)],
+    ])
+
+
+def _back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("« Main Menu", callback_data=CB_BACK_MENU)],
+    ])
+
+
+# ── Dashboard text builders ────────────────────────────────────────────────────
+
+def _idle_dashboard_text() -> str:
+    return (
+        "🤖 *MEXC Market Maker Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔴 Status: *IDLE*\n\n"
+        "No active trade. Use ⚙️ Quick Settings to configure\n"
+        "a symbol and start the strategy."
+    )
+
+
+def _searching_dashboard_text(symbol: str, sma: float | None, price: float) -> str:
+    sma_str = f"{sma:.8f}" if sma else "warming up…"
+    price_str = f"{price:.8f}" if price else "—"
+    return (
+        "🤖 *MEXC Market Maker Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟡 Status: *SEARCHING*\n\n"
+        f"🔍 Symbol: `{symbol}`\n"
+        f"💹 Price:  `{price_str}`\n"
+        f"📉 SMA-20: `{sma_str}`\n\n"
+        "⏳ Scanning for bid wall entry signal…"
+    )
+
+
+def _pending_dashboard_text(symbol: str, entry_price: float, order_id: str) -> str:
+    return (
+        "🤖 *MEXC Market Maker Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟠 Status: *PENDING FILL*\n\n"
+        f"🔍 Symbol:    `{symbol}`\n"
+        f"📋 Entry:     `{entry_price}`\n"
+        f"🆔 Order ID:  `{order_id}`\n\n"
+        "⏳ Waiting for limit buy to fill…"
+    )
+
+
+def _open_dashboard_text(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    current_price: float,
+    sl_price: float,
+    tp_price: float,
+) -> str:
+    if entry_price and current_price:
+        pnl_pct = (current_price - entry_price) / entry_price * 100
+        pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
+        pnl_str = f"{pnl_icon} `{pnl_pct:+.3f}%`"
+    else:
+        pnl_str = "—"
+
+    price_str = f"{current_price:.8f}" if current_price else "—"
+    return (
+        "🤖 *MEXC Market Maker Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 Status: *TRADE OPEN*\n\n"
+        f"🔍 Symbol:  `{symbol}` | Side: `{side.upper()}`\n"
+        f"📥 Entry:   `{entry_price}`\n"
+        f"💹 Current: `{price_str}`\n"
+        f"💰 P&L:     {pnl_str}\n\n"
+        f"⚠️  Stop-Loss (Virtual): `{sl_price}`\n"
+        f"🎯 Take-Profit:          `{tp_price}`"
+    )
 
 
 # ── Telegram notifier ──────────────────────────────────────────────────────────
@@ -87,6 +209,37 @@ async def send_alert(text: str, application: Application | None = None) -> None:
             )
         except Exception as exc:
             logger.error("Failed to send alert to %s: %s", uid, exc)
+
+
+async def _edit_or_send(
+    application: Application,
+    chat_id: int,
+    message_id: int | None,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> int | None:
+    """Edit an existing message if possible, otherwise send a new one. Returns message_id."""
+    if message_id:
+        try:
+            await application.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=reply_markup,
+            )
+            return message_id
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return message_id
+            logger.debug("edit_message_text failed (%s), sending new message", exc)
+    msg = await application.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=reply_markup,
+    )
+    return msg.message_id
 
 
 # ── WebSocket handlers ─────────────────────────────────────────────────────────
@@ -132,8 +285,6 @@ def _arm_sl_watcher(
     sl_pct: float,
     application: Application,
 ) -> None:
-    """Create and start the Virtual Stop-Loss watcher task."""
-
     async def _notifier(text: str) -> None:
         await send_alert(text, application)
 
@@ -158,13 +309,65 @@ def _arm_sl_watcher(
     )
 
 
+# ── Real-time monitor task ─────────────────────────────────────────────────────
+
+async def _monitor_loop(application: Application) -> None:
+    """
+    Runs while a trade is active. Every 10 seconds it edits the pinned
+    status message with fresh price / P&L data.
+    """
+    while _state.running:
+        try:
+            row = await get_db().fetch_state()
+            cfg = row.get("config", {}) if row else {}
+            trade_status = cfg.get("trade_status", "idle")
+            symbol = (row.get("symbol") if row else None) or _state.config.get("symbol", "—")
+
+            current_price = _state.analyzer._current_price
+            sma = _state.analyzer.sma()
+
+            if trade_status == "searching":
+                text = _searching_dashboard_text(symbol, sma, current_price)
+            elif trade_status == "pending_fill":
+                entry_price = row.get("entry_price", 0) if row else 0
+                order_id = cfg.get("entry_order_id", "—")
+                text = _pending_dashboard_text(symbol, entry_price, order_id)
+            elif trade_status == "open":
+                entry_price = float(row.get("entry_price", 0) or 0) if row else 0
+                sl_price = float(row.get("stop_loss", 0) or 0) if row else 0
+                tp_price = cfg.get("take_profit_price", "—")
+                text = _open_dashboard_text(
+                    symbol=symbol,
+                    side=row.get("side", "buy") if row else "buy",
+                    entry_price=entry_price,
+                    current_price=current_price,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                )
+            else:
+                text = _idle_dashboard_text()
+
+            if _state.status_chat_id and _state.status_message_id:
+                new_id = await _edit_or_send(
+                    application,
+                    _state.status_chat_id,
+                    _state.status_message_id,
+                    text,
+                    reply_markup=_main_menu_keyboard(),
+                )
+                _state.status_message_id = new_id
+
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.debug("Monitor loop error: %s", exc)
+
+        await asyncio.sleep(10)
+
+
 # ── Strategy orchestration ─────────────────────────────────────────────────────
 
 async def _on_order_filled(order: dict, application: Application) -> None:
-    """
-    Called when the limit buy is confirmed FILLED.
-    Places the take-profit limit sell, persists to Supabase, arms SL watcher.
-    """
     db = get_db()
     symbol: str = _state.config["symbol"]
     entry_price = float(order.get("price", 0))
@@ -181,7 +384,6 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         logger.error("Failed to place TP sell: %s", exc)
         exit_order_id = None
 
-    # Persist open trade to Supabase
     await db.upsert_state({
         "symbol": symbol,
         "is_active": True,
@@ -203,8 +405,8 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         f"Symbol: `{symbol}`\n"
         f"Entry: `{entry_price}`\n"
         f"Qty: `{entry_qty}`\n"
-        f"TP: `{tp_price}`\n"
-        f"SL: `{sl_price}`",
+        f"🎯 TP: `{tp_price}`\n"
+        f"⚠️ SL: `{sl_price}`",
         application,
     )
 
@@ -213,8 +415,8 @@ async def _on_order_filled(order: dict, application: Application) -> None:
 
 async def _start_strategy(application: Application) -> None:
     """
-    Subscribe to WS streams, wait for an entry signal, place the limit buy,
-    then start the fill poller.
+    Subscribe to WS, then loop FOREVER until an entry signal is found.
+    No timeout — keeps scanning until conditions are met or emergency stop.
     """
     db = get_db()
     symbol: str = _state.config["symbol"]
@@ -230,23 +432,24 @@ async def _start_strategy(application: Application) -> None:
         price_precision=get_precision(symbol)["price_precision"],
     )
 
-    # Retry loop — waits for SMA-20 to warm up (up to 60 s)
+    attempt = 0
     signal = None
-    for attempt in range(30):
+    while _state.running and signal is None:
         signal = _state.analyzer.find_entry_signal(tick_size)
         if signal:
             break
-        logger.debug("No signal yet (attempt %d/30) — waiting 2s", attempt + 1)
-        await asyncio.sleep(2)
+        attempt += 1
+        if attempt % 12 == 0:  # log every ~60s
+            sma = _state.analyzer.sma()
+            price = _state.analyzer._current_price
+            logger.info(
+                "Still searching for entry signal (attempt %d) price=%.8f sma=%s",
+                attempt, price, f"{sma:.8f}" if sma else "warming",
+            )
+        await asyncio.sleep(5)
 
-    if not signal:
-        await send_alert(
-            "⚠️ *No entry signal found after 60s.*\n"
-            "Check market conditions or adjust wall multiplier.",
-            application,
-        )
-        _state.running = False
-        await db.reset_state()
+    if not _state.running:
+        logger.info("Strategy stopped while searching (emergency stop)")
         return
 
     try:
@@ -259,13 +462,12 @@ async def _start_strategy(application: Application) -> None:
 
     order_id = buy_resp.get("orderId")
 
-    # Persist pending state to Supabase
     await db.upsert_state({
         "symbol": symbol,
         "is_active": True,
         "entry_price": signal.entry_price,
         "side": "buy",
-        "qty": None,          # not yet known until fill
+        "qty": None,
         "stop_loss": round(signal.entry_price * _state.config.get("stop_loss_pct", 0.985), 8),
         "config": {
             **_state.config,
@@ -292,29 +494,26 @@ async def _start_strategy(application: Application) -> None:
     )
 
 
-# ── State recovery (called on every startup via post_init) ─────────────────────
+# ── State recovery ─────────────────────────────────────────────────────────────
 
 async def recover_state(application: Application) -> None:
-    """
-    On startup, query Supabase for an active trade and re-attach all
-    live monitoring without requiring a new /setup command.
-
-    Cases:
-        is_active = false  → idle; notify and wait for /setup.
-        trade_status = pending_fill → re-attach fill poller.
-        trade_status = open         → re-arm WS + Virtual SL watcher.
-    """
     db = get_db()
-
-    # Guarantee the singleton row exists before any reads
     await db.ensure_row_exists()
-
     row = await db.fetch_state()
+
     if not row or not row.get("is_active"):
-        await send_alert(
-            "🚀 *Bot started.*\n\nNo active trade found. Use /setup to begin.",
-            application,
-        )
+        for uid in ALLOWED_USER_IDS:
+            try:
+                msg = await application.bot.send_message(
+                    chat_id=uid,
+                    text=_idle_dashboard_text(),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=_main_menu_keyboard(),
+                )
+                _state.status_chat_id = uid
+                _state.status_message_id = msg.message_id
+            except Exception as exc:
+                logger.error("Startup message failed for %s: %s", uid, exc)
         return
 
     symbol: str = row.get("symbol", "")
@@ -324,43 +523,29 @@ async def recover_state(application: Application) -> None:
     logger.info("Recovery: is_active=True symbol=%s trade_status=%s", symbol, trade_status)
 
     if not symbol:
-        logger.warning("is_active=True but no symbol — resetting")
         await db.reset_state()
-        await send_alert(
-            "⚠️ *Bot restarted.* Inconsistent state (no symbol) — reset.\n"
-            "Use /setup to begin.",
-            application,
-        )
+        await send_alert("⚠️ *Bot restarted.* Inconsistent state — reset. Use /start.", application)
         return
 
-    # Precision lives only in memory — must be re-fetched on every cold start
     try:
         await trade_exec.fetch_precision(symbol)
     except Exception as exc:
-        logger.error("Could not fetch precision on recovery: %s", exc)
         await send_alert(
             f"⚠️ *Bot restarted* but failed to fetch precision for `{symbol}`.\n"
-            f"Error: `{exc}`\n\nUse /emergency_stop then /setup to restart safely.",
+            f"Error: `{exc}`\n\nUse /emergency\\_stop then /start to restart.",
             application,
         )
         return
 
-    # Restore in-memory config from the Supabase config jsonb column
     _state.config = config
     _state.running = True
 
-    # ── pending_fill: re-attach fill poller ────────────────────────────────────
     if trade_status == "pending_fill":
         order_id = config.get("entry_order_id")
         if not order_id:
-            logger.warning("pending_fill but no entry_order_id — resetting")
             await db.reset_state()
             _state.running = False
-            await send_alert(
-                "⚠️ *Bot restarted.* Inconsistent pending_fill state — reset.\n"
-                "Use /setup to begin a new trade.",
-                application,
-            )
+            await send_alert("⚠️ *Bot restarted.* Inconsistent pending_fill — reset.", application)
             return
 
         _start_ws(symbol)
@@ -371,19 +556,12 @@ async def recover_state(application: Application) -> None:
         _state.fill_poll_task = asyncio.create_task(
             trade_exec.poll_order_fill(symbol, order_id, _filled_cb)
         )
-
         await send_alert(
-            "🚀 *Bot restarted and synchronised with current state.*\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Status: Waiting for fill on order `{order_id}`\n"
-            f"Entry price: `{row.get('entry_price')}`\n\n"
-            "WebSocket and fill poller re-attached.",
+            f"🚀 *Bot restarted.*\n\nSymbol: `{symbol}`\nStatus: Waiting for fill on `{order_id}`",
             application,
         )
-        logger.info("Recovery: fill poller re-attached for order %s", order_id)
         return
 
-    # ── open: re-arm Virtual SL watcher ───────────────────────────────────────
     if trade_status == "open":
         entry_price = row.get("entry_price")
         entry_qty = row.get("qty")
@@ -391,14 +569,9 @@ async def recover_state(application: Application) -> None:
         sl_pct: float = config.get("stop_loss_pct", 0.985)
 
         if not entry_price or not entry_qty:
-            logger.warning("open trade but missing entry_price/qty — resetting")
             await db.reset_state()
             _state.running = False
-            await send_alert(
-                "⚠️ *Bot restarted.* Open trade state is incomplete — reset.\n"
-                "Check your MEXC account manually, then use /setup.",
-                application,
-            )
+            await send_alert("⚠️ *Bot restarted.* Open trade state incomplete — reset.", application)
             return
 
         _start_ws(symbol)
@@ -410,92 +583,398 @@ async def recover_state(application: Application) -> None:
             sl_pct=sl_pct,
             application=application,
         )
-
         sl_price = row.get("stop_loss") or round(float(entry_price) * sl_pct, 8)
         tp_price = config.get("take_profit_price", "—")
-
         await send_alert(
-            "🚀 *Bot restarted and synchronised with current state.*\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Entry: `{entry_price}`\n"
-            f"Qty: `{entry_qty}`\n"
-            f"Stop-loss: `{sl_price}`\n"
-            f"Take-profit: `{tp_price}`\n\n"
-            "WebSocket and Virtual Stop-Loss watcher re-attached.",
+            f"🚀 *Bot restarted.*\n\n"
+            f"Symbol: `{symbol}`\nEntry: `{entry_price}`\n"
+            f"SL: `{sl_price}`\nTP: `{tp_price}`\n\nSL watcher re-armed.",
             application,
-        )
-        logger.info(
-            "Recovery: SL watcher re-armed for %s entry=%.8f sl=%.8f",
-            symbol, float(entry_price), float(sl_price) if sl_price else 0,
         )
         return
 
-    # ── Unknown status ─────────────────────────────────────────────────────────
-    logger.warning("Unknown trade_status '%s' on recovery — resetting", trade_status)
     await db.reset_state()
     _state.running = False
-    await send_alert(
-        f"⚠️ *Bot restarted.* Unknown trade status `{trade_status}` — reset.\n"
-        "Use /setup to begin.",
-        application,
+    await send_alert(f"⚠️ Unknown trade status `{trade_status}` — reset. Use /start.", application)
+
+
+# ── /start command ─────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — show the main inline-button dashboard."""
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    row = None
+    try:
+        row = await get_db().fetch_state()
+    except Exception:
+        pass
+
+    cfg = row.get("config", {}) if row else {}
+    trade_status = cfg.get("trade_status", "idle")
+    symbol = (row.get("symbol") if row else None) or "—"
+    current_price = _state.analyzer._current_price
+    sma = _state.analyzer.sma()
+
+    if trade_status == "searching":
+        text = _searching_dashboard_text(symbol, sma, current_price)
+    elif trade_status == "pending_fill":
+        text = _pending_dashboard_text(symbol, row.get("entry_price", 0), cfg.get("entry_order_id", "—"))
+    elif trade_status == "open":
+        entry_price = float(row.get("entry_price", 0) or 0) if row else 0
+        text = _open_dashboard_text(
+            symbol=symbol,
+            side=row.get("side", "buy") if row else "buy",
+            entry_price=entry_price,
+            current_price=current_price,
+            sl_price=float(row.get("stop_loss", 0) or 0) if row else 0,
+            tp_price=cfg.get("take_profit_price", "—"),
+        )
+    else:
+        text = _idle_dashboard_text()
+
+    msg = await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
+    )
+    _state.status_chat_id = update.effective_chat.id
+    _state.status_message_id = msg.message_id
+
+    # Start monitor loop if running and not already active
+    if _state.running and (
+        _state.monitor_task is None or _state.monitor_task.done()
+    ):
+        _state.monitor_task = asyncio.create_task(_monitor_loop(context.application))
+
+
+# ── Callback query handlers ────────────────────────────────────────────────────
+
+async def _cb_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    row = None
+    try:
+        row = await get_db().fetch_state()
+    except Exception:
+        pass
+
+    cfg = row.get("config", {}) if row else {}
+    trade_status = cfg.get("trade_status", "idle")
+    symbol = (row.get("symbol") if row else None) or "—"
+    current_price = _state.analyzer._current_price
+    sma = _state.analyzer.sma()
+
+    if trade_status == "searching":
+        text = _searching_dashboard_text(symbol, sma, current_price)
+    elif trade_status == "pending_fill":
+        text = _pending_dashboard_text(symbol, row.get("entry_price", 0), cfg.get("entry_order_id", "—"))
+    elif trade_status == "open":
+        entry_price = float(row.get("entry_price", 0) or 0) if row else 0
+        text = _open_dashboard_text(
+            symbol=symbol,
+            side=row.get("side", "buy") if row else "buy",
+            entry_price=entry_price,
+            current_price=current_price,
+            sl_price=float(row.get("stop_loss", 0) or 0) if row else 0,
+            tp_price=cfg.get("take_profit_price", "—"),
+        )
+    else:
+        text = _idle_dashboard_text()
+
+    new_id = await _edit_or_send(
+        context.application,
+        query.message.chat_id,
+        query.message.message_id,
+        text,
+        reply_markup=_main_menu_keyboard(),
+    )
+    _state.status_chat_id = query.message.chat_id
+    _state.status_message_id = new_id
+
+    if _state.running and (
+        _state.monitor_task is None or _state.monitor_task.done()
+    ):
+        _state.monitor_task = asyncio.create_task(_monitor_loop(context.application))
+
+
+async def _cb_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same as status but shows a brief 'Refreshed' toast."""
+    query = update.callback_query
+    await query.answer("🔄 Refreshed!")
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+    # Reuse status logic
+    update.callback_query.data = CB_STATUS
+    await _cb_status(update, context)
+
+
+async def _cb_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    if _state.running:
+        await query.edit_message_text(
+            "⚠️ *Bot is already running.*\n\nUse 🛑 EMERGENCY STOP first to reconfigure.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_back_keyboard(),
+        )
+        return
+
+    context.user_data.clear()
+    await query.edit_message_text(
+        "⚙️ *Quick Setup — Step 1/3*\n\n"
+        "Please type the trading symbol:\n"
+        "_(e.g. `BTCUSDT`, `ETHUSDT`, `SOLUSDT`)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_back_keyboard(),
+    )
+    context.user_data["setup_step"] = "symbol"
+    context.user_data["setup_chat_id"] = query.message.chat_id
+    context.user_data["setup_message_id"] = query.message.message_id
+
+
+async def _cb_estop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    await query.edit_message_text(
+        "🛑 *EMERGENCY STOP*\n\n"
+        "This will:\n"
+        "• Cancel all open orders\n"
+        "• Market-sell any open position\n"
+        "• Reset the bot to idle\n\n"
+        "Are you sure?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_estop_confirm_keyboard(),
     )
 
 
-# ── Command handlers ───────────────────────────────────────────────────────────
+async def _cb_estop_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("Cancelled.")
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+    await query.edit_message_text(
+        _idle_dashboard_text() if not _state.running else "✅ Emergency stop cancelled.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
+    )
 
-async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+
+async def _cb_back_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+    await query.edit_message_text(
+        _idle_dashboard_text(),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
+    )
+
+
+async def _cb_estop_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("🛑 Stopping…")
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    await query.edit_message_text(
+        "🛑 *Emergency stop in progress…*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    db = get_db()
+    try:
+        row = await db.fetch_state()
+    except Exception:
+        row = None
+
+    cfg = row.get("config", {}) if row else {}
+    symbol = (row.get("symbol") if row else None) or _state.config.get("symbol")
+    trade_status = cfg.get("trade_status", "idle")
+
+    steps: list[str] = []
+
+    # 1. Disarm SL watcher
+    if _state.sl_watcher:
+        _state.sl_watcher.cancel()
+        _state.sl_watcher = None
+        steps.append("✅ SL watcher disarmed")
+
+    # 2. Cancel fill poller
+    if _state.fill_poll_task and not _state.fill_poll_task.done():
+        _state.fill_poll_task.cancel()
+        steps.append("✅ Fill poller cancelled")
+
+    # 3. Cancel monitor task
+    if _state.monitor_task and not _state.monitor_task.done():
+        _state.monitor_task.cancel()
+
+    if symbol:
+        # 4. Cancel pending entry order
+        entry_order_id = cfg.get("entry_order_id")
+        if entry_order_id and trade_status == "pending_fill":
+            try:
+                await trade_exec.cancel_order(symbol, entry_order_id)
+                steps.append(f"✅ Entry order `{entry_order_id}` cancelled")
+            except Exception as exc:
+                steps.append(f"⚠️ Could not cancel entry order: `{exc}`")
+
+        # 5. Cancel TP order
+        exit_order_id = cfg.get("exit_order_id")
+        if exit_order_id and trade_status == "open":
+            try:
+                await trade_exec.cancel_order(symbol, exit_order_id)
+                steps.append(f"✅ TP order `{exit_order_id}` cancelled")
+            except Exception as exc:
+                steps.append(f"⚠️ Could not cancel TP order: `{exc}`")
+
+        # 6. Market sell
+        qty = row.get("qty") if row else None
+        if qty and trade_status == "open":
+            try:
+                resp = await trade_exec.market_sell(symbol, float(qty))
+                steps.append(f"✅ Market sell executed (`{resp.get('orderId')}`)")
+            except Exception as exc:
+                steps.append(f"❌ Market sell failed: `{exc}`")
+
+    # 7. Stop WebSocket
+    _state.ws.stop()
+    if _state.ws_task and not _state.ws_task.done():
+        _state.ws_task.cancel()
+    steps.append("✅ WebSocket stopped")
+
+    # 8. Reset DB
+    try:
+        await db.reset_state()
+        steps.append("✅ Database reset")
+    except Exception as exc:
+        steps.append(f"⚠️ DB reset failed: `{exc}`")
+
+    _state.running = False
+    _state.config = {}
+    _state.status_message_id = None
+
+    summary = "\n".join(steps)
+    await query.edit_message_text(
+        f"🔴 *Bot stopped.*\n\n{summary}\n\nUse /start to return to the dashboard.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ── Setup conversation (text message steps) ────────────────────────────────────
+
+async def _handle_setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /setup <symbol> <quote_amount> [sl_pct] [tp_pct]
-
-    sl_pct / tp_pct are percentages (e.g. 1.5 = 1.5% stop-loss).
+    Handles the multi-step setup flow driven by inline buttons + free-text replies.
+    Steps: symbol → capital → strategy (via buttons).
     """
     if not _is_allowed(update):
         await _deny(update)
         return
 
-    args = context.args or []
-    if len(args) < 2:
+    step = context.user_data.get("setup_step")
+    if not step:
+        return  # not in a setup flow
+
+    text_in = (update.message.text or "").strip()
+
+    if step == "symbol":
+        symbol = text_in.upper()
+        if not symbol.isalnum():
+            await update.message.reply_text("❌ Invalid symbol. Try again (e.g. `BTCUSDT`):", parse_mode=ParseMode.MARKDOWN)
+            return
+        context.user_data["setup_symbol"] = symbol
+        context.user_data["setup_step"] = "capital"
         await update.message.reply_text(
-            "Usage: `/setup <symbol> <quote_amount> [sl_pct] [tp_pct]`\n"
-            "Example: `/setup BTCUSDT 100 1.5 2.0`",
+            f"⚙️ *Quick Setup — Step 2/3*\n\n"
+            f"Symbol: `{symbol}` ✅\n\n"
+            "How much capital (in quote currency, e.g. USDT) do you want to use?\n"
+            "_(e.g. `100` for 100 USDT)_",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    symbol = args[0].upper()
-    try:
-        quote_amount = float(args[1])
-        sl_pct = 1 - float(args[2]) / 100 if len(args) > 2 else 0.985
-        tp_pct = 1 + float(args[3]) / 100 if len(args) > 3 else 1.02
-    except ValueError:
-        await update.message.reply_text("❌ Invalid numeric argument.")
-        return
-
-    if _state.running:
+    if step == "capital":
+        try:
+            capital = float(text_in)
+            if capital <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a positive number (e.g. `100`):", parse_mode=ParseMode.MARKDOWN)
+            return
+        context.user_data["setup_capital"] = capital
+        context.user_data["setup_step"] = "strategy"
+        symbol = context.user_data.get("setup_symbol", "—")
         await update.message.reply_text(
-            "⚠️ Bot is already running. Use /emergency_stop first."
+            f"⚙️ *Quick Setup — Step 3/3*\n\n"
+            f"Symbol: `{symbol}` ✅\n"
+            f"Capital: `{capital}` ✅\n\n"
+            "Choose a strategy mode:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_strategy_keyboard(),
         )
         return
 
-    await update.message.reply_text(
-        f"🔍 Fetching precision for `{symbol}`…", parse_mode=ParseMode.MARKDOWN
+
+async def _apply_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE, sl_pct: float, tp_pct: float) -> None:
+    """Shared logic to finalise setup after strategy selection."""
+    query = update.callback_query
+    await query.answer()
+
+    symbol = context.user_data.get("setup_symbol")
+    capital = context.user_data.get("setup_capital")
+
+    if not symbol or not capital:
+        await query.edit_message_text(
+            "⚠️ Setup data lost. Please use /start and try again.",
+            reply_markup=_main_menu_keyboard(),
+        )
+        context.user_data.clear()
+        return
+
+    await query.edit_message_text(
+        f"🔍 Fetching precision for `{symbol}`…",
+        parse_mode=ParseMode.MARKDOWN,
     )
+
     try:
         await trade_exec.fetch_precision(symbol)
     except Exception as exc:
-        await update.message.reply_text(
-            f"❌ Failed to fetch symbol info: `{exc}`", parse_mode=ParseMode.MARKDOWN
+        await query.edit_message_text(
+            f"❌ Failed to fetch symbol info: `{exc}`\n\nUse /start to try again.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_back_keyboard(),
         )
+        context.user_data.clear()
         return
 
     prec = get_precision(symbol)
     _state.config = {
         "symbol": symbol,
-        "quote_amount": quote_amount,
+        "quote_amount": capital,
         "wall_multiplier": 3.0,
         "sma_period": 20,
-        "stop_loss_pct": sl_pct,
-        "take_profit_pct": tp_pct,
+        "stop_loss_pct": 1 - sl_pct / 100,
+        "take_profit_pct": 1 + tp_pct / 100,
         "price_precision": prec["price_precision"],
         "qty_precision": prec["qty_precision"],
         "tick_size": prec["tick_size"],
@@ -504,7 +983,6 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
     _state.running = True
 
-    # Write initial config to Supabase
     await get_db().upsert_state({
         "symbol": symbol,
         "is_active": True,
@@ -515,167 +993,196 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "config": _state.config,
     })
 
-    await update.message.reply_text(
-        f"✅ *Setup complete*\n\n"
-        f"Symbol: `{symbol}`\n"
-        f"Quote: `{quote_amount}`\n"
-        f"SL: `{(1 - sl_pct) * 100:.2f}%`\n"
-        f"TP: `{(tp_pct - 1) * 100:.2f}%`\n"
-        f"Tick: `{prec['tick_size']}`\n\n"
-        f"Starting strategy…",
+    msg = await query.edit_message_text(
+        f"✅ *Setup complete — Strategy started!*\n\n"
+        f"🔍 Symbol:  `{symbol}`\n"
+        f"💰 Capital: `{capital}`\n"
+        f"⚠️ SL:      `{sl_pct}%`\n"
+        f"🎯 TP:      `{tp_pct}%`\n"
+        f"📐 Tick:    `{prec['tick_size']}`\n\n"
+        "🟡 Scanning for entry signal…",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
     )
+    _state.status_chat_id = query.message.chat_id
+    _state.status_message_id = msg.message_id
+
+    context.user_data.clear()
 
     asyncio.create_task(_start_strategy(context.application))
 
+    if _state.monitor_task is None or _state.monitor_task.done():
+        _state.monitor_task = asyncio.create_task(_monitor_loop(context.application))
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/status — show live price, Supabase state, and session info."""
+
+async def _cb_strat_normal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _apply_strategy(update, context, sl_pct=1.5, tp_pct=2.0)
+
+
+async def _cb_strat_aggr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _apply_strategy(update, context, sl_pct=1.0, tp_pct=3.0)
+
+
+async def _cb_strat_cons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _apply_strategy(update, context, sl_pct=2.0, tp_pct=1.5)
+
+
+# ── Legacy text commands (kept for backward compatibility) ─────────────────────
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setup <symbol> <quote_amount> [sl_pct] [tp_pct]"""
     if not _is_allowed(update):
         await _deny(update)
         return
 
-    # Fetch authoritative state from Supabase
-    try:
-        row = await get_db().fetch_state()
-    except Exception as exc:
+    args = context.args or []
+    if len(args) < 2:
         await update.message.reply_text(
-            f"❌ Failed to fetch state from Supabase: `{exc}`",
+            "Usage: `/setup <symbol> <quote_amount> [sl_pct] [tp_pct]`\n"
+            "Example: `/setup BTCUSDT 100 1.5 2.0`\n\n"
+            "Or use /start for the interactive dashboard.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    cfg = row.get("config", {}) if row else {}
-    symbol = (row.get("symbol") if row else None) or "—"
-    trade_status = cfg.get("trade_status", "idle")
-    is_active = row.get("is_active", False) if row else False
+    symbol = args[0].upper()
+    try:
+        quote_amount = float(args[1])
+        sl_pct_val = float(args[2]) if len(args) > 2 else 1.5
+        tp_pct_val = float(args[3]) if len(args) > 3 else 2.0
+    except ValueError:
+        await update.message.reply_text("❌ Invalid numeric argument.")
+        return
 
-    sma = _state.analyzer.sma()
-    sma_str = f"`{sma:.8f}`" if sma else "_not ready_"
-    current_price = _state.analyzer._current_price
-    price_str = f"`{current_price:.8f}`" if current_price else "_no data_"
+    if _state.running:
+        await update.message.reply_text("⚠️ Bot is already running. Use /emergency_stop first.")
+        return
 
-    lines = [
-        "📊 *Bot Status*",
-        "",
-        f"*Symbol:* `{symbol}`",
-        f"*Running:* `{_state.running}`",
-        f"*Trade status:* `{trade_status}`",
-        f"*Is active (DB):* `{is_active}`",
-        "",
-        f"*Live price:* {price_str}",
-        f"*SMA-20:* {sma_str}",
-        "",
-        f"*Entry price:* `{row.get('entry_price', '—') if row else '—'}`",
-        f"*Qty:* `{row.get('qty', '—') if row else '—'}`",
-        f"*Stop-loss:* `{row.get('stop_loss', '—') if row else '—'}`",
-        f"*Take-profit:* `{cfg.get('take_profit_price', '—')}`",
-    ]
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🔍 Fetching precision for `{symbol}`…", parse_mode=ParseMode.MARKDOWN)
+    try:
+        await trade_exec.fetch_precision(symbol)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to fetch symbol info: `{exc}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    prec = get_precision(symbol)
+    _state.config = {
+        "symbol": symbol,
+        "quote_amount": quote_amount,
+        "wall_multiplier": 3.0,
+        "sma_period": 20,
+        "stop_loss_pct": 1 - sl_pct_val / 100,
+        "take_profit_pct": 1 + tp_pct_val / 100,
+        "price_precision": prec["price_precision"],
+        "qty_precision": prec["qty_precision"],
+        "tick_size": prec["tick_size"],
+        "started_at": int(time.time()),
+        "trade_status": "searching",
+    }
+    _state.running = True
+
+    await get_db().upsert_state({
+        "symbol": symbol,
+        "is_active": True,
+        "entry_price": None,
+        "side": "buy",
+        "qty": None,
+        "stop_loss": None,
+        "config": _state.config,
+    })
+
+    msg = await update.message.reply_text(
+        f"✅ *Setup complete*\n\n"
+        f"Symbol: `{symbol}`\n"
+        f"Quote: `{quote_amount}`\n"
+        f"SL: `{sl_pct_val}%`\n"
+        f"TP: `{tp_pct_val}%`\n"
+        f"Tick: `{prec['tick_size']}`\n\n"
+        "🟡 Starting strategy…",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_main_menu_keyboard(),
+    )
+    _state.status_chat_id = update.effective_chat.id
+    _state.status_message_id = msg.message_id
+
+    asyncio.create_task(_start_strategy(context.application))
+    if _state.monitor_task is None or _state.monitor_task.done():
+        _state.monitor_task = asyncio.create_task(_monitor_loop(context.application))
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — alias for the dashboard status view."""
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+    await cmd_start(update, context)
 
 
 async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/emergency_stop — cancel all orders, market-sell open position, reset DB."""
+    """/emergency_stop — text-command version of the emergency stop."""
     if not _is_allowed(update):
         await _deny(update)
         return
 
-    await update.message.reply_text(
-        "🛑 *Emergency stop initiated…*", parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text("🛑 *Emergency stop initiated…*", parse_mode=ParseMode.MARKDOWN)
 
     db = get_db()
-
-    # Fetch current state from Supabase for order IDs
     try:
         row = await db.fetch_state()
-    except Exception as exc:
-        await update.message.reply_text(
-            f"⚠️ Could not fetch state from Supabase: `{exc}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    except Exception:
         row = None
 
     cfg = row.get("config", {}) if row else {}
     symbol = (row.get("symbol") if row else None) or _state.config.get("symbol")
     trade_status = cfg.get("trade_status", "idle")
 
-    # 1. Disarm SL watcher (prevents race with market sell below)
     if _state.sl_watcher:
         _state.sl_watcher.cancel()
         _state.sl_watcher = None
-
-    # 2. Cancel fill poller
     if _state.fill_poll_task and not _state.fill_poll_task.done():
         _state.fill_poll_task.cancel()
+    if _state.monitor_task and not _state.monitor_task.done():
+        _state.monitor_task.cancel()
 
-    if not symbol:
-        await update.message.reply_text("No active symbol found.")
-    else:
-        # 3. Cancel pending entry order
+    if symbol:
         entry_order_id = cfg.get("entry_order_id")
         if entry_order_id and trade_status == "pending_fill":
             try:
                 await trade_exec.cancel_order(symbol, entry_order_id)
-                await update.message.reply_text(
-                    f"✅ Entry order `{entry_order_id}` cancelled.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
             except Exception as exc:
-                await update.message.reply_text(
-                    f"⚠️ Could not cancel entry order: `{exc}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                await update.message.reply_text(f"⚠️ Could not cancel entry order: `{exc}`", parse_mode=ParseMode.MARKDOWN)
 
-        # 4. Cancel take-profit order
         exit_order_id = cfg.get("exit_order_id")
         if exit_order_id and trade_status == "open":
             try:
                 await trade_exec.cancel_order(symbol, exit_order_id)
-                await update.message.reply_text(
-                    f"✅ Exit order `{exit_order_id}` cancelled.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
             except Exception as exc:
-                await update.message.reply_text(
-                    f"⚠️ Could not cancel exit order: `{exc}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                await update.message.reply_text(f"⚠️ Could not cancel TP order: `{exc}`", parse_mode=ParseMode.MARKDOWN)
 
-        # 5. Market sell open position
         qty = row.get("qty") if row else None
         if qty and trade_status == "open":
             try:
                 resp = await trade_exec.market_sell(symbol, float(qty))
-                await update.message.reply_text(
-                    f"✅ Market sell executed. Order ID: `{resp.get('orderId')}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                await update.message.reply_text(f"✅ Market sell: `{resp.get('orderId')}`", parse_mode=ParseMode.MARKDOWN)
             except Exception as exc:
-                await update.message.reply_text(
-                    f"❌ Market sell failed: `{exc}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                await update.message.reply_text(f"❌ Market sell failed: `{exc}`", parse_mode=ParseMode.MARKDOWN)
 
-    # 6. Stop WebSocket
     _state.ws.stop()
     if _state.ws_task and not _state.ws_task.done():
         _state.ws_task.cancel()
 
-    # 7. Reset Supabase state
     try:
         await db.reset_state()
     except Exception as exc:
-        await update.message.reply_text(
-            f"⚠️ Failed to reset Supabase state: `{exc}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text(f"⚠️ DB reset failed: `{exc}`", parse_mode=ParseMode.MARKDOWN)
 
     _state.running = False
     _state.config = {}
+    _state.status_message_id = None
 
     await update.message.reply_text(
-        "🔴 *Bot stopped. All positions closed.*", parse_mode=ParseMode.MARKDOWN
+        "🔴 *Bot stopped. All positions closed.*\n\nUse /start to return to the dashboard.",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -684,7 +1191,26 @@ async def cmd_emergency_stop(update: Update, context: ContextTypes.DEFAULT_TYPE)
 def build_application() -> Application:
     """Build and return the configured Telegram Application."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("setup", cmd_setup))
-    app.add_handler(CommandHandler("status", cmd_status))
+
+    # Core commands
+    app.add_handler(CommandHandler("start",          cmd_start))
+    app.add_handler(CommandHandler("status",         cmd_status))
+    app.add_handler(CommandHandler("setup",          cmd_setup))
     app.add_handler(CommandHandler("emergency_stop", cmd_emergency_stop))
+
+    # Inline button callbacks
+    app.add_handler(CallbackQueryHandler(_cb_status,        pattern=f"^{CB_STATUS}$"))
+    app.add_handler(CallbackQueryHandler(_cb_refresh,       pattern=f"^{CB_REFRESH}$"))
+    app.add_handler(CallbackQueryHandler(_cb_settings,      pattern=f"^{CB_SETTINGS}$"))
+    app.add_handler(CallbackQueryHandler(_cb_estop,         pattern=f"^{CB_ESTOP}$"))
+    app.add_handler(CallbackQueryHandler(_cb_estop_confirm, pattern=f"^{CB_ESTOP_CONFIRM}$"))
+    app.add_handler(CallbackQueryHandler(_cb_estop_cancel,  pattern=f"^{CB_ESTOP_CANCEL}$"))
+    app.add_handler(CallbackQueryHandler(_cb_back_menu,     pattern=f"^{CB_BACK_MENU}$"))
+    app.add_handler(CallbackQueryHandler(_cb_strat_normal,  pattern=f"^{CB_STRAT_NORMAL}$"))
+    app.add_handler(CallbackQueryHandler(_cb_strat_aggr,    pattern=f"^{CB_STRAT_AGGR}$"))
+    app.add_handler(CallbackQueryHandler(_cb_strat_cons,    pattern=f"^{CB_STRAT_CONS}$"))
+
+    # Free-text handler for the setup conversation flow
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_setup_text))
+
     return app
