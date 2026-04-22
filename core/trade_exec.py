@@ -195,6 +195,42 @@ async def cancel_order(symbol: str, order_id: str) -> dict:
     return await _request("DELETE", "/api/v3/order", params, signed=True)
 
 
+async def fetch_klines(
+    symbol: str,
+    interval: str,
+    limit: int = 100,
+) -> list[dict]:
+    """
+    Fetch OHLCV candlestick data from MEXC REST API.
+
+    interval examples: "1m", "5m", "15m", "30m", "1h", "4h", "1d"
+    Returns a list of dicts with keys: open_time, open, high, low, close, volume.
+    Sorted oldest → newest.
+    """
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": limit,
+    }
+    raw = await _request("GET", "/api/v3/klines", params)
+    # MEXC klines format: [open_time, open, high, low, close, volume, ...]
+    candles = []
+    for row in raw:
+        try:
+            candles.append({
+                "open_time": int(row[0]),
+                "open":      float(row[1]),
+                "high":      float(row[2]),
+                "low":       float(row[3]),
+                "close":     float(row[4]),
+                "volume":    float(row[5]),
+            })
+        except (IndexError, ValueError, TypeError):
+            continue
+    logger.debug("Fetched %d klines for %s [%s]", len(candles), symbol, interval)
+    return candles
+
+
 async def get_order(symbol: str, order_id: str) -> dict:
     """Fetch the current status of an order."""
     params = {

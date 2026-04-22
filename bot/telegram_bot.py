@@ -50,6 +50,18 @@ CB_BACK_MENU     = "cb_back_menu"
 CB_STRAT_NORMAL  = "cb_strat_normal"
 CB_STRAT_AGGR    = "cb_strat_aggr"
 CB_STRAT_CONS    = "cb_strat_cons"
+CB_TF_5M         = "cb_tf_5m"
+CB_TF_15M        = "cb_tf_15m"
+CB_TF_1H         = "cb_tf_1h"
+CB_TF_4H         = "cb_tf_4h"
+
+# Valid MEXC kline intervals mapped from callback data
+TIMEFRAME_MAP: dict[str, str] = {
+    CB_TF_5M:  "5m",
+    CB_TF_15M: "15m",
+    CB_TF_1H:  "1h",
+    CB_TF_4H:  "4h",
+}
 
 # ── In-memory runtime state ────────────────────────────────────────────────────
 
@@ -110,12 +122,26 @@ def _estop_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _timeframe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⏱ 5m",  callback_data=CB_TF_5M),
+            InlineKeyboardButton("⏱ 15m", callback_data=CB_TF_15M),
+        ],
+        [
+            InlineKeyboardButton("⏱ 1h",  callback_data=CB_TF_1H),
+            InlineKeyboardButton("⏱ 4h",  callback_data=CB_TF_4H),
+        ],
+        [InlineKeyboardButton("« Back to menu", callback_data=CB_BACK_MENU)],
+    ])
+
+
 def _strategy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Normal  (SL 1.5% / TP 2%)",      callback_data=CB_STRAT_NORMAL)],
-        [InlineKeyboardButton("⚡ Aggressive (SL 1% / TP 3%)",     callback_data=CB_STRAT_AGGR)],
-        [InlineKeyboardButton("🛡️ Conservative (SL 2% / TP 1.5%)", callback_data=CB_STRAT_CONS)],
-        [InlineKeyboardButton("« Back to menu",                     callback_data=CB_BACK_MENU)],
+        [InlineKeyboardButton("📈 Normal      (impulse ×2, OB vol ×1.5)", callback_data=CB_STRAT_NORMAL)],
+        [InlineKeyboardButton("⚡ Aggressive  (impulse ×1.5, OB vol ×1)", callback_data=CB_STRAT_AGGR)],
+        [InlineKeyboardButton("🛡️ Conservative (impulse ×3, OB vol ×2)",  callback_data=CB_STRAT_CONS)],
+        [InlineKeyboardButton("« Back to menu",                            callback_data=CB_BACK_MENU)],
     ])
 
 
@@ -372,10 +398,19 @@ async def _on_order_filled(order: dict, application: Application) -> None:
     symbol: str = _state.config["symbol"]
     entry_price = float(order.get("price", 0))
     entry_qty = float(order.get("executedQty", 0))
-    sl_pct: float = _state.config.get("stop_loss_pct", 0.985)
-    tp_pct: float = _state.config.get("take_profit_pct", 1.02)
-    tp_price = round(entry_price * tp_pct, get_precision(symbol)["price_precision"])
-    sl_price = round(entry_price * sl_pct, 8)
+    prec = get_precision(symbol)
+
+    # Use OB-derived TP/SL written to config by _start_strategy.
+    # Fall back to fixed percentages only when recovering an older trade record
+    # that pre-dates OB-based logic.
+    sl_price: float = float(
+        _state.config.get("sl_price") or
+        round(entry_price * (1 - _state.config.get("impulse_multiplier", 2.0) * 0.005), 8)
+    )
+    tp_price: float = float(
+        _state.config.get("take_profit_price") or
+        round(entry_price * _state.config.get("tp_fallback_pct", 1.02), prec["price_precision"])
+    )
 
     try:
         tp_resp = await trade_exec.place_limit_sell(symbol, tp_price, entry_qty)
@@ -410,17 +445,22 @@ async def _on_order_filled(order: dict, application: Application) -> None:
         application,
     )
 
-    _arm_sl_watcher(symbol, entry_price, entry_qty, exit_order_id, sl_pct, application)
+    # VirtualStopLossWatcher expects stop_loss_pct as a ratio (e.g. 0.985).
+    # Derive it from the absolute OB-based sl_price.
+    sl_ratio = sl_price / entry_price if entry_price else 0.985
+    _arm_sl_watcher(symbol, entry_price, entry_qty, exit_order_id, sl_ratio, application)
 
 
 async def _start_strategy(application: Application) -> None:
     """
-    Subscribe to WS, then loop FOREVER until an entry signal is found.
-    No timeout — keeps scanning until conditions are met or emergency stop.
+    Subscribe to WS, fetch klines to detect Order Blocks, then loop until
+    an OB-confirmed entry signal is found. TP and SL are set dynamically
+    from the detected OB zones — no fixed percentages.
     """
     db = get_db()
     symbol: str = _state.config["symbol"]
     quote_amount: float = _state.config["quote_amount"]
+    timeframe: str = _state.config.get("timeframe", "15m")
     tick_size: float = float(get_precision(symbol)["tick_size"])
 
     _start_ws(symbol)
@@ -430,20 +470,45 @@ async def _start_strategy(application: Application) -> None:
         wall_multiplier=_state.config.get("wall_multiplier", 3.0),
         sma_period=_state.config.get("sma_period", 20),
         price_precision=get_precision(symbol)["price_precision"],
+        impulse_multiplier=_state.config.get("impulse_multiplier", 2.0),
+        ob_volume_threshold=_state.config.get("ob_volume_threshold", 1.5),
+        tp_fallback_pct=_state.config.get("tp_fallback_pct", 1.02),
     )
+
+    # Fetch candles and detect Order Blocks (refreshed every 5 minutes)
+    _OB_REFRESH_INTERVAL = 300  # seconds
+    last_ob_refresh: float = 0.0
 
     attempt = 0
     signal = None
     while _state.running and signal is None:
+        now = time.time()
+
+        # Periodically refresh OB detection from fresh klines
+        if now - last_ob_refresh >= _OB_REFRESH_INTERVAL or last_ob_refresh == 0:
+            try:
+                candles = await trade_exec.fetch_klines(symbol, timeframe, limit=100)
+                _state.analyzer.detect_order_blocks(candles)
+                last_ob_refresh = now
+                logger.info(
+                    "OBs refreshed for %s [%s]: %d bullish, %d bearish",
+                    symbol, timeframe,
+                    len(_state.analyzer._bullish_obs),
+                    len(_state.analyzer._bearish_obs),
+                )
+            except Exception as exc:
+                logger.error("Failed to fetch klines: %s", exc)
+
         signal = _state.analyzer.find_entry_signal(tick_size)
         if signal:
             break
+
         attempt += 1
         if attempt % 12 == 0:  # log every ~60s
             sma = _state.analyzer.sma()
             price = _state.analyzer._current_price
             logger.info(
-                "Still searching for entry signal (attempt %d) price=%.8f sma=%s",
+                "Searching for OB entry signal (attempt %d) price=%.8f sma=%s",
                 attempt, price, f"{sma:.8f}" if sma else "warming",
             )
         await asyncio.sleep(5)
@@ -451,6 +516,11 @@ async def _start_strategy(application: Application) -> None:
     if not _state.running:
         logger.info("Strategy stopped while searching (emergency stop)")
         return
+
+    # Dynamic TP/SL from the OB signal
+    sl_price = signal.sl_price
+    tp_price = signal.tp_price
+    tp_source = "OB" if signal.tp_ob else "fallback"
 
     try:
         buy_resp = await trade_exec.place_limit_buy(symbol, signal.entry_price, quote_amount)
@@ -462,24 +532,43 @@ async def _start_strategy(application: Application) -> None:
 
     order_id = buy_resp.get("orderId")
 
+    # Persist sl_price and tp_price into config so _on_order_filled can read
+    # them back without recalculating from percentages.
+    _state.config["sl_price"] = sl_price
+    _state.config["take_profit_price"] = tp_price
+
     await db.upsert_state({
         "symbol": symbol,
         "is_active": True,
         "entry_price": signal.entry_price,
         "side": "buy",
         "qty": None,
-        "stop_loss": round(signal.entry_price * _state.config.get("stop_loss_pct", 0.985), 8),
+        "stop_loss": sl_price,
         "config": {
             **_state.config,
             "entry_order_id": order_id,
+            "take_profit_price": tp_price,
+            "sl_price": sl_price,
+            "tp_source": tp_source,
             "trade_status": "pending_fill",
         },
     })
 
+    ob_info = (
+        f"Entry OB: `{signal.entry_ob.low:.8f}` – `{signal.entry_ob.high:.8f}`\n"
+        f"TP OB:    `{signal.tp_ob.low:.8f}` – `{signal.tp_ob.high:.8f}`\n"
+        if signal.tp_ob else
+        f"Entry OB: `{signal.entry_ob.low:.8f}` – `{signal.entry_ob.high:.8f}`\n"
+        f"TP source: fallback ({_state.config.get('tp_fallback_pct', 1.02)}×)\n"
+    )
+
     await send_alert(
         f"📋 *Limit Buy Placed*\n\n"
-        f"Symbol: `{symbol}`\n"
-        f"Price: `{signal.entry_price}`\n"
+        f"Symbol: `{symbol}` | TF: `{timeframe}`\n"
+        f"Entry:  `{signal.entry_price}`\n"
+        f"⚠️ SL:  `{sl_price}` _(below entry OB)_\n"
+        f"🎯 TP:  `{tp_price}` _{('(next bearish OB)' if signal.tp_ob else '(fixed fallback)')}_\n\n"
+        f"{ob_info}"
         f"Wall: `{signal.wall_price}` (vol `{signal.wall_volume:.2f}`)\n"
         f"SMA-20: `{signal.sma:.8f}`\n"
         f"Order ID: `{order_id}`",
@@ -922,26 +1011,60 @@ async def _handle_setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Enter a positive number (e.g. `100`):", parse_mode=ParseMode.MARKDOWN)
             return
         context.user_data["setup_capital"] = capital
-        context.user_data["setup_step"] = "strategy"
+        context.user_data["setup_step"] = "timeframe"
         symbol = context.user_data.get("setup_symbol", "—")
         await update.message.reply_text(
-            f"⚙️ *Quick Setup — Step 3/3*\n\n"
+            f"⚙️ *Quick Setup — Step 3/4*\n\n"
             f"Symbol: `{symbol}` ✅\n"
             f"Capital: `{capital}` ✅\n\n"
-            "Choose a strategy mode:",
+            "Choose the analysis timeframe for Order Block detection:",
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=_strategy_keyboard(),
+            reply_markup=_timeframe_keyboard(),
         )
         return
 
 
-async def _apply_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE, sl_pct: float, tp_pct: float) -> None:
-    """Shared logic to finalise setup after strategy selection."""
+async def _cb_timeframe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle timeframe selection button — advances to strategy step."""
+    query = update.callback_query
+    await query.answer()
+    if not _is_allowed(update):
+        await _deny(update)
+        return
+
+    tf_interval = TIMEFRAME_MAP.get(query.data, "15m")
+    context.user_data["setup_timeframe"] = tf_interval
+    context.user_data["setup_step"] = "strategy"
+
+    symbol = context.user_data.get("setup_symbol", "—")
+    capital = context.user_data.get("setup_capital", "—")
+
+    await query.edit_message_text(
+        f"⚙️ *Quick Setup — Step 4/4*\n\n"
+        f"Symbol:    `{symbol}` ✅\n"
+        f"Capital:   `{capital}` ✅\n"
+        f"Timeframe: `{tf_interval}` ✅\n\n"
+        "Choose a strategy sensitivity:\n"
+        "_(Controls how strong an impulse must be to qualify as an Order Block)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_strategy_keyboard(),
+    )
+
+
+async def _apply_strategy(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    impulse_multiplier: float,
+    ob_volume_threshold: float,
+    tp_fallback_pct: float,
+) -> None:
+    """Finalise setup after strategy sensitivity selection."""
     query = update.callback_query
     await query.answer()
 
-    symbol = context.user_data.get("setup_symbol")
-    capital = context.user_data.get("setup_capital")
+    symbol    = context.user_data.get("setup_symbol")
+    capital   = context.user_data.get("setup_capital")
+    timeframe = context.user_data.get("setup_timeframe", "15m")
 
     if not symbol or not capital:
         await query.edit_message_text(
@@ -971,10 +1094,12 @@ async def _apply_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE, sl
     _state.config = {
         "symbol": symbol,
         "quote_amount": capital,
+        "timeframe": timeframe,
         "wall_multiplier": 3.0,
         "sma_period": 20,
-        "stop_loss_pct": 1 - sl_pct / 100,
-        "take_profit_pct": 1 + tp_pct / 100,
+        "impulse_multiplier": impulse_multiplier,
+        "ob_volume_threshold": ob_volume_threshold,
+        "tp_fallback_pct": tp_fallback_pct,
         "price_precision": prec["price_precision"],
         "qty_precision": prec["qty_precision"],
         "tick_size": prec["tick_size"],
@@ -995,12 +1120,12 @@ async def _apply_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE, sl
 
     msg = await query.edit_message_text(
         f"✅ *Setup complete — Strategy started!*\n\n"
-        f"🔍 Symbol:  `{symbol}`\n"
-        f"💰 Capital: `{capital}`\n"
-        f"⚠️ SL:      `{sl_pct}%`\n"
-        f"🎯 TP:      `{tp_pct}%`\n"
-        f"📐 Tick:    `{prec['tick_size']}`\n\n"
-        "🟡 Scanning for entry signal…",
+        f"🔍 Symbol:    `{symbol}`\n"
+        f"💰 Capital:   `{capital}`\n"
+        f"⏱ Timeframe: `{timeframe}`\n"
+        f"📐 Tick:      `{prec['tick_size']}`\n\n"
+        "🟡 Scanning for Order Block entry signal…\n"
+        "_(TP/SL will be set dynamically from detected OB zones)_",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=_main_menu_keyboard(),
     )
@@ -1016,21 +1141,21 @@ async def _apply_strategy(update: Update, context: ContextTypes.DEFAULT_TYPE, sl
 
 
 async def _cb_strat_normal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _apply_strategy(update, context, sl_pct=1.5, tp_pct=2.0)
+    await _apply_strategy(update, context, impulse_multiplier=2.0, ob_volume_threshold=1.5, tp_fallback_pct=1.02)
 
 
 async def _cb_strat_aggr(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _apply_strategy(update, context, sl_pct=1.0, tp_pct=3.0)
+    await _apply_strategy(update, context, impulse_multiplier=1.5, ob_volume_threshold=1.0, tp_fallback_pct=1.03)
 
 
 async def _cb_strat_cons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _apply_strategy(update, context, sl_pct=2.0, tp_pct=1.5)
+    await _apply_strategy(update, context, impulse_multiplier=3.0, ob_volume_threshold=2.0, tp_fallback_pct=1.015)
 
 
 # ── Legacy text commands (kept for backward compatibility) ─────────────────────
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/setup <symbol> <quote_amount> [sl_pct] [tp_pct]"""
+    """/setup <symbol> <quote_amount> [timeframe]  — TP/SL set dynamically from OBs."""
     if not _is_allowed(update):
         await _deny(update)
         return
@@ -1038,8 +1163,10 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: `/setup <symbol> <quote_amount> [sl_pct] [tp_pct]`\n"
-            "Example: `/setup BTCUSDT 100 1.5 2.0`\n\n"
+            "Usage: `/setup <symbol> <quote_amount> [timeframe]`\n"
+            "Example: `/setup BTCUSDT 100 15m`\n\n"
+            "Timeframes: `1m` `5m` `15m` `30m` `1h` `4h`\n"
+            "TP and SL are set automatically from detected Order Block zones.\n\n"
             "Or use /start for the interactive dashboard.",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1048,10 +1175,17 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = args[0].upper()
     try:
         quote_amount = float(args[1])
-        sl_pct_val = float(args[2]) if len(args) > 2 else 1.5
-        tp_pct_val = float(args[3]) if len(args) > 3 else 2.0
     except ValueError:
-        await update.message.reply_text("❌ Invalid numeric argument.")
+        await update.message.reply_text("❌ Invalid quote amount.")
+        return
+
+    timeframe = args[2] if len(args) > 2 else "15m"
+    valid_tfs = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+    if timeframe not in valid_tfs:
+        await update.message.reply_text(
+            f"❌ Invalid timeframe `{timeframe}`. Choose from: {', '.join(sorted(valid_tfs))}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     if _state.running:
@@ -1069,10 +1203,12 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _state.config = {
         "symbol": symbol,
         "quote_amount": quote_amount,
+        "timeframe": timeframe,
         "wall_multiplier": 3.0,
         "sma_period": 20,
-        "stop_loss_pct": 1 - sl_pct_val / 100,
-        "take_profit_pct": 1 + tp_pct_val / 100,
+        "impulse_multiplier": 2.0,
+        "ob_volume_threshold": 1.5,
+        "tp_fallback_pct": 1.02,
         "price_precision": prec["price_precision"],
         "qty_precision": prec["qty_precision"],
         "tick_size": prec["tick_size"],
@@ -1093,12 +1229,12 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     msg = await update.message.reply_text(
         f"✅ *Setup complete*\n\n"
-        f"Symbol: `{symbol}`\n"
-        f"Quote: `{quote_amount}`\n"
-        f"SL: `{sl_pct_val}%`\n"
-        f"TP: `{tp_pct_val}%`\n"
-        f"Tick: `{prec['tick_size']}`\n\n"
-        "🟡 Starting strategy…",
+        f"Symbol:    `{symbol}`\n"
+        f"Capital:   `{quote_amount}`\n"
+        f"Timeframe: `{timeframe}`\n"
+        f"Tick:      `{prec['tick_size']}`\n\n"
+        "🟡 Scanning for Order Block entry signal…\n"
+        "_(TP/SL will be set dynamically from OB zones)_",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=_main_menu_keyboard(),
     )
@@ -1206,6 +1342,10 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(_cb_estop_confirm, pattern=f"^{CB_ESTOP_CONFIRM}$"))
     app.add_handler(CallbackQueryHandler(_cb_estop_cancel,  pattern=f"^{CB_ESTOP_CANCEL}$"))
     app.add_handler(CallbackQueryHandler(_cb_back_menu,     pattern=f"^{CB_BACK_MENU}$"))
+    # Timeframe selection
+    app.add_handler(CallbackQueryHandler(_cb_timeframe, pattern=f"^({CB_TF_5M}|{CB_TF_15M}|{CB_TF_1H}|{CB_TF_4H})$"))
+
+    # Strategy sensitivity selection
     app.add_handler(CallbackQueryHandler(_cb_strat_normal,  pattern=f"^{CB_STRAT_NORMAL}$"))
     app.add_handler(CallbackQueryHandler(_cb_strat_aggr,    pattern=f"^{CB_STRAT_AGGR}$"))
     app.add_handler(CallbackQueryHandler(_cb_strat_cons,    pattern=f"^{CB_STRAT_CONS}$"))
