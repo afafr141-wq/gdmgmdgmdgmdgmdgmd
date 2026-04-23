@@ -129,7 +129,7 @@ class MexcClient:
 
     async def market_sell_all(self, symbol: str) -> Optional[dict]:
         """Sell entire free balance of the base currency at market price."""
-        base = symbol.split("/")[0] if "/" in symbol else symbol.replace("USDT", "")
+        base = symbol.split("/")[0]
         qty = await self.get_balance(base)
         qty = self.round_amount(symbol, qty)
         if qty <= 0 or qty < self.min_amount(symbol):

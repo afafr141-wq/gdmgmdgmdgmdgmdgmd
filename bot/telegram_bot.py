@@ -15,7 +15,19 @@ from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALLOWED_USER_I
 
 logger = logging.getLogger(__name__)
 
-POPULAR_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+POPULAR_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """Convert BTCUSDT → BTC/USDT for ccxt compatibility."""
+    symbol = symbol.upper().replace("-", "").replace("_", "")
+    if "/" not in symbol:
+        # Try common quote currencies
+        for quote in ("USDT", "USDC", "BTC", "ETH", "BNB"):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                base = symbol[: -len(quote)]
+                return f"{base}/{quote}"
+    return symbol
 RISK_LEVELS = ["low", "medium", "high"]
 
 _engine = None
@@ -157,7 +169,7 @@ async def cmd_start_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
         return
-    symbol, amount_str, risk = args[0].upper(), args[1], args[2].lower()
+    symbol, amount_str, risk = _normalize_symbol(args[0]), args[1], args[2].lower()
     if risk not in RISK_LEVELS:
         await update.message.reply_text(f"❌ المخاطرة يجب أن تكون: {', '.join(RISK_LEVELS)}")
         return
@@ -175,7 +187,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
         await update.message.reply_text("❌ الاستخدام: `/status SYMBOL`", parse_mode="Markdown")
         return
-    await _send_status(update, ctx.args[0].upper())
+    await _send_status(update, _normalize_symbol(ctx.args[0]))
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -184,7 +196,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
         await update.message.reply_text("❌ الاستخدام: `/stop SYMBOL`", parse_mode="Markdown")
         return
-    await _do_stop(update, ctx.args[0].upper())
+    await _do_stop(update, _normalize_symbol(ctx.args[0]))
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -195,10 +207,44 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _launch_grid(update: Update, symbol: str, amount: float, risk: str) -> None:
     msg = update.message or (update.callback_query.message if update.callback_query else None)
+
+    # ── Pre-flight checks ──────────────────────────────────────────────────────
+    # 1. Validate symbol exists on MEXC
+    try:
+        await _client.load_markets()
+        price = await _client.get_current_price(symbol)
+    except Exception as exc:
+        logger.exception("pre-flight price fetch failed for %s: %s", symbol, exc)
+        await msg.reply_text(
+            f"❌ *تعذّر الاتصال بـ MEXC*\n`{type(exc).__name__}: {exc}`\n\n"
+            "تحقق من:\n• صحة `MEXC_API_KEY` و `MEXC_API_SECRET`\n• أن الزوج `{symbol}` موجود على MEXC",
+            parse_mode="Markdown",
+        )
+        return
+
+    # 2. Check USDT balance
+    try:
+        usdt_balance = await _client.get_balance("USDT")
+    except Exception as exc:
+        logger.exception("balance fetch failed: %s", exc)
+        usdt_balance = 0.0
+
+    if usdt_balance < amount:
+        await msg.reply_text(
+            f"❌ *رصيد غير كافٍ*\n"
+            f"المطلوب: `${amount:.2f}` USDT\n"
+            f"المتاح: `${usdt_balance:.2f}` USDT",
+            parse_mode="Markdown",
+        )
+        return
+
     await msg.reply_text(
-        f"⏳ جاري بدء شبكة *{symbol}* بمبلغ `${amount}` ومخاطرة `{risk}`…",
+        f"⏳ جاري بدء شبكة *{symbol}* بمبلغ `${amount}` ومخاطرة `{risk}`…\n"
+        f"💵 السعر الحالي: `{price:.4f}`\n"
+        f"💰 الرصيد المتاح: `${usdt_balance:.2f}` USDT",
         parse_mode="Markdown",
     )
+
     try:
         state = await _engine.start(symbol, amount, risk)
         p = state.params
@@ -213,10 +259,14 @@ async def _launch_grid(update: Update, symbol: str, amount: float, risk: str) ->
             reply_markup=_active_grid_kb(symbol),
         )
     except ValueError as exc:
+        logger.warning("start grid ValueError for %s: %s", symbol, exc)
         await msg.reply_text(f"⚠️ {exc}")
     except Exception as exc:
-        logger.exception("start grid error: %s", exc)
-        await msg.reply_text(f"❌ خطأ: {exc}")
+        logger.exception("start grid error for %s: %s", symbol, exc)
+        await msg.reply_text(
+            f"❌ *خطأ أثناء بدء الشبكة*\n`{type(exc).__name__}: {exc}`",
+            parse_mode="Markdown",
+        )
 
 
 async def _send_status(update: Update, symbol: str) -> None:
@@ -325,7 +375,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("📈 *اختر الزوج لعرض تقاريره:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
     elif data.startswith("pair_"):
-        symbol = data[5:]
+        symbol = _normalize_symbol(data[5:])
         ctx.user_data["pending_symbol"] = symbol
         ctx.user_data["awaiting"] = "amount"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
