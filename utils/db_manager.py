@@ -110,30 +110,69 @@ async def _create_tables() -> None:
 # ── active_grids CRUD ──────────────────────────────────────────────────────────
 
 async def upsert_grid(data: dict) -> int:
-    """Insert or update a grid row. Returns the row id."""
+    """
+    Insert or update a grid row using a fixed-column UPSERT.
+    All numeric columns are cast explicitly to avoid asyncpg type-inference
+    errors ('could not determine data type of parameter $N').
+    Only the keys present in `data` are written; missing keys keep their
+    current DB value via DO UPDATE SET ... = COALESCE(EXCLUDED.col, col).
+    """
     pool = get_db()
-    symbol = data["symbol"]
+
+    # Provide defaults for every column so the INSERT path always works
+    row = {
+        "symbol":           data.get("symbol", ""),
+        "risk_level":       data.get("risk_level", "medium"),
+        "total_investment": float(data.get("total_investment", 0)),
+        "lower_price":      float(data.get("lower_price", 0)),
+        "upper_price":      float(data.get("upper_price", 0)),
+        "grid_count":       int(data.get("grid_count", 0)),
+        "grid_spacing":     float(data.get("grid_spacing", 0)),
+        "current_atr":      float(data.get("current_atr", 0)) if data.get("current_atr") is not None else None,
+        "is_active":        bool(data.get("is_active", True)),
+    }
+
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT id FROM active_grids WHERE symbol = $1", symbol
+        grid_id = await conn.fetchval(
+            """
+            INSERT INTO active_grids
+                (symbol, risk_level, total_investment, lower_price, upper_price,
+                 grid_count, grid_spacing, current_atr, is_active)
+            VALUES
+                ($1, $2, $3::numeric, $4::numeric, $5::numeric,
+                 $6::integer, $7::numeric, $8::numeric, $9::boolean)
+            ON CONFLICT (symbol) DO UPDATE SET
+                risk_level       = COALESCE(EXCLUDED.risk_level,       active_grids.risk_level),
+                total_investment = CASE WHEN $3::numeric > 0
+                                        THEN $3::numeric
+                                        ELSE active_grids.total_investment END,
+                lower_price      = CASE WHEN $4::numeric > 0
+                                        THEN $4::numeric
+                                        ELSE active_grids.lower_price END,
+                upper_price      = CASE WHEN $5::numeric > 0
+                                        THEN $5::numeric
+                                        ELSE active_grids.upper_price END,
+                grid_count       = CASE WHEN $6::integer > 0
+                                        THEN $6::integer
+                                        ELSE active_grids.grid_count END,
+                grid_spacing     = CASE WHEN $7::numeric > 0
+                                        THEN $7::numeric
+                                        ELSE active_grids.grid_spacing END,
+                current_atr      = COALESCE($8::numeric, active_grids.current_atr),
+                is_active        = EXCLUDED.is_active,
+                updated_at       = NOW()
+            RETURNING id
+            """,
+            row["symbol"],
+            row["risk_level"],
+            row["total_investment"],
+            row["lower_price"],
+            row["upper_price"],
+            row["grid_count"],
+            row["grid_spacing"],
+            row["current_atr"],
+            row["is_active"],
         )
-        if row:
-            grid_id = row["id"]
-            sets = ", ".join(
-                f"{k} = ${i+2}" for i, k in enumerate(data.keys()) if k != "symbol"
-            )
-            vals = [v for k, v in data.items() if k != "symbol"]
-            await conn.execute(
-                f"UPDATE active_grids SET {sets}, updated_at = NOW() WHERE id = $1",
-                grid_id, *vals,
-            )
-        else:
-            cols = ", ".join(data.keys())
-            placeholders = ", ".join(f"${i+1}" for i in range(len(data)))
-            grid_id = await conn.fetchval(
-                f"INSERT INTO active_grids ({cols}) VALUES ({placeholders}) RETURNING id",
-                *data.values(),
-            )
     return grid_id
 
 
@@ -208,9 +247,9 @@ async def get_trade_history(symbol: str, days: int = 30) -> list[dict]:
         rows = await conn.fetch(
             """SELECT * FROM trade_history
                WHERE symbol = $1
-                 AND executed_at >= NOW() - ($2 || ' days')::INTERVAL
+                 AND executed_at >= NOW() - ($2 * INTERVAL '1 day')
                ORDER BY executed_at DESC""",
-            symbol, str(days),
+            symbol, days,
         )
     return [dict(r) for r in rows]
 
