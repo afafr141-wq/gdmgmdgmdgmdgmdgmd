@@ -1,100 +1,77 @@
 """
-Central configuration: loads env vars and provides symbol precision helpers.
-
-On Railway, all variables are injected directly into the process environment —
-load_dotenv() is a no-op there but still works for local development.
-
-Precision data is fetched once from MEXC /api/v3/exchangeInfo and cached
-so every module can call get_precision(symbol) without extra HTTP calls.
+Central configuration: env-var loading and risk-profile presets.
 """
-
 import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()  # no-op on Railway; used for local .env files
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # ── Credentials ────────────────────────────────────────────────────────────────
 MEXC_API_KEY: str = os.getenv("MEXC_API_KEY", "")
-MEXC_SECRET_KEY: str = os.getenv("MEXC_SECRET_KEY", "")
+MEXC_API_SECRET: str = os.getenv("MEXC_API_SECRET", "")
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
-# Comma-separated Telegram user IDs allowed to control the bot
-_raw_ids = os.getenv("ALLOWED_USER_IDS", "")
-ALLOWED_USER_IDS: set[int] = {
-    int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip().isdigit()
-}
-
-# ── Database ───────────────────────────────────────────────────────────────────
-# Direct PostgreSQL connection string (Supabase pooler recommended for free tier).
-# Format: postgresql://postgres.<project-ref>:<password>@aws-1-<region>.pooler.supabase.com:6543/postgres
-# Set DATABASE_URL in Railway's Variables tab; never commit the real value.
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-
-# ── Runtime paths (local fallback only) ───────────────────────────────────────
-# state.json is no longer the primary store; kept for local dev without Supabase.
-STATE_PATH: str = os.getenv("STATE_PATH", "data/state.json")
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-# Set LOG_LEVEL=DEBUG in Railway dashboard for verbose output during debugging.
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# ── MEXC REST endpoints ────────────────────────────────────────────────────────
-MEXC_BASE_URL: str = "https://api.mexc.com"
-MEXC_WS_URL: str = "wss://wbs.mexc.com/ws"
+# ── Allowed Telegram users ─────────────────────────────────────────────────────
+_raw_ids = os.getenv("ALLOWED_USER_IDS", "")
+ALLOWED_USER_IDS: set[int] = (
+    {int(uid.strip()) for uid in _raw_ids.split(",") if uid.strip()}
+    if _raw_ids
+    else set()
+)
 
-# ── WebSocket settings ─────────────────────────────────────────────────────────
-WS_HEARTBEAT_INTERVAL: int = 20   # seconds between PING frames
-WS_RECONNECT_DELAY: int = 5       # seconds before first reconnect attempt
+# ── Risk profiles ──────────────────────────────────────────────────────────────
+# Each profile controls how the AI grid engine sizes the range and grid count.
+RISK_PROFILES: dict[str, dict] = {
+    "low": {
+        "atr_multiplier": 1.5,   # range = ATR × multiplier (each side)
+        "min_grids": 5,
+        "max_grids": 10,
+        "atr_period": 14,
+        "rebalance_trigger": 1.0,  # rebuild when price moves ≥ 1× ATR outside range
+    },
+    "medium": {
+        "atr_multiplier": 2.0,
+        "min_grids": 8,
+        "max_grids": 20,
+        "atr_period": 14,
+        "rebalance_trigger": 1.0,
+    },
+    "high": {
+        "atr_multiplier": 3.0,
+        "min_grids": 15,
+        "max_grids": 30,
+        "atr_period": 14,
+        "rebalance_trigger": 1.0,
+    },
+}
 
-# ── Strategy defaults (overridden per /setup call) ────────────────────────────
-DEFAULT_WALL_MULTIPLIER: float = 3.0   # volume > avg * multiplier → wall
-DEFAULT_SMA_PERIOD: int = 20
-DEFAULT_STOP_LOSS_PCT: float = 0.985   # 1.5% below entry
-DEFAULT_TAKE_PROFIT_PCT: float = 1.02  # 2% above entry
+# ── ATR recalculation interval ─────────────────────────────────────────────────
+ATR_REFRESH_SECONDS: int = 300   # every 5 minutes
+CANDLE_TIMEFRAME: str = "15m"    # 15-minute candles for ATR
 
-# ── Precision cache ────────────────────────────────────────────────────────────
-# Populated at startup by fetch_precision(); shape:
-#   { "BTCUSDT": {"price_precision": 2, "qty_precision": 5, "tick_size": "0.01"} }
-_precision_cache: dict[str, dict] = {}
-
-
-def set_precision(symbol: str, price_precision: int, qty_precision: int, tick_size: str) -> None:
-    """Store precision data for a symbol (called after exchangeInfo fetch)."""
-    _precision_cache[symbol.upper()] = {
-        "price_precision": price_precision,
-        "qty_precision": qty_precision,
-        "tick_size": tick_size,
-    }
-    logger.debug("Precision cached for %s: price=%d qty=%d tick=%s",
-                 symbol, price_precision, qty_precision, tick_size)
-
-
-def get_precision(symbol: str) -> dict:
-    """
-    Return cached precision dict for symbol.
-    Falls back to safe defaults if symbol was never fetched.
-    """
-    return _precision_cache.get(symbol.upper(), {
-        "price_precision": 8,
-        "qty_precision": 8,
-        "tick_size": "0.00000001",
-    })
+# ── Order management ───────────────────────────────────────────────────────────
+ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
+FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
 
-def validate_env() -> list[str]:
-    """Return a list of missing required env-var names."""
-    missing = []
-    if not MEXC_API_KEY:
-        missing.append("MEXC_API_KEY")
-    if not MEXC_SECRET_KEY:
-        missing.append("MEXC_SECRET_KEY")
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not ALLOWED_USER_IDS:
-        missing.append("ALLOWED_USER_IDS")
-    if not DATABASE_URL:
-        missing.append("DATABASE_URL")
-    return missing
+def validate_env() -> None:
+    """Raise if any required variable is missing."""
+    missing = [
+        name
+        for name, val in [
+            ("MEXC_API_KEY", MEXC_API_KEY),
+            ("MEXC_API_SECRET", MEXC_API_SECRET),
+            ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+            ("DATABASE_URL", DATABASE_URL),
+        ]
+        if not val
+    ]
+    if missing:
+        raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}")
+    logger.info("Environment validated OK")
