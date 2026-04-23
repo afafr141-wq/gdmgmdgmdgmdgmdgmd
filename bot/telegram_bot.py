@@ -120,6 +120,10 @@ def _fmt_report(r: dict) -> str:
         f"🪙 الكمية المحتجزة: `{r['held_qty']:.6f}`\n"
         f"✅ أوامر بيع منفذة: `{r['sell_count']}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 أوامر شراء نشطة: `{r.get('active_buys', 0)}`\n"
+        f"🔴 أوامر بيع نشطة: `{r.get('active_sells', 0)}`\n"
+        f"🔓 إجمالي الأوامر المفتوحة: `{r['open_orders']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💹 ربح الشبكة: `${r['grid_profit']:.4f}`\n"
         f"📈 أرباح غير محققة: `${r['unrealised_pnl']:.4f}`\n"
         f"✅ أرباح محققة: `${r['realized_pnl']:.4f}`\n"
@@ -128,7 +132,6 @@ def _fmt_report(r: dict) -> str:
         f"📅 أيام التشغيل: `{r['days_running']:.1f}`\n"
         f"📊 APY الكلي: `{r['apy']:.2f}%`\n"
         f"📊 APY الشبكة: `{r['grid_apy']:.2f}%`\n"
-        f"🔓 أوامر مفتوحة: `{r['open_orders']}`\n"
         f"⚠️ المخاطرة: `{r['risk']}`"
     )
 
