@@ -15,7 +15,32 @@ from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALLOWED_USER_I
 
 logger = logging.getLogger(__name__)
 
-POPULAR_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+# Default quick-select pairs — editable via /addpair and /removepair commands
+# or by changing bot_config key "popular_pairs" in Supabase directly.
+DEFAULT_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+
+# In-memory cache; refreshed from DB on each menu open
+_popular_pairs: list[str] = list(DEFAULT_PAIRS)
+
+
+async def _load_popular_pairs() -> list[str]:
+    """Load pairs from bot_config table; fall back to DEFAULT_PAIRS."""
+    global _popular_pairs
+    try:
+        from utils import db_manager as db
+        raw = await db.get_config("popular_pairs", "")
+        if raw:
+            _popular_pairs = [p.strip() for p in raw.split(",") if p.strip()]
+        else:
+            _popular_pairs = list(DEFAULT_PAIRS)
+    except Exception:
+        _popular_pairs = list(DEFAULT_PAIRS)
+    return _popular_pairs
+
+
+async def _save_popular_pairs(pairs: list[str]) -> None:
+    from utils import db_manager as db
+    await db.set_config("popular_pairs", ",".join(pairs))
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -68,9 +93,18 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _pair_kb() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(p, callback_data=f"pair_{p}")] for p in POPULAR_PAIRS]
-    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
+def _pair_kb(pairs: list[str] | None = None) -> InlineKeyboardMarkup:
+    pairs = pairs or _popular_pairs
+    # Two pairs per row for compact display
+    rows = []
+    for i in range(0, len(pairs), 2):
+        row = [InlineKeyboardButton(pairs[i], callback_data=f"pair_{pairs[i]}")]
+        if i + 1 < len(pairs):
+            row.append(InlineKeyboardButton(pairs[i + 1], callback_data=f"pair_{pairs[i + 1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔍 زوج آخر", callback_data="pair_custom")])
+    rows.append([InlineKeyboardButton("⚙️ إدارة الأزواج", callback_data="manage_pairs"),
+                 InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -151,11 +185,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return await _deny(update)
     await update.message.reply_text(
         "📖 *المساعدة*\n\n"
+        "*تداول:*\n"
         "`/start_ai BTCUSDT 500 medium` — بدء شبكة ذكية\n"
         "`/status BTCUSDT` — تقرير الأرباح\n"
         "`/stop BTCUSDT` — إيقاف وبيع\n"
-        "`/list` — الأزواج النشطة\n"
-        "`/help` — هذه الرسالة\n\n"
+        "`/list` — الأزواج النشطة\n\n"
+        "*إدارة الأزواج السريعة:*\n"
+        "`/pairs` — عرض القائمة الحالية\n"
+        "`/addpair ADAUSDT` — إضافة زوج للقائمة\n"
+        "`/removepair ADAUSDT` — حذف زوج من القائمة\n\n"
+        "*ملاحظة:* أي زوج يدعمه MEXC يعمل مع `/start_ai`\nمثال: `ADAUSDT`, `DOGEUSDT`, `MATICUSDT`\n\n"
         "*مستويات المخاطرة:*\n"
         "🟢 `low` | 🟡 `medium` | 🔴 `high`",
         parse_mode="Markdown",
@@ -206,6 +245,56 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
     await _send_list(update)
+
+
+async def cmd_pairs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current quick-select pairs list."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    pairs = await _load_popular_pairs()
+    text = "📋 *الأزواج المحفوظة في القائمة السريعة:*\n" + "\n".join(f"• `{p}`" for p in pairs)
+    text += "\n\n`/addpair BTC/USDT` — إضافة زوج\n`/removepair BTC/USDT` — حذف زوج"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_addpair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a pair to the quick-select list: /addpair SOLUSDT"""
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not ctx.args:
+        await update.message.reply_text("❌ الاستخدام: `/addpair SYMBOL`\nمثال: `/addpair SOLUSDT`", parse_mode="Markdown")
+        return
+    symbol = _normalize_symbol(ctx.args[0])
+    # Validate on MEXC
+    try:
+        await _client.get_current_price(symbol)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ الزوج `{symbol}` غير موجود على MEXC:\n`{exc}`", parse_mode="Markdown")
+        return
+    pairs = await _load_popular_pairs()
+    if symbol in pairs:
+        await update.message.reply_text(f"⚠️ `{symbol}` موجود بالفعل في القائمة.", parse_mode="Markdown")
+        return
+    pairs.append(symbol)
+    await _save_popular_pairs(pairs)
+    await update.message.reply_text(f"✅ تمت إضافة `{symbol}` إلى القائمة السريعة.", parse_mode="Markdown")
+
+
+async def cmd_removepair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a pair from the quick-select list: /removepair SOLUSDT"""
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not ctx.args:
+        await update.message.reply_text("❌ الاستخدام: `/removepair SYMBOL`", parse_mode="Markdown")
+        return
+    symbol = _normalize_symbol(ctx.args[0])
+    pairs = await _load_popular_pairs()
+    if symbol not in pairs:
+        await update.message.reply_text(f"⚠️ `{symbol}` غير موجود في القائمة.", parse_mode="Markdown")
+        return
+    pairs.remove(symbol)
+    await _save_popular_pairs(pairs)
+    await update.message.reply_text(f"✅ تم حذف `{symbol}` من القائمة السريعة.", parse_mode="Markdown")
 
 
 async def _launch_grid(update: Update, symbol: str, amount: float, risk: str) -> None:
@@ -329,7 +418,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("🤖 *AI Grid Bot — MEXC*\nاختر من القائمة:", parse_mode="Markdown", reply_markup=_main_menu_kb())
 
     elif data == "menu_start":
-        await query.edit_message_text("🚀 *بدء شبكة جديدة*\nاختر الزوج:", parse_mode="Markdown", reply_markup=_pair_kb())
+        pairs = await _load_popular_pairs()
+        await query.edit_message_text(
+            "🚀 *بدء شبكة جديدة*\nاختر الزوج أو اضغط 🔍 لإدخال أي زوج:",
+            parse_mode="Markdown",
+            reply_markup=_pair_kb(pairs),
+        )
 
     elif data in ("menu_status", "menu_list"):
         symbols = _engine.active_symbols()
@@ -376,6 +470,25 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             rows = [[InlineKeyboardButton(f"📈 {s}", callback_data=f"reports_{s}")] for s in symbols]
             rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
             await query.edit_message_text("📈 *اختر الزوج لعرض تقاريره:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "pair_custom":
+        ctx.user_data["awaiting"] = "custom_symbol"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
+        await query.edit_message_text(
+            "🔍 *إدخال زوج مخصص*\n\nاكتب رمز الزوج:\n"
+            "مثال: `ADAUSDT` أو `ADA/USDT` أو `DOGEUSDT`\n\n"
+            "أي زوج يدعمه MEXC يعمل.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data == "manage_pairs":
+        pairs = await _load_popular_pairs()
+        text = "⚙️ *إدارة الأزواج السريعة*\n\n"
+        text += "\n".join(f"`{p}`" for p in pairs)
+        text += "\n\n*لإضافة زوج:* `/addpair SYMBOL`\n*لحذف زوج:* `/removepair SYMBOL`\n*لعرض القائمة:* `/pairs`"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
 
     elif data.startswith("pair_"):
         symbol = _normalize_symbol(data[5:])
@@ -484,14 +597,38 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return
-    if ctx.user_data.get("awaiting") != "amount":
+    awaiting = ctx.user_data.get("awaiting")
+
+    # ── Custom symbol input ────────────────────────────────────────────────────
+    if awaiting == "custom_symbol":
+        symbol = _normalize_symbol(update.message.text.strip())
+        try:
+            price = await _client.get_current_price(symbol)
+        except Exception as exc:
+            await update.message.reply_text(
+                f"❌ الزوج `{symbol}` غير موجود على MEXC:\n`{exc}`\n\nحاول مرة أخرى:",
+                parse_mode="Markdown",
+            )
+            return
+        ctx.user_data["pending_symbol"] = symbol
+        ctx.user_data["awaiting"] = "amount"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
+        await update.message.reply_text(
+            f"✅ *{symbol}* — السعر الحالي: `{price:.4f}`\n\nأدخل المبلغ بالـ USDT:\n(مثال: `500`)",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Amount input ───────────────────────────────────────────────────────────
+    if awaiting != "amount":
         return
     try:
         amount = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ أدخل رقماً صحيحاً للمبلغ.")
         return
-    symbol = ctx.user_data.get("pending_symbol", "BTCUSDT")
+    symbol = ctx.user_data.get("pending_symbol", "BTC/USDT")
     ctx.user_data["pending_amount"] = amount
     ctx.user_data["awaiting"] = None
     await update.message.reply_text(
@@ -520,6 +657,9 @@ def build_application(engine, client) -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("pairs", cmd_pairs))
+    app.add_handler(CommandHandler("addpair", cmd_addpair))
+    app.add_handler(CommandHandler("removepair", cmd_removepair))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
