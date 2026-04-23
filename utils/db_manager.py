@@ -1,30 +1,17 @@
 """
-Async PostgreSQL database manager using asyncpg.
+Async PostgreSQL manager (asyncpg + PgBouncer transaction mode).
 
-Connects directly to Supabase via the connection-pooler string in DATABASE_URL.
-The pooler endpoint (port 6543) is recommended for the Supabase free tier because
-it multiplexes connections and avoids hitting the 60-connection limit.
-
-All bot state lives in a single row (id=1) of the `bot_state` table.
-The table is created automatically on first startup via `ensure_table()`.
-
-Public API
-----------
-    init_db()               -> DatabaseManager   (call once in main())
-    get_db()                -> DatabaseManager   (singleton accessor)
-
-    db.fetch_state()        -> dict | None
-    db.upsert_state(data)   -> None
-    db.reset_state()        -> None
-    db.is_trade_active()    -> bool
-    db.ensure_table()       -> None              (called by init_db)
-    db.close()              -> None              (called on shutdown)
+Tables managed here:
+  active_grids    – one row per running grid bot
+  trade_history   – every filled buy/sell
+  grid_snapshots  – full grid state saved before shutdown / rebuild
+  bot_config      – global key-value settings
 """
-
 import asyncio
 import json
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import asyncpg
 
@@ -32,246 +19,237 @@ from config.settings import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
-_TABLE = "bot_state"
-_ROW_ID = 1
-
-# Written to the row on first boot and after every reset
-_EMPTY_STATE: dict[str, Any] = {
-    "symbol": None,
-    "is_active": False,
-    "entry_price": None,
-    "side": None,
-    "qty": None,
-    "stop_loss": None,
-    "config": {},
-}
-
-# DDL executed once at startup — idempotent
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS bot_state (
-    id          INTEGER     PRIMARY KEY,
-    symbol      TEXT,
-    is_active   BOOLEAN     NOT NULL DEFAULT FALSE,
-    entry_price FLOAT8,
-    side        TEXT        CHECK (side IN ('buy', 'sell')),
-    qty         FLOAT8,
-    stop_loss   FLOAT8,
-    config      JSONB       NOT NULL DEFAULT '{}'::jsonb,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-
-# Trigger that keeps updated_at current on every write
-_CREATE_TRIGGER_SQL = """
-CREATE OR REPLACE FUNCTION set_updated_at()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-END;
-$$;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_trigger
-        WHERE tgname = 'trg_bot_state_updated_at'
-    ) THEN
-        CREATE TRIGGER trg_bot_state_updated_at
-            BEFORE UPDATE ON bot_state
-            FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-    END IF;
-END;
-$$;
-"""
+_pool: Optional[asyncpg.Pool] = None
 
 
-class DatabaseManager:
-    """
-    Async PostgreSQL client backed by an asyncpg connection pool.
+# ── Pool lifecycle ─────────────────────────────────────────────────────────────
 
-    The pool is sized at min=1 / max=3 — sufficient for a single-process
-    bot and well within Supabase free-tier limits when using the pooler.
+async def init_db() -> None:
+    """Create the connection pool and ensure all tables exist."""
+    global _pool
+    # Normalise postgres:// → postgresql:// for asyncpg
+    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    _pool = await asyncpg.create_pool(
+        url,
+        min_size=1,
+        max_size=5,
+        statement_cache_size=0,   # required for PgBouncer transaction mode
+    )
+    await _create_tables()
+    logger.info("Database pool initialised")
 
-    asyncpg returns JSONB columns as strings; we decode them explicitly.
-    """
 
-    def __init__(self) -> None:
-        if not DATABASE_URL:
-            raise RuntimeError(
-                "DATABASE_URL must be set before initialising DatabaseManager"
-            )
-        self._pool: asyncpg.Pool | None = None
+def get_db() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("DB pool not initialised – call init_db() first")
+    return _pool
 
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
-    async def connect(self) -> None:
-        """Open the connection pool. Called once from init_db()."""
-        # asyncpg does not understand the 'postgresql+asyncpg://' SQLAlchemy
-        # prefix — strip it if present and normalise to plain 'postgresql://'.
-        dsn = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+async def close_db() -> None:
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+        logger.info("Database pool closed")
 
-        self._pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=1,
-            max_size=3,
-            # Supabase pooler (PgBouncer) uses transaction-mode pooling;
-            # prepared statements are not supported in that mode.
-            statement_cache_size=0,
-            command_timeout=10,
+
+# ── Schema ─────────────────────────────────────────────────────────────────────
+
+async def _create_tables() -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS active_grids (
+                id              SERIAL PRIMARY KEY,
+                symbol          TEXT NOT NULL UNIQUE,
+                risk_level      TEXT NOT NULL DEFAULT 'medium',
+                total_investment NUMERIC NOT NULL,
+                lower_price     NUMERIC NOT NULL,
+                upper_price     NUMERIC NOT NULL,
+                grid_count      INTEGER NOT NULL,
+                grid_spacing    NUMERIC NOT NULL,
+                current_atr     NUMERIC,
+                avg_buy_price   NUMERIC DEFAULT 0,
+                held_qty        NUMERIC DEFAULT 0,
+                realized_pnl    NUMERIC DEFAULT 0,
+                sell_count      INTEGER DEFAULT 0,
+                started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+                extra           JSONB DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS trade_history (
+                id          SERIAL PRIMARY KEY,
+                symbol      TEXT NOT NULL,
+                side        TEXT NOT NULL,          -- 'buy' | 'sell'
+                price       NUMERIC NOT NULL,
+                qty         NUMERIC NOT NULL,
+                order_id    TEXT,
+                grid_id     INTEGER REFERENCES active_grids(id),
+                pnl         NUMERIC DEFAULT 0,
+                executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS grid_snapshots (
+                id          SERIAL PRIMARY KEY,
+                symbol      TEXT NOT NULL,
+                snapshot    JSONB NOT NULL,
+                saved_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_config (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+    logger.debug("Tables verified / created")
+
+
+# ── active_grids CRUD ──────────────────────────────────────────────────────────
+
+async def upsert_grid(data: dict) -> int:
+    """Insert or update a grid row. Returns the row id."""
+    pool = get_db()
+    symbol = data["symbol"]
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id FROM active_grids WHERE symbol = $1", symbol
         )
-        logger.info("asyncpg pool connected (min=1 max=3)")
-
-    async def close(self) -> None:
-        """Gracefully close the connection pool."""
-        if self._pool:
-            await self._pool.close()
-            logger.info("asyncpg pool closed")
-
-    async def ensure_table(self) -> None:
-        """
-        Create the bot_state table and updated_at trigger if they don't
-        exist, then seed the singleton row.  Safe to call on every startup.
-        """
-        async with self._pool.acquire() as conn:
-            await conn.execute(_CREATE_TABLE_SQL)
-            await conn.execute(_CREATE_TRIGGER_SQL)
-            # Seed the singleton row only if it doesn't exist yet
+        if row:
+            grid_id = row["id"]
+            sets = ", ".join(
+                f"{k} = ${i+2}" for i, k in enumerate(data.keys()) if k != "symbol"
+            )
+            vals = [v for k, v in data.items() if k != "symbol"]
             await conn.execute(
-                """
-                INSERT INTO bot_state (id, symbol, is_active, entry_price,
-                                       side, qty, stop_loss, config)
-                VALUES ($1, NULL, FALSE, NULL, NULL, NULL, NULL, '{}'::jsonb)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                _ROW_ID,
+                f"UPDATE active_grids SET {sets}, updated_at = NOW() WHERE id = $1",
+                grid_id, *vals,
             )
-        logger.info("bot_state table ready")
-
-    # ── Helpers ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _row_to_dict(row: asyncpg.Record | None) -> dict | None:
-        """Convert an asyncpg Record to a plain dict, decoding JSONB."""
-        if row is None:
-            return None
-        d = dict(row)
-        # asyncpg returns JSONB as a str when the column type is unknown;
-        # decode it if needed.
-        if isinstance(d.get("config"), str):
-            try:
-                d["config"] = json.loads(d["config"])
-            except (json.JSONDecodeError, TypeError):
-                d["config"] = {}
-        return d
-
-    # ── Public API ─────────────────────────────────────────────────────────────
-
-    async def fetch_state(self) -> dict | None:
-        """Return the bot_state row as a dict, or None if missing."""
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM bot_state WHERE id = $1", _ROW_ID
+        else:
+            cols = ", ".join(data.keys())
+            placeholders = ", ".join(f"${i+1}" for i in range(len(data)))
+            grid_id = await conn.fetchval(
+                f"INSERT INTO active_grids ({cols}) VALUES ({placeholders}) RETURNING id",
+                *data.values(),
             )
-        result = self._row_to_dict(row)
-        logger.debug("fetch_state: %s", result)
-        return result
-
-    async def upsert_state(self, data: dict[str, Any]) -> None:
-        """
-        Insert or update the singleton row.
-
-        `data` is a partial dict — only the keys you want to change.
-        Unrecognised keys are silently ignored to avoid SQL errors.
-        """
-        # Map Python dict keys to the columns we manage
-        allowed = {"symbol", "is_active", "entry_price", "side", "qty",
-                   "stop_loss", "config"}
-        payload = {k: v for k, v in data.items() if k in allowed}
-
-        if not payload:
-            logger.warning("upsert_state called with no recognised keys")
-            return
-
-        # Encode config dict to JSON string for asyncpg
-        if "config" in payload and isinstance(payload["config"], dict):
-            payload["config"] = json.dumps(payload["config"])
-
-        # Build dynamic SET clause
-        cols = list(payload.keys())
-        set_clause = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(cols))
-        values = [payload[c] for c in cols]
-
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO bot_state (id, {', '.join(cols)})
-                VALUES ($1, {', '.join(f'${i+2}' for i in range(len(cols)))})
-                ON CONFLICT (id) DO UPDATE SET {set_clause}
-                """,
-                _ROW_ID, *values,
-            )
-        logger.debug("upsert_state: %s", payload)
-
-    async def reset_state(self) -> None:
-        """Reset the row to idle defaults. Called after trade close or /emergency_stop."""
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE bot_state
-                SET symbol      = NULL,
-                    is_active   = FALSE,
-                    entry_price = NULL,
-                    side        = NULL,
-                    qty         = NULL,
-                    stop_loss   = NULL,
-                    config      = '{}'::jsonb
-                WHERE id = $1
-                """,
-                _ROW_ID,
-            )
-        logger.info("bot_state reset to idle")
-
-    async def is_trade_active(self) -> bool:
-        """Return True if is_active == true in the database."""
-        async with self._pool.acquire() as conn:
-            val = await conn.fetchval(
-                "SELECT is_active FROM bot_state WHERE id = $1", _ROW_ID
-            )
-        return bool(val)
-
-    async def ensure_row_exists(self) -> None:
-        """
-        Guarantee the singleton row exists.
-        Delegates to ensure_table() which already handles this idempotently.
-        Kept for API compatibility with callers in telegram_bot.py.
-        """
-        await self.ensure_table()
+    return grid_id
 
 
-# ── Singleton ──────────────────────────────────────────────────────────────────
-
-_db: DatabaseManager | None = None
-
-
-def get_db() -> DatabaseManager:
-    """Return the singleton. Raises if init_db() has not been called."""
-    if _db is None:
-        raise RuntimeError("Database not initialised — call init_db() first")
-    return _db
+async def get_grid(symbol: str) -> Optional[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM active_grids WHERE symbol = $1 AND is_active = TRUE", symbol
+        )
+    return dict(row) if row else None
 
 
-async def init_db() -> DatabaseManager:
-    """
-    Create the DatabaseManager, open the connection pool, and ensure the
-    table exists.  Must be awaited once before any DB operations.
+async def get_all_active_grids() -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM active_grids WHERE is_active = TRUE ORDER BY started_at"
+        )
+    return [dict(r) for r in rows]
 
-    Changed to async (was sync) because asyncpg.create_pool() is a coroutine.
-    main.py calls this inside the post_init hook so the event loop is running.
-    """
-    global _db
-    if _db is None:
-        _db = DatabaseManager()
-        await _db.connect()
-        await _db.ensure_table()
-    return _db
+
+async def deactivate_grid(symbol: str) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE active_grids SET is_active = FALSE, updated_at = NOW() WHERE symbol = $1",
+            symbol,
+        )
+
+
+async def update_grid_pnl(
+    symbol: str,
+    realized_pnl: float,
+    avg_buy_price: float,
+    held_qty: float,
+    sell_count: int,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE active_grids
+               SET realized_pnl = $2, avg_buy_price = $3,
+                   held_qty = $4, sell_count = $5, updated_at = NOW()
+               WHERE symbol = $1""",
+            symbol, realized_pnl, avg_buy_price, held_qty, sell_count,
+        )
+
+
+# ── trade_history ──────────────────────────────────────────────────────────────
+
+async def record_trade(
+    symbol: str,
+    side: str,
+    price: float,
+    qty: float,
+    order_id: str = "",
+    grid_id: Optional[int] = None,
+    pnl: float = 0.0,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO trade_history (symbol, side, price, qty, order_id, grid_id, pnl)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+            symbol, side, price, qty, order_id, grid_id, pnl,
+        )
+
+
+async def get_trade_history(symbol: str, days: int = 30) -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM trade_history
+               WHERE symbol = $1
+                 AND executed_at >= NOW() - ($2 || ' days')::INTERVAL
+               ORDER BY executed_at DESC""",
+            symbol, str(days),
+        )
+    return [dict(r) for r in rows]
+
+
+# ── grid_snapshots ─────────────────────────────────────────────────────────────
+
+async def save_snapshot(symbol: str, snapshot: dict) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO grid_snapshots (symbol, snapshot) VALUES ($1, $2)",
+            symbol, json.dumps(snapshot),
+        )
+
+
+async def get_latest_snapshot(symbol: str) -> Optional[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT snapshot FROM grid_snapshots WHERE symbol = $1 ORDER BY saved_at DESC LIMIT 1",
+            symbol,
+        )
+    return json.loads(row["snapshot"]) if row else None
+
+
+# ── bot_config ─────────────────────────────────────────────────────────────────
+
+async def set_config(key: str, value: str) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO bot_config (key, value, updated_at) VALUES ($1, $2, NOW())
+               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()""",
+            key, value,
+        )
+
+
+async def get_config(key: str, default: str = "") -> str:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM bot_config WHERE key = $1", key)
+    return row["value"] if row else default

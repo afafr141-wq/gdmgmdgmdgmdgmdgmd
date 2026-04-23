@@ -1,89 +1,107 @@
 """
-Entry point for the MEXC Passive Market Maker bot.
-
-Startup sequence:
-1. Validate required environment variables (including Supabase credentials).
-2. Initialise the Supabase DatabaseManager singleton.
-3. Build the Telegram Application.
-4. Register a post-init hook that runs inside the event loop:
-   a. Ensures the bot_state singleton row exists in Supabase.
-   b. If is_active == true, re-attaches the WebSocket listener and
-      Virtual Stop-Loss watcher automatically (no user command needed).
-   c. Sends a startup notification to all ALLOWED_USER_IDS.
-5. Start long-polling.
-
-Railway deployment notes:
-- Runs as a `worker` dyno (no inbound HTTP port needed).
-- Set DATABASE_URL in the Railway Variables tab (Supabase pooler connection string).
-- Set LOG_LEVEL=DEBUG for verbose output during debugging.
+Entry point. Validates env, initialises DB + MEXC client, wires the
+GridEngine to the Telegram bot, then starts long-polling.
 """
-
+import asyncio
 import logging
+import signal
 import sys
 
-from telegram.ext import Application
-
 from config.settings import LOG_LEVEL, validate_env
-from utils.db_manager import init_db  # async — awaited inside _on_startup
-from bot.telegram_bot import build_application, recover_state
-
-# ── Logging ────────────────────────────────────────────────────────────────────
+from core.mexc_client import MexcClient
+from core.grid_engine import GridEngine
+from bot.telegram_bot import build_application, send_notification
+from utils.db_manager import init_db, close_db, get_all_active_grids
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
 )
-# Reduce noise from third-party libraries
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
-logging.getLogger("websockets").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
-# ── Post-init hook (runs inside the event loop, before polling starts) ─────────
+async def _on_startup(application) -> None:
+    """Called once after the bot is initialised, before polling starts."""
+    logger.info("Bot starting up…")
 
-async def _on_startup(app: Application) -> None:
-    """
-    Called by python-telegram-bot after the event loop is running but before
-    the first update is processed.  Safe to await coroutines and create Tasks.
-
-    init_db() is awaited here (not in main()) because asyncpg.create_pool()
-    requires a running event loop.
-    """
-    logger.info("Running startup hook…")
+    # DB
     await init_db()
-    logger.info("Database ready")
-    await recover_state(app)
+
+    # MEXC
+    client = application.bot_data["client"]
+    await client.load_markets()
+
+    # Recover any grids that were active before a restart
+    engine: GridEngine = application.bot_data["engine"]
+    active = await get_all_active_grids()
+    if active:
+        logger.info("Recovering %d active grid(s) from DB…", len(active))
+        for row in active:
+            symbol = row["symbol"]
+            try:
+                await engine.start(
+                    symbol=symbol,
+                    total_investment=float(row["total_investment"]),
+                    risk=row["risk_level"],
+                )
+                logger.info("Recovered grid: %s", symbol)
+            except Exception as exc:
+                logger.error("Failed to recover grid %s: %s", symbol, exc)
+
+    await send_notification(
+        "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
+        f"📊 شبكات نشطة: `{len(active)}`\n"
+        "اكتب /start للقائمة الرئيسية.",
+        application=application,
+    )
+    logger.info("Startup complete.")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+async def _on_shutdown(application) -> None:
+    """Called when the bot is shutting down."""
+    logger.info("Shutting down…")
+    engine: GridEngine = application.bot_data["engine"]
+    client: MexcClient = application.bot_data["client"]
+
+    # Stop all running grids gracefully (cancel orders, save snapshots)
+    for symbol in list(engine.active_symbols()):
+        try:
+            await engine.stop(symbol, market_sell=False)
+        except Exception as exc:
+            logger.error("Error stopping grid %s: %s", symbol, exc)
+
+    await client.close()
+    await close_db()
+    logger.info("Shutdown complete.")
+
 
 def main() -> None:
-    missing = validate_env()
-    if missing:
-        logger.error("Missing required environment variables: %s", ", ".join(missing))
-        logger.error(
-            "Set them in Railway's dashboard (Variables tab) or in a local .env file."
-        )
-        sys.exit(1)
+    validate_env()
 
-    logger.info("Starting MEXC Market Maker bot…")
-    app = build_application()
+    client = MexcClient()
 
-    # Register the startup hook via post_init.
-    # python-telegram-bot v20 calls this coroutine after Application.initialize()
-    # but before polling begins, so the event loop is already running.
+    # Notify callback — needs the application reference, injected after build
+    _notify_ref: dict = {}
+
+    async def notify(text: str) -> None:
+        app = _notify_ref.get("app")
+        await send_notification(text, application=app)
+
+    engine = GridEngine(client=client, notify=notify)
+
+    app = build_application(engine, client)
+    _notify_ref["app"] = app
+
+    # Inject shared objects so startup/shutdown hooks can access them
+    app.bot_data["client"] = client
+    app.bot_data["engine"] = engine
+
     app.post_init = _on_startup
+    app.post_shutdown = _on_shutdown
 
-    # run_polling() manages its own event loop and handles graceful shutdown
-    # on SIGINT / SIGTERM automatically (python-telegram-bot v20+).
-    app.run_polling(
-        allowed_updates=["message", "callback_query"],
-        drop_pending_updates=True,
-    )
+    logger.info("Starting Telegram long-polling…")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
