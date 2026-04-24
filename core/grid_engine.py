@@ -2,9 +2,10 @@
 AI Dynamic Grid Engine — KuCoin AI Plus behaviour (Grid Expansion).
 
 Startup:
-  - Places only 2 buy orders below price and 2 sell orders above price.
-  - Buys base currency equal to (sell_order_count × qty_per_grid) upfront.
-  - Remaining capital stays in reserve — not spread across all levels.
+  - Places INITIAL_ORDERS_PER_SIDE limit buys below price.
+  - Places INITIAL_ORDERS_PER_SIDE limit sells above price.
+  - No upfront base-currency purchase; capital is deployed only as orders fill.
+  - Each order size = total_investment / grid_count / current_price.
 
 Fill handling:
   - Buy filled  → place new buy one grid lower + sell at the filled level.
@@ -122,11 +123,12 @@ def derive_grid_params(
     grid_count = max(min_g, min(raw_grids, max_g))
 
     grid_spacing = (upper - lower) / grid_count
-    # qty sized so that INITIAL_ORDERS_PER_SIDE buys use ~half the investment
-    qty_per_grid = client.round_amount(
-        symbol,
-        (total_investment / 2) / (INITIAL_ORDERS_PER_SIDE * current_price),
-    )
+    # Each grid level gets an equal share of the total investment.
+    # qty = (total_investment / grid_count) / current_price
+    raw_qty      = total_investment / grid_count / current_price
+    # Hard cap: a single grid order must not exceed half the total investment
+    max_qty      = (total_investment / 2) / current_price
+    qty_per_grid = client.round_amount(symbol, min(raw_qty, max_qty))
 
     return GridParams(
         lower        = client.round_price(symbol, lower),
@@ -235,30 +237,42 @@ class GridEngine:
     def active_symbols(self) -> list[str]:
         return [s for s, g in self._grids.items() if g.running]
 
+    # ── Budget guard ───────────────────────────────────────────────────────────
+
+    def _guard_order_cost(self, state: GridState, price: float, qty: float) -> bool:
+        """
+        Return False and fire an error notification if a single order would cost
+        more than 2× the per-grid budget (total_investment / grid_count).
+        This catches runaway orders caused by stale params or rounding bugs.
+        """
+        cost      = price * qty
+        max_cost  = (state.total_investment / state.params.grid_count) * 2
+        if cost > max_cost:
+            logger.error(
+                "ORDER BLOCKED %s: cost=%.4f USDT exceeds budget cap=%.4f USDT "
+                "(investment=%.2f / grids=%d × 2)",
+                state.symbol, cost, max_cost, state.total_investment, state.params.grid_count,
+            )
+            asyncio.ensure_future(_fire(
+                _notify_error and _notify_error(
+                    state.symbol,
+                    "تجاوز ميزانية الأمر",
+                    f"تم رفض أمر بقيمة {cost:.2f} USDT — الحد المسموح {max_cost:.2f} USDT",
+                )
+            ))
+            return False
+        return True
+
     # ── Initial order placement (KuCoin-style) ─────────────────────────────────
 
     async def _place_initial_orders(self, state: GridState, price: float) -> None:
         """
-        Place only INITIAL_ORDERS_PER_SIDE orders on each side.
-        Also buy base currency upfront to back the sell orders.
+        Place INITIAL_ORDERS_PER_SIDE limit buys below price and
+        INITIAL_ORDERS_PER_SIDE limit sells above price.
+        No upfront base-currency purchase — sell orders are placed speculatively
+        and will only fill after the corresponding buy orders execute first.
         """
         p = state.params
-
-        # ── Buy base currency to back sell orders ──────────────────────────────
-        sell_qty_needed = INITIAL_ORDERS_PER_SIDE * p.qty_per_grid
-        buy_order = await self._client.place_limit_buy(
-            state.symbol,
-            self._client.round_price(state.symbol, price),   # at-market limit
-            sell_qty_needed,
-        )
-        if buy_order:
-            state.open_orders[buy_order["id"]] = {
-                "side":  "buy",
-                "price": price,
-                "qty":   sell_qty_needed,
-                "role":  "initial_base_buy",
-            }
-            logger.info("Initial base buy placed: qty=%.6f @ %.4f", sell_qty_needed, price)
 
         # ── Limit buy orders below price ───────────────────────────────────────
         for i in range(1, INITIAL_ORDERS_PER_SIDE + 1):
@@ -279,8 +293,10 @@ class GridEngine:
                 state.open_orders[order["id"]] = {"side": "sell", "price": level, "qty": p.qty_per_grid}
 
         logger.info(
-            "Initial orders placed for %s: %d total (2 buys + 2 sells + 1 base-buy)",
+            "Initial orders placed for %s: %d total (%d buys + %d sells)",
             state.symbol, len(state.open_orders),
+            sum(1 for m in state.open_orders.values() if m["side"] == "buy"),
+            sum(1 for m in state.open_orders.values() if m["side"] == "sell"),
         )
 
     # ── Main loop ──────────────────────────────────────────────────────────────
@@ -325,6 +341,22 @@ class GridEngine:
             await _fire(tgbot.notify_hourly_report(state.symbol, report))
         except Exception as exc:
             logger.error("Hourly report error for %s: %s", state.symbol, exc)
+
+    # ── Manual upgrade ─────────────────────────────────────────────────────────
+
+    async def upgrade_grid(self, symbol: str) -> None:
+        """
+        Cancel all open orders and rebuild the grid at the current price/ATR.
+        Used by /upgrade command and called for every active grid on startup.
+        """
+        state = self._grids.get(symbol)
+        if not state or not state.running:
+            raise ValueError(f"No active grid for {symbol}")
+        profile = RISK_PROFILES[state.risk]
+        price   = await self._client.get_current_price(symbol)
+        atr     = await self._fetch_atr(symbol, profile["atr_period"])
+        await self._rebuild(state, price, atr)
+        logger.info("Grid upgraded: %s @ %.4f", symbol, price)
 
     # ── ATR rebalance ──────────────────────────────────────────────────────────
 
@@ -396,21 +428,7 @@ class GridEngine:
         side        = meta["side"]
         fill_price  = float(order.get("average") or order.get("price") or meta["price"])
         qty         = float(order.get("filled") or meta["qty"])
-        role        = meta.get("role", "")
-        pnl         = 0.0
-
-        # ── Initial base buy: just update holdings, no counter-order ──────────
-        if role == "initial_base_buy":
-            total_cost       = state.avg_buy_price * state.held_qty + fill_price * qty
-            state.held_qty  += qty
-            state.avg_buy_price = total_cost / state.held_qty if state.held_qty else 0.0
-            await db.record_trade(state.symbol, "buy", fill_price, qty, order.get("id",""), state.grid_id, 0.0)
-            await self._sync_pnl(state)
-            await _fire(_notify_buy_filled and _notify_buy_filled(
-                state.symbol, fill_price, qty,
-                grid_level=0, grid_total=state.params.grid_count,
-            ))
-            return
+        pnl = 0.0
 
         if side == "buy":
             # Update average cost
@@ -420,24 +438,36 @@ class GridEngine:
 
             # Place sell one grid above the fill
             sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
-            sell_order = await self._client.place_limit_sell(state.symbol, sell_price, qty)
-            if sell_order:
-                state.open_orders[sell_order["id"]] = {"side": "sell", "price": sell_price, "qty": qty}
+            if self._guard_order_cost(state, sell_price, qty):
+                sell_order = await self._client.place_limit_sell(state.symbol, sell_price, qty)
+                if sell_order:
+                    state.open_orders[sell_order["id"]] = {"side": "sell", "price": sell_price, "qty": qty}
 
-            # Expand: place next buy one grid lower
+            # Expand: place next buy one grid lower — only if holdings are within budget
+            max_holdings = state.total_investment / fill_price
             next_buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
-            if next_buy_price >= state.params.lower:
+            if (
+                next_buy_price >= state.params.lower
+                and state.held_qty < max_holdings
+                and self._guard_order_cost(state, next_buy_price, state.params.qty_per_grid)
+            ):
                 buy_order = await self._client.place_limit_buy(state.symbol, next_buy_price, state.params.qty_per_grid)
                 if buy_order:
                     state.open_orders[buy_order["id"]] = {"side": "buy", "price": next_buy_price, "qty": state.params.qty_per_grid}
                     await _fire(_notify_grid_expansion and _notify_grid_expansion(
                         state.symbol, "down", next_buy_price, "buy"
                     ))
+            elif state.held_qty >= max_holdings:
+                logger.warning(
+                    "HOLDINGS CAP reached for %s: held=%.4f >= max=%.4f (investment=%.2f) — buy skipped",
+                    state.symbol, state.held_qty, max_holdings, state.total_investment,
+                )
 
-            # Notify buy fill
+            # Notify buy fill — grid_level = buys executed so far (held_qty / qty_per_grid)
+            buy_level = max(1, round(state.held_qty / state.params.qty_per_grid)) if state.params.qty_per_grid else 1
             await _fire(_notify_buy_filled and _notify_buy_filled(
                 state.symbol, fill_price, qty,
-                grid_level=len(state.open_orders),
+                grid_level=buy_level,
                 grid_total=state.params.grid_count,
             ))
 
@@ -447,16 +477,26 @@ class GridEngine:
             state.sell_count += 1
             state.held_qty    = max(0.0, state.held_qty - qty)
 
-            # Place buy one grid below the fill
+            # Place buy one grid below the fill — only if holdings are within budget
+            max_holdings = state.total_investment / fill_price
             buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
-            if buy_price >= state.params.lower:
+            if (
+                buy_price >= state.params.lower
+                and state.held_qty < max_holdings
+                and self._guard_order_cost(state, buy_price, qty)
+            ):
                 buy_order = await self._client.place_limit_buy(state.symbol, buy_price, qty)
                 if buy_order:
                     state.open_orders[buy_order["id"]] = {"side": "buy", "price": buy_price, "qty": qty}
+            elif state.held_qty >= max_holdings:
+                logger.warning(
+                    "HOLDINGS CAP reached for %s: held=%.4f >= max=%.4f — buy skipped",
+                    state.symbol, state.held_qty, max_holdings,
+                )
 
             # Expand: place next sell one grid higher
             next_sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
-            if next_sell_price <= state.params.upper:
+            if next_sell_price <= state.params.upper and self._guard_order_cost(state, next_sell_price, state.params.qty_per_grid):
                 sell_order = await self._client.place_limit_sell(state.symbol, next_sell_price, state.params.qty_per_grid)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": next_sell_price, "qty": state.params.qty_per_grid}
@@ -488,36 +528,41 @@ class GridEngine:
             (datetime.now(timezone.utc) - state.started_at).total_seconds() / 86400,
             1 / 1440,
         )
-        investment_per_grid = state.total_investment / p.grid_count
-        grid_profit         = p.grid_spacing * investment_per_grid * state.sell_count
-        unrealised_pnl      = (current_price - state.avg_buy_price) * state.held_qty
+        # grid_profit: each completed sell cycle earns grid_spacing × qty_per_grid
+        grid_profit    = p.grid_spacing * p.qty_per_grid * state.sell_count
+        unrealised_pnl = (current_price - state.avg_buy_price) * state.held_qty
         total_profit        = state.realized_pnl + unrealised_pnl
         apy                 = (total_profit / state.total_investment) / days * 365 * 100
         grid_apy            = (grid_profit  / state.total_investment) / days * 365 * 100
 
+        qty_per_grid_usdt = p.qty_per_grid * current_price
+        min_cost          = self._client.min_cost(state.symbol)
+
         return {
-            "symbol":           state.symbol,
-            "risk":             state.risk,
-            "total_investment": state.total_investment,
-            "lower":            p.lower,
-            "upper":            p.upper,
-            "grid_count":       p.grid_count,
-            "grid_spacing":     p.grid_spacing,
-            "atr":              p.atr,
-            "current_price":    current_price,
-            "avg_buy_price":    state.avg_buy_price,
-            "held_qty":         state.held_qty,
-            "sell_count":       state.sell_count,
-            "realized_pnl":     state.realized_pnl,
-            "unrealised_pnl":   unrealised_pnl,
-            "grid_profit":      grid_profit,
-            "total_profit":     total_profit,
-            "apy":              apy,
-            "grid_apy":         grid_apy,
-            "days_running":     days,
-            "open_orders":      len(state.open_orders),
-            "active_buys":      sum(1 for m in state.open_orders.values() if m["side"] == "buy"),
-            "active_sells":     sum(1 for m in state.open_orders.values() if m["side"] == "sell"),
+            "symbol":              state.symbol,
+            "risk":                state.risk,
+            "total_investment":    state.total_investment,
+            "lower":               p.lower,
+            "upper":               p.upper,
+            "grid_count":          p.grid_count,
+            "grid_spacing":        p.grid_spacing,
+            "atr":                 p.atr,
+            "current_price":       current_price,
+            "avg_buy_price":       state.avg_buy_price,
+            "held_qty":            state.held_qty,
+            "sell_count":          state.sell_count,
+            "realized_pnl":        state.realized_pnl,
+            "unrealised_pnl":      unrealised_pnl,
+            "grid_profit":         grid_profit,
+            "total_profit":        total_profit,
+            "apy":                 apy,
+            "grid_apy":            grid_apy,
+            "days_running":        days,
+            "open_orders":         len(state.open_orders),
+            "active_buys":         sum(1 for m in state.open_orders.values() if m["side"] == "buy"),
+            "active_sells":        sum(1 for m in state.open_orders.values() if m["side"] == "sell"),
+            "qty_per_grid_usdt":   qty_per_grid_usdt,
+            "min_order_cost":      min_cost,
         }
 
     # ── Helpers ────────────────────────────────────────────────────────────────

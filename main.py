@@ -29,6 +29,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+async def _upgrade_existing_grids(engine: GridEngine, application) -> None:
+    """Rebuild all active grids at the current price/ATR after a restart."""
+    symbols = engine.active_symbols()
+    if not symbols:
+        return
+    logger.info("Upgrading %d grid(s) to latest engine logic…", len(symbols))
+    ok, failed = [], []
+    for sym in symbols:
+        try:
+            await engine.upgrade_grid(sym)
+            ok.append(sym)
+        except Exception as exc:
+            logger.error("upgrade_grid %s failed: %s", sym, exc)
+            failed.append(sym)
+    logger.info("Upgrade complete — ok=%s failed=%s", ok, failed)
+
+
 async def _on_startup(application) -> None:
     """Called once after the bot is initialised, before polling starts."""
     logger.info("Bot starting up…")
@@ -43,6 +60,7 @@ async def _on_startup(application) -> None:
     # Recover any grids that were active before a restart
     engine: GridEngine = application.bot_data["engine"]
     active = await get_all_active_grids()
+    recovered, upgraded, failed = 0, 0, 0
     if active:
         logger.info("Recovering %d active grid(s) from DB…", len(active))
         for row in active:
@@ -53,13 +71,20 @@ async def _on_startup(application) -> None:
                     total_investment=float(row["total_investment"]),
                     risk=row["risk_level"],
                 )
+                recovered += 1
                 logger.info("Recovered grid: %s", symbol)
             except Exception as exc:
                 logger.error("Failed to recover grid %s: %s", symbol, exc)
+                failed += 1
+                continue
+
+        # Upgrade all recovered grids to the latest engine logic
+        await _upgrade_existing_grids(engine, application)
+        upgraded = recovered
 
     await send_notification(
         "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
-        f"📊 شبكات نشطة: `{len(active)}`\n"
+        f"📊 شبكات مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
         "اكتب /start للقائمة الرئيسية.",
         application=application,
     )

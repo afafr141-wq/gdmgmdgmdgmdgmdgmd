@@ -89,8 +89,7 @@ class MexcClient:
 
     def round_amount(self, symbol: str, amount: float) -> float:
         dp = self.amount_precision(symbol)
-        factor = 10 ** dp
-        return math.floor(amount * factor) / factor  # always floor to avoid over-spend
+        return round(amount, dp)
 
     # ── Order placement ────────────────────────────────────────────────────────
 

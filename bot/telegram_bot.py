@@ -146,12 +146,14 @@ def _reports_kb(symbol: str) -> InlineKeyboardMarkup:
 
 def _fmt_report(r: dict) -> str:
     return (
-        f"📊 *{r['symbol']}* — تقرير الشبكة\n"
+        f"📊 *{_fmt_symbol(r['symbol'])}* — تقرير الشبكة\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 الاستثمار: `${r['total_investment']:.2f}`\n"
         f"📐 النطاق: `{r['lower']:.4f}` — `{r['upper']:.4f}`\n"
         f"🔢 عدد الشبكات: `{r['grid_count']}`\n"
         f"📏 فارق الشبكة: `{r['grid_spacing']:.4f}`\n"
+        f"💲 ميزانية كل شبكة: `{r.get('qty_per_grid_usdt', 0):.2f}` USDT\n"
+        f"🏦 الحد الأدنى MEXC: `{r.get('min_order_cost', 1):.2f}` USDT\n"
         f"📡 ATR: `{r['atr']:.4f}`\n"
         f"💵 السعر الحالي: `{r['current_price']:.4f}`\n"
         f"📦 متوسط سعر الشراء: `{r['avg_buy_price']:.4f}`\n"
@@ -200,7 +202,12 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "`/removepair ADAUSDT` — حذف زوج من القائمة\n\n"
         "*ملاحظة:* أي زوج يدعمه MEXC يعمل مع `/start_ai`\nمثال: `ADAUSDT`, `DOGEUSDT`, `MATICUSDT`\n\n"
         "*مستويات المخاطرة:*\n"
-        "🟢 `low` | 🟡 `medium` | 🔴 `high`",
+        "🟢 `low` | 🟡 `medium` | 🔴 `high`\n\n"
+        "*صيانة:*\n"
+        "`/upgrade` — إعادة بناء جميع الشبكات بالسعر الحالي\n"
+        "`/upgrade BTCUSDT` — إعادة بناء شبكة محددة\n"
+        "`/mute [SYMBOL]` — كتم الإشعارات\n"
+        "`/unmute [SYMBOL]` — تفعيل الإشعارات",
         parse_mode="Markdown",
     )
 
@@ -700,7 +707,22 @@ async def _send(text: str) -> None:
 
 def _now_str() -> str:
     from datetime import datetime, timezone
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S %d-%m-%Y")
+
+
+def _fmt_symbol(symbol: str) -> str:
+    """Normalise exchange symbol to display format: BTCUSDT → BTC/USDT."""
+    symbol = symbol.replace("/", "").upper()
+    for quote in ("USDT", "USDC", "BTC", "ETH", "BNB"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            base = symbol[: -len(quote)]
+            return f"{base}/{quote}"
+    return symbol
+
+
+def _fmt_pnl(value: float) -> str:
+    """Format a USDT profit/loss value to 2 decimal places."""
+    return f"{value:.2f}"
 
 
 # ── Public notification functions (called from grid_engine) ────────────────────
@@ -721,7 +743,7 @@ async def notify_buy_filled(
     await _send(
         f"📥 *تنفيذ شراء*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{symbol}`\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"💵 السعر: `{price:,.4f}` USDT\n"
         f"🪙 الكمية: `{qty:.6f}`\n"
         f"💰 القيمة: `{value:.2f}` USDT"
@@ -745,11 +767,11 @@ async def notify_sell_filled(
     await _send(
         f"📤 *تنفيذ بيع*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{symbol}`\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"💵 السعر: `{price:,.4f}` USDT\n"
         f"🪙 الكمية: `{qty:.6f}`\n"
         f"💰 القيمة: `{value:.2f}` USDT\n"
-        f"💹 الربح: `{pnl_sign}{pnl:.4f}` USDT\n"
+        f"💹 الربح: `{pnl_sign}{_fmt_pnl(pnl)}` USDT\n"
         f"🕐 الوقت: `{_now_str()}`"
     )
 
@@ -769,7 +791,7 @@ async def notify_grid_rebuild(
     await _send(
         f"🔄 *إعادة تشكيل الشبكة*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{symbol}`\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"📌 السبب: {reason}\n"
         f"📉 السعر القديم: `{old_price:,.4f}`\n"
         f"📈 السعر الجديد: `{new_price:,.4f}`\n"
@@ -795,7 +817,7 @@ async def notify_grid_expansion(
     await _send(
         f"➕ *توسيع الشبكة*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{symbol}`\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"🧭 الاتجاه: {dir_ar}\n"
         f"💵 السعر الجديد: `{new_price:,.4f}`\n"
         f"📋 نوع الأمر: {side_ar}"
@@ -812,7 +834,7 @@ async def notify_error(
     await _send(
         f"⚠️ *خطأ في البوت*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{symbol}`\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"🔴 نوع الخطأ: {error_type}\n"
         f"📋 التفاصيل: {details}\n"
         f"🕐 الوقت: `{_now_str()}`"
@@ -824,12 +846,12 @@ async def notify_hourly_report(symbol: str, report: dict) -> None:
         return
     pnl_sign = "+" if report["total_profit"] >= 0 else ""
     await _send(
-        f"📊 *تقرير ساعي — {symbol}*\n"
+        f"📊 *تقرير ساعي — {_fmt_symbol(symbol)}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ صفقات بيع منفذة: `{report['sell_count']}`\n"
-        f"💹 ربح الشبكة: `+{report['grid_profit']:.4f}` USDT\n"
-        f"📈 أرباح غير محققة: `{report['unrealised_pnl']:.4f}` USDT\n"
-        f"🏆 إجمالي الربح: `{pnl_sign}{report['total_profit']:.4f}` USDT\n"
+        f"💹 ربح الشبكة: `+{_fmt_pnl(report['grid_profit'])}` USDT\n"
+        f"📈 أرباح غير محققة: `{_fmt_pnl(report['unrealised_pnl'])}` USDT\n"
+        f"🏆 إجمالي الربح: `{pnl_sign}{_fmt_pnl(report['total_profit'])}` USDT\n"
         f"📊 APY: `{report['apy']:.2f}%`\n"
         f"🔓 أوامر مفتوحة: `{report['open_orders']}`"
     )
@@ -875,6 +897,85 @@ async def cmd_unmute(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/balance [SYMBOL] — show budget vs actual holdings for one or all grids."""
+    if not _is_allowed(update):
+        return await _deny(update)
+
+    symbols = (
+        [_normalize_symbol(ctx.args[0])]
+        if ctx.args
+        else _engine.active_symbols()
+    )
+
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد شبكات نشطة.")
+        return
+
+    lines = ["💼 *ميزان المحافظ*\n━━━━━━━━━━━━━━━━━━━━"]
+    for sym in symbols:
+        state = _engine.get_state(sym)
+        if not state:
+            continue
+        try:
+            price        = await _client.get_current_price(sym)
+            allocated    = state.total_investment
+            held_value   = state.held_qty * price
+            max_holdings = allocated          # الحد الأقصى = كامل الاستثمار
+            diff         = allocated - held_value
+            pct          = (held_value / allocated * 100) if allocated else 0
+            status_icon  = "✅" if held_value <= allocated else "🚨"
+            lines.append(
+                f"\n{status_icon} *{_fmt_symbol(sym)}*\n"
+                f"💰 المخصص: `{allocated:.2f}` USDT\n"
+                f"📦 القيمة الفعلية: `{held_value:.2f}` USDT ({pct:.1f}%)\n"
+                f"📊 الفرق: `{diff:+.2f}` USDT\n"
+                f"🪙 الكمية: `{state.held_qty:.4f}` | الحد الأقصى: `{max_holdings/price:.4f}`"
+            )
+        except Exception as exc:
+            lines.append(f"\n⚠️ *{_fmt_symbol(sym)}*: خطأ — {exc}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/upgrade [SYMBOL] — rebuild one or all active grids at current price/ATR."""
+    if not _is_allowed(update):
+        return await _deny(update)
+
+    symbols = (
+        [_normalize_symbol(ctx.args[0])]
+        if ctx.args
+        else _engine.active_symbols()
+    )
+
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد شبكات نشطة حالياً.")
+        return
+
+    await update.message.reply_text(
+        f"⏳ جاري ترقية {len(symbols)} شبكة…",
+        parse_mode="Markdown",
+    )
+
+    ok, failed = [], []
+    for sym in symbols:
+        try:
+            await _engine.upgrade_grid(sym)
+            ok.append(sym)
+        except Exception as exc:
+            logger.error("upgrade_grid %s failed: %s", sym, exc)
+            failed.append(f"`{_fmt_symbol(sym)}`: {exc}")
+
+    lines = []
+    if ok:
+        lines.append("✅ *تمت الترقية:*\n" + "\n".join(f"• `{_fmt_symbol(s)}`" for s in ok))
+    if failed:
+        lines.append("❌ *فشلت:*\n" + "\n".join(f"• {e}" for e in failed))
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 def build_application(engine, client) -> Application:
     global _application
     set_engine(engine, client)
@@ -891,6 +992,8 @@ def build_application(engine, client) -> Application:
     app.add_handler(CommandHandler("removepair", cmd_removepair))
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("upgrade", cmd_upgrade))
+    app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
