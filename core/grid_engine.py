@@ -260,10 +260,10 @@ class GridEngine:
         """
         p = state.params
 
-        # ── Step 1: immediate market buy (half of buy-side allocation) ─────────
+        # ── Step 1: immediate market buy (half of total investment) ───────────
         initial_buy_qty = self._client.round_amount(
             state.symbol,
-            (MAX_ORDERS_PER_SIDE * p.qty_per_grid) / 2,
+            (state.total_investment / 2) / price,
         )
         fill_price = price   # fallback if order response lacks average
         market_order = await self._client.market_buy(state.symbol, initial_buy_qty)
