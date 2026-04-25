@@ -15,10 +15,12 @@ Holdings cap:
   - Max allowed qty = (total_investment / 2) / current_price.
   - No new buy orders are placed once this cap is reached.
 
-Range:
+Range & re-centering:
   - Fixed: lower = price × (1 - MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
            upper = price × (1 + MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
-  - No ATR-based rebalancing.
+  - If the live price escapes the range (price < lower or price > upper),
+    all orders are cancelled and the grid is rebuilt around the new price.
+  - Checked every FILL_POLL_INTERVAL seconds (same cycle as fill polling).
 """
 import asyncio
 import logging
@@ -287,6 +289,9 @@ class GridEngine:
                     await self._send_hourly_report(state)
                     last_hourly_report = now
 
+                # Re-center grid if price escaped the range
+                await self._check_recentering(state)
+
                 await self._poll_fills(state)
                 await asyncio.sleep(FILL_POLL_INTERVAL)
 
@@ -298,6 +303,37 @@ class GridEngine:
                     state.symbol, type(exc).__name__, str(exc)[:200]
                 ))
                 await asyncio.sleep(30)
+
+    async def _check_recentering(self, state: GridState) -> None:
+        """
+        Rebuild the grid around the current price if it has escaped the range.
+        Triggered when: price < params.lower  OR  price > params.upper
+        """
+        price = await self._client.get_current_price(state.symbol)
+        if state.params.lower <= price <= state.params.upper:
+            return  # still inside range — nothing to do
+
+        direction = "العلوي" if price > state.params.upper else "السفلي"
+        old_lower = state.params.lower
+        old_upper = state.params.upper
+
+        logger.info(
+            "Re-centering grid for %s: price=%.4f escaped range [%.4f, %.4f]",
+            state.symbol, price, old_lower, old_upper,
+        )
+
+        await self._rebuild(state, price)
+
+        await _fire(_notify_grid_rebuild and _notify_grid_rebuild(
+            state.symbol,
+            f"السعر تجاوز النطاق {direction}",
+            price,
+            price,
+            state.params.lower,
+            state.params.upper,
+            state.params.grid_count,
+            0.0,
+        ))
 
     async def _send_hourly_report(self, state: GridState) -> None:
         try:
