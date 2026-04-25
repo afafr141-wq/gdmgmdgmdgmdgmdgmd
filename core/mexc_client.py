@@ -127,14 +127,26 @@ class MexcClient:
             return None
 
     async def market_buy(self, symbol: str, qty: float) -> Optional[dict]:
-        """Buy a fixed quantity at market price. Returns the order dict or None."""
+        """
+        Buy qty base-currency at market price.
+        MEXC spot requires passing the USDT cost (qty × price) as the amount,
+        with createMarketBuyOrderRequiresPrice=False.
+        """
         qty = self.round_amount(symbol, qty)
         if qty <= 0 or qty < self.min_amount(symbol):
             logger.warning("market_buy: qty %.8f below min for %s – skipped", qty, symbol)
             return None
         try:
-            order = await self._exchange.create_market_buy_order(symbol, qty)
-            logger.info("MARKET BUY %s qty=%.6f id=%s", symbol, qty, order["id"])
+            # Fetch current price to calculate USDT cost
+            ticker = await self._exchange.fetch_ticker(symbol)
+            price  = float(ticker["last"])
+            cost   = round(qty * price, 4)   # USDT amount to spend
+
+            order = await self._exchange.create_market_buy_order(
+                symbol, cost,
+                params={"createMarketBuyOrderRequiresPrice": False},
+            )
+            logger.info("MARKET BUY %s cost=%.4f USDT id=%s", symbol, cost, order["id"])
             await asyncio.sleep(ORDER_SLEEP_SECONDS)
             return order
         except ccxt.BaseError as exc:
