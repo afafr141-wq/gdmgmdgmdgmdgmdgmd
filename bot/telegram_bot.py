@@ -779,20 +779,18 @@ async def notify_grid_rebuild(
     new_lower: float,
     new_upper: float,
     new_grid_count: int,
-    new_atr: float,
+    new_atr: float,   # kept for signature compatibility, not displayed
 ) -> None:
     if _is_muted(symbol):
         return
     await _send(
-        f"🔄 *إعادة تشكيل الشبكة*\n"
+        f"🔄 *نقل الشبكة — إعادة التمركز*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
         f"📌 السبب: {reason}\n"
-        f"📉 السعر القديم: `{old_price:,.4f}`\n"
-        f"📈 السعر الجديد: `{new_price:,.4f}`\n"
+        f"📉 السعر عند الخروج: `{old_price:,.4f}`\n"
         f"📐 النطاق الجديد: `{new_lower:,.4f}` ←→ `{new_upper:,.4f}`\n"
-        f"🔢 عدد الشبكات: `{new_grid_count}`\n"
-        f"📡 ATR الجديد: `{new_atr:.4f}`\n"
+        f"🔢 الأوامر: `{new_grid_count // 2}` شراء + `{new_grid_count // 2}` بيع\n"
         f"🕐 الوقت: `{_now_str()}`"
     )
 
