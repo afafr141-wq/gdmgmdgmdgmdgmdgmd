@@ -174,11 +174,14 @@ class GridEngine:
         state.grid_id = grid_id
 
         await self._place_initial_orders(state, price)
+        # Persist the initial market-buy position (held_qty, avg_buy_price) to DB
+        await self._sync_pnl(state)
         self._tasks[symbol] = asyncio.create_task(self._run_loop(state))
 
         logger.info(
-            "Grid started: %s | range %.4f–%.4f | %d grids | spacing=%.4f%%",
+            "Grid started: %s | range %.4f–%.4f | %d grids | spacing=%.4f%% | held=%.6f @ %.4f",
             symbol, params.lower, params.upper, params.grid_count, ORDER_PERCENT * 100,
+            state.held_qty, state.avg_buy_price,
         )
         return state
 
@@ -241,34 +244,65 @@ class GridEngine:
             return False
         return True
 
-    # ── Initial order placement (KuCoin-style) ─────────────────────────────────
+    # ── Initial order placement ────────────────────────────────────────────────
 
     async def _place_initial_orders(self, state: GridState, price: float) -> None:
         """
-        Place MAX_ORDERS_PER_SIDE (3) limit buys and MAX_ORDERS_PER_SIDE (3) limit sells.
-        Each level is ORDER_PERCENT (1%) away from the previous one (compound spacing).
-          buy  i: price × (1 - i × ORDER_PERCENT)
-          sell i: price × (1 + i × ORDER_PERCENT)
+        1. Market-buy half the total buy-side allocation immediately so the bot
+           holds a position from the start and profits if price rises right away.
+           initial_buy_qty = (MAX_ORDERS_PER_SIDE × qty_per_grid) / 2
+
+        2. Place MAX_ORDERS_PER_SIDE limit buys below the execution price.
+        3. Place MAX_ORDERS_PER_SIDE limit sells above the execution price.
+
+        The pending orders are centred on the actual market-fill price, not the
+        pre-fetch price, so slippage is absorbed correctly.
         """
         p = state.params
 
-        # ── Limit buy orders below price ───────────────────────────────────────
+        # ── Step 1: immediate market buy (half of buy-side allocation) ─────────
+        initial_buy_qty = self._client.round_amount(
+            state.symbol,
+            (MAX_ORDERS_PER_SIDE * p.qty_per_grid) / 2,
+        )
+        fill_price = price   # fallback if order response lacks average
+        market_order = await self._client.market_buy(state.symbol, initial_buy_qty)
+        if market_order:
+            filled_qty  = float(market_order.get("filled") or initial_buy_qty)
+            fill_price  = float(market_order.get("average") or market_order.get("price") or price)
+            state.held_qty     += filled_qty
+            state.avg_buy_price = fill_price
+            logger.info(
+                "Initial market buy %s: qty=%.6f @ %.6f",
+                state.symbol, filled_qty, fill_price,
+            )
+            await db.record_trade(
+                state.symbol, "buy", fill_price, filled_qty,
+                market_order.get("id", ""), state.grid_id, pnl=0.0,
+            )
+        else:
+            logger.warning(
+                "Initial market buy skipped for %s — proceeding with limit orders only",
+                state.symbol,
+            )
+
+        # ── Step 2: limit buy orders below fill price ──────────────────────────
         for i in range(1, MAX_ORDERS_PER_SIDE + 1):
-            level = self._client.round_price(state.symbol, price * (1 - i * ORDER_PERCENT))
+            level = self._client.round_price(state.symbol, fill_price * (1 - i * ORDER_PERCENT))
             order = await self._client.place_limit_buy(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "buy", "price": level, "qty": p.qty_per_grid}
 
-        # ── Limit sell orders above price ──────────────────────────────────────
+        # ── Step 3: limit sell orders above fill price ─────────────────────────
         for i in range(1, MAX_ORDERS_PER_SIDE + 1):
-            level = self._client.round_price(state.symbol, price * (1 + i * ORDER_PERCENT))
+            level = self._client.round_price(state.symbol, fill_price * (1 + i * ORDER_PERCENT))
             order = await self._client.place_limit_sell(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "sell", "price": level, "qty": p.qty_per_grid}
 
         logger.info(
-            "Initial orders placed for %s: %d total (%d buys + %d sells)",
-            state.symbol, len(state.open_orders),
+            "Initial orders placed for %s: market_buy=%.6f @ %.6f | %d limit orders (%d buys + %d sells)",
+            state.symbol, state.held_qty, fill_price, len(state.open_orders),
             sum(1 for m in state.open_orders.values() if m["side"] == "buy"),
             sum(1 for m in state.open_orders.values() if m["side"] == "sell"),
         )

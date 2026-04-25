@@ -126,6 +126,21 @@ class MexcClient:
             logger.error("place_limit_sell failed: %s", exc)
             return None
 
+    async def market_buy(self, symbol: str, qty: float) -> Optional[dict]:
+        """Buy a fixed quantity at market price. Returns the order dict or None."""
+        qty = self.round_amount(symbol, qty)
+        if qty <= 0 or qty < self.min_amount(symbol):
+            logger.warning("market_buy: qty %.8f below min for %s – skipped", qty, symbol)
+            return None
+        try:
+            order = await self._exchange.create_market_buy_order(symbol, qty)
+            logger.info("MARKET BUY %s qty=%.6f id=%s", symbol, qty, order["id"])
+            await asyncio.sleep(ORDER_SLEEP_SECONDS)
+            return order
+        except ccxt.BaseError as exc:
+            logger.error("market_buy failed: %s", exc)
+            return None
+
     async def market_sell_all(self, symbol: str) -> Optional[dict]:
         """Sell entire free balance of the base currency at market price."""
         base = symbol.split("/")[0]
