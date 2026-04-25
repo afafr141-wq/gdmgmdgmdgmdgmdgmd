@@ -550,18 +550,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await query.edit_message_text(f"⏳ جاري إعادة تشكيل شبكة *{symbol}*…", parse_mode="Markdown")
         try:
-            from core.grid_engine import compute_atr
-            from config.settings import RISK_PROFILES, CANDLE_TIMEFRAME
             price = await _client.get_current_price(symbol)
-            ohlcv = await _client.fetch_ohlcv(symbol, CANDLE_TIMEFRAME, limit=20)
-            atr = compute_atr(ohlcv, RISK_PROFILES[state.risk]["atr_period"])
-            await _engine._rebuild(state, price, atr)
+            await _engine._rebuild(state, price)
             p = state.params
             await query.edit_message_text(
                 f"✅ *{symbol}* — تمت إعادة التشكيل!\n"
                 f"📐 النطاق الجديد: `{p.lower:.4f}` — `{p.upper:.4f}`\n"
-                f"🔢 عدد الشبكات: `{p.grid_count}`\n"
-                f"📡 ATR: `{p.atr:.4f}`",
+                f"🔢 عدد الأوامر: `{p.grid_count}` ({p.grid_count // 2} شراء + {p.grid_count // 2} بيع)",
                 parse_mode="Markdown",
                 reply_markup=_active_grid_kb(symbol),
             )

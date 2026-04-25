@@ -1,21 +1,24 @@
 """
-AI Dynamic Grid Engine — KuCoin AI Plus behaviour (Grid Expansion).
+Fixed-Spacing Grid Engine.
 
 Startup:
-  - Places INITIAL_ORDERS_PER_SIDE limit buys below price.
-  - Places INITIAL_ORDERS_PER_SIDE limit sells above price.
+  - Places MAX_ORDERS_PER_SIDE (3) limit buys below price, each 1% apart.
+  - Places MAX_ORDERS_PER_SIDE (3) limit sells above price, each 1% apart.
   - No upfront base-currency purchase; capital is deployed only as orders fill.
-  - Each order size = total_investment / grid_count / current_price.
+  - Each order size = total_investment / (MAX_ORDERS_PER_SIDE * 2) / current_price.
 
 Fill handling:
-  - Buy filled  → place new buy one grid lower + sell at the filled level.
-  - Sell filled → place new sell one grid higher + buy at the filled level.
+  - Buy filled  → place sell at fill_price + ORDER_PERCENT, then next buy lower (if under holdings cap).
+  - Sell filled → place buy at fill_price - ORDER_PERCENT (if under holdings cap), then next sell higher.
 
-This "expansion" means the grid grows organically with price movement
-instead of locking all capital into 20+ orders at once.
+Holdings cap:
+  - Max allowed qty = (total_investment / 2) / current_price.
+  - No new buy orders are placed once this cap is reached.
 
-ATR rebalance (every 5 min):
-  - If price escapes range by ≥ 1×ATR, cancel all orders and rebuild.
+Range:
+  - Fixed: lower = price × (1 - MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
+           upper = price × (1 + MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
+  - No ATR-based rebalancing.
 """
 import asyncio
 import logging
@@ -25,18 +28,16 @@ from datetime import datetime, timezone
 from typing import Callable, Coroutine, Optional
 
 from config.settings import (
-    ATR_REFRESH_SECONDS,
-    CANDLE_TIMEFRAME,
     FILL_POLL_INTERVAL,
-    RISK_PROFILES,
 )
 from core.mexc_client import MexcClient
 from utils import db_manager as db
 
 logger = logging.getLogger(__name__)
 
-# How many active orders to keep on each side at startup
-INITIAL_ORDERS_PER_SIDE = 2
+# ── Grid constants ─────────────────────────────────────────────────────────────
+ORDER_PERCENT       = 0.01   # 1% spacing between each order
+MAX_ORDERS_PER_SIDE = 3      # 3 buys + 3 sells = 6 total orders per grid
 
 # Notification functions — injected at runtime to avoid circular import
 _notify_buy_filled    = None
@@ -73,60 +74,37 @@ async def _fire(coro_or_none) -> None:
         logger.error("Notification error: %s", exc)
 
 
-# ── ATR (Wilder) ───────────────────────────────────────────────────────────────
-
-def compute_atr(ohlcv: list, period: int = 14) -> float:
-    if len(ohlcv) < 2:
-        return 0.0
-    true_ranges = []
-    for i in range(1, len(ohlcv)):
-        h, l, pc = ohlcv[i][2], ohlcv[i][3], ohlcv[i - 1][4]
-        true_ranges.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if not true_ranges:
-        return 0.0
-    atr = sum(true_ranges[:period]) / min(period, len(true_ranges))
-    for tr in true_ranges[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return atr
-
-
 # ── Grid parameters ────────────────────────────────────────────────────────────
 
 @dataclass
 class GridParams:
-    lower: float          # range lower bound
-    upper: float          # range upper bound
-    grid_count: int       # total number of grid levels
-    grid_spacing: float   # price distance between levels
+    lower: float          # range lower bound  = price × (1 - N × ORDER_PERCENT)
+    upper: float          # range upper bound  = price × (1 + N × ORDER_PERCENT)
+    grid_count: int       # total order slots  = MAX_ORDERS_PER_SIDE × 2
+    grid_spacing: float   # price step between levels (ORDER_PERCENT of entry price)
     qty_per_grid: float   # base-currency qty per order
-    atr: float
+    atr: float            # kept for DB/report compatibility (always 0.0)
 
 
 def derive_grid_params(
     current_price: float,
-    atr: float,
     total_investment: float,
-    risk: str,
     client: MexcClient,
     symbol: str,
 ) -> GridParams:
-    profile = RISK_PROFILES[risk]
-    mult    = profile["atr_multiplier"]
-    min_g   = profile["min_grids"]
-    max_g   = profile["max_grids"]
+    """
+    Build fixed-spacing grid params.
+    - Range: ±(MAX_ORDERS_PER_SIDE × ORDER_PERCENT) around current_price.
+    - Each order is ORDER_PERCENT apart (compound, so level i = price × (1 ± i × ORDER_PERCENT)).
+    - qty_per_grid = total_investment / grid_count / current_price,
+      capped at (total_investment / 2) / current_price.
+    """
+    grid_count   = MAX_ORDERS_PER_SIDE * 2
+    lower        = current_price * (1 - MAX_ORDERS_PER_SIDE * ORDER_PERCENT)
+    upper        = current_price * (1 + MAX_ORDERS_PER_SIDE * ORDER_PERCENT)
+    grid_spacing = current_price * ORDER_PERCENT   # nominal step for reference
 
-    lower = max(current_price - atr * mult, current_price * 0.01)
-    upper = current_price + atr * mult
-
-    vol_ratio  = atr / current_price
-    raw_grids  = int(min_g + (max_g - min_g) * min(vol_ratio / 0.02, 1.0))
-    grid_count = max(min_g, min(raw_grids, max_g))
-
-    grid_spacing = (upper - lower) / grid_count
-    # Each grid level gets an equal share of the total investment.
-    # qty = (total_investment / grid_count) / current_price
     raw_qty      = total_investment / grid_count / current_price
-    # Hard cap: a single grid order must not exceed half the total investment
     max_qty      = (total_investment / 2) / current_price
     qty_per_grid = client.round_amount(symbol, min(raw_qty, max_qty))
 
@@ -136,7 +114,7 @@ def derive_grid_params(
         grid_count   = grid_count,
         grid_spacing = client.round_price(symbol, grid_spacing),
         qty_per_grid = qty_per_grid,
-        atr          = atr,
+        atr          = 0.0,
     )
 
 
@@ -175,8 +153,7 @@ class GridEngine:
             raise ValueError(f"Grid already running for {symbol}")
 
         price  = await self._client.get_current_price(symbol)
-        atr    = await self._fetch_atr(symbol, RISK_PROFILES[risk]["atr_period"])
-        params = derive_grid_params(price, atr, total_investment, risk, self._client, symbol)
+        params = derive_grid_params(price, total_investment, self._client, symbol)
 
         state = GridState(symbol=symbol, risk=risk, total_investment=total_investment, params=params)
         self._grids[symbol] = state
@@ -189,7 +166,7 @@ class GridEngine:
             "upper_price":      params.upper,
             "grid_count":       params.grid_count,
             "grid_spacing":     params.grid_spacing,
-            "current_atr":      params.atr,
+            "current_atr":      0.0,
             "is_active":        True,
         })
         state.grid_id = grid_id
@@ -198,8 +175,8 @@ class GridEngine:
         self._tasks[symbol] = asyncio.create_task(self._run_loop(state))
 
         logger.info(
-            "Grid started: %s | range %.4f–%.4f | %d grids | spacing=%.4f | ATR=%.4f",
-            symbol, params.lower, params.upper, params.grid_count, params.grid_spacing, params.atr,
+            "Grid started: %s | range %.4f–%.4f | %d grids | spacing=%.4f%%",
+            symbol, params.lower, params.upper, params.grid_count, ORDER_PERCENT * 100,
         )
         return state
 
@@ -241,17 +218,16 @@ class GridEngine:
 
     def _guard_order_cost(self, state: GridState, price: float, qty: float) -> bool:
         """
-        Return False and fire an error notification if a single order would cost
-        more than 2× the per-grid budget (total_investment / grid_count).
-        This catches runaway orders caused by stale params or rounding bugs.
+        Return False if a single order would cost more than 2× the per-grid budget.
+        Per-grid budget = total_investment / (MAX_ORDERS_PER_SIDE * 2).
         """
-        cost      = price * qty
-        max_cost  = (state.total_investment / state.params.grid_count) * 2
+        cost     = price * qty
+        max_cost = (state.total_investment / (MAX_ORDERS_PER_SIDE * 2)) * 2
         if cost > max_cost:
             logger.error(
                 "ORDER BLOCKED %s: cost=%.4f USDT exceeds budget cap=%.4f USDT "
-                "(investment=%.2f / grids=%d × 2)",
-                state.symbol, cost, max_cost, state.total_investment, state.params.grid_count,
+                "(investment=%.2f / %d orders × 2)",
+                state.symbol, cost, max_cost, state.total_investment, MAX_ORDERS_PER_SIDE * 2,
             )
             asyncio.ensure_future(_fire(
                 _notify_error and _notify_error(
@@ -267,27 +243,23 @@ class GridEngine:
 
     async def _place_initial_orders(self, state: GridState, price: float) -> None:
         """
-        Place INITIAL_ORDERS_PER_SIDE limit buys below price and
-        INITIAL_ORDERS_PER_SIDE limit sells above price.
-        No upfront base-currency purchase — sell orders are placed speculatively
-        and will only fill after the corresponding buy orders execute first.
+        Place MAX_ORDERS_PER_SIDE (3) limit buys and MAX_ORDERS_PER_SIDE (3) limit sells.
+        Each level is ORDER_PERCENT (1%) away from the previous one (compound spacing).
+          buy  i: price × (1 - i × ORDER_PERCENT)
+          sell i: price × (1 + i × ORDER_PERCENT)
         """
         p = state.params
 
         # ── Limit buy orders below price ───────────────────────────────────────
-        for i in range(1, INITIAL_ORDERS_PER_SIDE + 1):
-            level = self._client.round_price(state.symbol, price - i * p.grid_spacing)
-            if level < p.lower:
-                break
+        for i in range(1, MAX_ORDERS_PER_SIDE + 1):
+            level = self._client.round_price(state.symbol, price * (1 - i * ORDER_PERCENT))
             order = await self._client.place_limit_buy(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "buy", "price": level, "qty": p.qty_per_grid}
 
         # ── Limit sell orders above price ──────────────────────────────────────
-        for i in range(1, INITIAL_ORDERS_PER_SIDE + 1):
-            level = self._client.round_price(state.symbol, price + i * p.grid_spacing)
-            if level > p.upper:
-                break
+        for i in range(1, MAX_ORDERS_PER_SIDE + 1):
+            level = self._client.round_price(state.symbol, price * (1 + i * ORDER_PERCENT))
             order = await self._client.place_limit_sell(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "sell", "price": level, "qty": p.qty_per_grid}
@@ -303,18 +275,12 @@ class GridEngine:
 
     async def _run_loop(self, state: GridState) -> None:
         loop = asyncio.get_event_loop()
-        last_atr_refresh  = loop.time()
         last_hourly_report = loop.time()
         HOURLY = 3600
 
         while state.running:
             try:
                 now = loop.time()
-
-                # ATR rebalance every 5 min
-                if now - last_atr_refresh >= ATR_REFRESH_SECONDS:
-                    await self._maybe_rebalance(state)
-                    last_atr_refresh = now
 
                 # Hourly summary report
                 if now - last_hourly_report >= HOURLY:
@@ -346,57 +312,21 @@ class GridEngine:
 
     async def upgrade_grid(self, symbol: str) -> None:
         """
-        Cancel all open orders and rebuild the grid at the current price/ATR.
+        Cancel all open orders and rebuild the grid at the current price.
         Used by /upgrade command and called for every active grid on startup.
         """
         state = self._grids.get(symbol)
         if not state or not state.running:
             raise ValueError(f"No active grid for {symbol}")
-        profile = RISK_PROFILES[state.risk]
-        price   = await self._client.get_current_price(symbol)
-        atr     = await self._fetch_atr(symbol, profile["atr_period"])
-        await self._rebuild(state, price, atr)
+        price = await self._client.get_current_price(symbol)
+        await self._rebuild(state, price)
         logger.info("Grid upgraded: %s @ %.4f", symbol, price)
 
-    # ── ATR rebalance ──────────────────────────────────────────────────────────
-
-    async def _maybe_rebalance(self, state: GridState) -> None:
-        profile = RISK_PROFILES[state.risk]
-        atr     = await self._fetch_atr(state.symbol, profile["atr_period"])
-        price   = await self._client.get_current_price(state.symbol)
-        trigger = profile["rebalance_trigger"] * atr
-        outside = price < state.params.lower - trigger or price > state.params.upper + trigger
-
-        if outside:
-            reason = (
-                "السعر تجاوز النطاق العلوي"
-                if price > state.params.upper + trigger
-                else "السعر تجاوز النطاق السفلي"
-            )
-            old_lower = state.params.lower
-            old_upper = state.params.upper
-            logger.info("Price %.4f escaped range — rebuilding grid for %s", price, state.symbol)
-            await self._rebuild(state, price, atr)
-            await _fire(_notify_grid_rebuild and _notify_grid_rebuild(
-                state.symbol,
-                reason,
-                price,
-                price,
-                state.params.lower,
-                state.params.upper,
-                state.params.grid_count,
-                atr,
-            ))
-        else:
-            state.params.atr = atr
-            await db.upsert_grid({"symbol": state.symbol, "current_atr": atr})
-
-    async def _rebuild(self, state: GridState, price: float, atr: float) -> None:
+    async def _rebuild(self, state: GridState, price: float) -> None:
+        """Cancel all orders and re-place the fixed 3+3 grid around the current price."""
         await self._client.cancel_all_orders(state.symbol)
         state.open_orders.clear()
-        params = derive_grid_params(
-            price, atr, state.total_investment, state.risk, self._client, state.symbol
-        )
+        params = derive_grid_params(price, state.total_investment, self._client, state.symbol)
         state.params = params
         await db.upsert_grid({
             "symbol":       state.symbol,
@@ -404,7 +334,7 @@ class GridEngine:
             "upper_price":  params.upper,
             "grid_count":   params.grid_count,
             "grid_spacing": params.grid_spacing,
-            "current_atr":  params.atr,
+            "current_atr":  0.0,
         })
         await self._place_initial_orders(state, price)
 
@@ -430,25 +360,31 @@ class GridEngine:
         qty         = float(order.get("filled") or meta["qty"])
         pnl = 0.0
 
+        # Max allowed holdings = half the total investment at current fill price
+        max_allowed_qty = (state.total_investment / 2) / fill_price
+
         if side == "buy":
             # Update average cost
             total_cost          = state.avg_buy_price * state.held_qty + fill_price * qty
             state.held_qty     += qty
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else 0.0
 
-            # Place sell one grid above the fill
-            sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
+            # Place sell one step above the fill (1% higher)
+            sell_price = self._client.round_price(state.symbol, fill_price * (1 + ORDER_PERCENT))
             if self._guard_order_cost(state, sell_price, qty):
                 sell_order = await self._client.place_limit_sell(state.symbol, sell_price, qty)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": sell_price, "qty": qty}
 
-            # Expand: place next buy one grid lower — only if holdings are within budget
-            max_holdings = state.total_investment / fill_price
-            next_buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
-            if (
+            # Place next buy one step lower — only if under holdings cap
+            next_buy_price = self._client.round_price(state.symbol, fill_price * (1 - ORDER_PERCENT))
+            if state.held_qty >= max_allowed_qty:
+                logger.warning(
+                    "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f (investment/2=%.2f) — buy skipped",
+                    state.symbol, state.held_qty, max_allowed_qty, state.total_investment / 2,
+                )
+            elif (
                 next_buy_price >= state.params.lower
-                and state.held_qty < max_holdings
                 and self._guard_order_cost(state, next_buy_price, state.params.qty_per_grid)
             ):
                 buy_order = await self._client.place_limit_buy(state.symbol, next_buy_price, state.params.qty_per_grid)
@@ -457,13 +393,8 @@ class GridEngine:
                     await _fire(_notify_grid_expansion and _notify_grid_expansion(
                         state.symbol, "down", next_buy_price, "buy"
                     ))
-            elif state.held_qty >= max_holdings:
-                logger.warning(
-                    "HOLDINGS CAP reached for %s: held=%.4f >= max=%.4f (investment=%.2f) — buy skipped",
-                    state.symbol, state.held_qty, max_holdings, state.total_investment,
-                )
 
-            # Notify buy fill — grid_level = buys executed so far (held_qty / qty_per_grid)
+            # Notify buy fill
             buy_level = max(1, round(state.held_qty / state.params.qty_per_grid)) if state.params.qty_per_grid else 1
             await _fire(_notify_buy_filled and _notify_buy_filled(
                 state.symbol, fill_price, qty,
@@ -472,31 +403,32 @@ class GridEngine:
             ))
 
         else:  # sell
-            pnl              = (fill_price - state.avg_buy_price) * qty
+            pnl                = (fill_price - state.avg_buy_price) * qty
             state.realized_pnl += pnl
-            state.sell_count += 1
-            state.held_qty    = max(0.0, state.held_qty - qty)
+            state.sell_count   += 1
+            state.held_qty      = max(0.0, state.held_qty - qty)
 
-            # Place buy one grid below the fill — only if holdings are within budget
-            max_holdings = state.total_investment / fill_price
-            buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
-            if (
-                buy_price >= state.params.lower
-                and state.held_qty < max_holdings
-                and self._guard_order_cost(state, buy_price, qty)
-            ):
-                buy_order = await self._client.place_limit_buy(state.symbol, buy_price, qty)
-                if buy_order:
-                    state.open_orders[buy_order["id"]] = {"side": "buy", "price": buy_price, "qty": qty}
-            elif state.held_qty >= max_holdings:
+            # Place buy one step below the fill — only if under holdings cap
+            buy_price = self._client.round_price(state.symbol, fill_price * (1 - ORDER_PERCENT))
+            if state.held_qty >= max_allowed_qty:
                 logger.warning(
-                    "HOLDINGS CAP reached for %s: held=%.4f >= max=%.4f — buy skipped",
-                    state.symbol, state.held_qty, max_holdings,
+                    "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f — buy skipped",
+                    state.symbol, state.held_qty, max_allowed_qty,
                 )
+            elif (
+                buy_price >= state.params.lower
+                and self._guard_order_cost(state, buy_price, state.params.qty_per_grid)
+            ):
+                buy_order = await self._client.place_limit_buy(state.symbol, buy_price, state.params.qty_per_grid)
+                if buy_order:
+                    state.open_orders[buy_order["id"]] = {"side": "buy", "price": buy_price, "qty": state.params.qty_per_grid}
 
-            # Expand: place next sell one grid higher
-            next_sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
-            if next_sell_price <= state.params.upper and self._guard_order_cost(state, next_sell_price, state.params.qty_per_grid):
+            # Place next sell one step higher
+            next_sell_price = self._client.round_price(state.symbol, fill_price * (1 + ORDER_PERCENT))
+            if (
+                next_sell_price <= state.params.upper
+                and self._guard_order_cost(state, next_sell_price, state.params.qty_per_grid)
+            ):
                 sell_order = await self._client.place_limit_sell(state.symbol, next_sell_price, state.params.qty_per_grid)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": next_sell_price, "qty": state.params.qty_per_grid}
@@ -566,14 +498,6 @@ class GridEngine:
         }
 
     # ── Helpers ────────────────────────────────────────────────────────────────
-
-    async def _fetch_atr(self, symbol: str, period: int) -> float:
-        ohlcv = await self._client.fetch_ohlcv(symbol, CANDLE_TIMEFRAME, limit=period + 5)
-        atr   = compute_atr(ohlcv, period)
-        if atr <= 0:
-            price = await self._client.get_current_price(symbol)
-            atr   = price * 0.01
-        return atr
 
     def _snapshot(self, state: GridState) -> dict:
         return {
