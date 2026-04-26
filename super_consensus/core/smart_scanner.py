@@ -29,6 +29,10 @@ from typing import Dict, List, Optional, Tuple
 
 from config.settings import OPENROUTER_API_KEY
 
+# In-process cache: avoids repeated CoinGecko calls within the same process
+_coingecko_cache: Dict[int, tuple] = {}   # count → (monotonic_ts, raw_list)
+COINGECKO_CACHE_TTL = 300                 # reuse data for 5 minutes
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -132,15 +136,36 @@ class ScanResult:
 
 # ── CoinGecko data fetch ───────────────────────────────────────────────────────
 
-def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
+def _fetch_top_coins_raw(count: int, retries: int = 4) -> list:
+    """Single CoinGecko request with exponential backoff on 429."""
     url = COINGECKO_MARKETS_URL.format(count=count)
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "SuperConsensusBot/2.0"},
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        raw = json.loads(r.read())
+    last_exc: Exception = RuntimeError("No attempts made")
+    for attempt in range(1, retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code == 429:
+                wait = 5 * attempt   # 5s, 10s, 15s, 20s
+                logger.warning(
+                    "CoinGecko 429 — waiting %ds (attempt %d/%d)", wait, attempt, retries
+                )
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(2)
+    raise last_exc
 
+
+def _parse_coins(raw: list) -> List[CoinData]:
     coins = []
     for i, item in enumerate(raw, start=1):
         sym = (item.get("symbol") or "").lower()
@@ -158,6 +183,22 @@ def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
             rank=i,
         ))
     return coins
+
+
+def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
+    # Serve from cache if data is fresh
+    cached = _coingecko_cache.get(count)
+    if cached:
+        cached_at, raw = cached
+        age = time.monotonic() - cached_at
+        if age < COINGECKO_CACHE_TTL:
+            logger.info("CoinGecko cache hit (age=%.0fs)", age)
+            return _parse_coins(raw)
+
+    raw = _fetch_top_coins_raw(count)
+    _coingecko_cache[count] = (time.monotonic(), raw)
+    logger.info("CoinGecko fetched %d items, cached for %ds", len(raw), COINGECKO_CACHE_TTL)
+    return _parse_coins(raw)
 
 
 # ── OpenRouter call (sync, runs in thread) ─────────────────────────────────────
