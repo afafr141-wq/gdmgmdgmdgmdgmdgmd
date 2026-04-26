@@ -41,20 +41,31 @@ SCAN_COIN_COUNT = 50          # how many top coins to fetch from CoinGecko
 SCAN_TOP_PICKS  = 5           # each analyst picks this many coins
 SCAN_FINAL_TOP  = 3           # judge outputs this many final coins
 
-# Free models — verified available on OpenRouter (checked 2025-04-26)
-# Using diverse providers to spread rate-limit load
+# Free models — ordered by reliability. All from different providers to
+# spread rate-limit load. GPT-OSS-20B confirmed working; others are fallbacks.
+# Primary analysts: try each in order, skip on failure
 ANALYST_MODELS: List[Tuple[str, str]] = [
-    ("LLaMA-70B",  "meta-llama/llama-3.3-70b-instruct:free"),
-    ("Gemma-12B",  "google/gemma-3-12b-it:free"),        # smaller → no 400
-    ("GPT-OSS-20B","openai/gpt-oss-20b:free"),           # different provider
+    ("GPT-OSS-20B",  "openai/gpt-oss-20b:free"),
+    ("Qwen3-80B",    "qwen/qwen3-next-80b-a3b-instruct:free"),
+    ("Nemotron-30B", "nvidia/nemotron-3-nano-30b-a3b:free"),
 ]
 JUDGE_MODEL = "openai/gpt-oss-120b:free"
 
+# Fallback analysts tried if primary ones all fail
+FALLBACK_ANALYST_MODELS: List[Tuple[str, str]] = [
+    ("LLaMA-3B",    "meta-llama/llama-3.2-3b-instruct:free"),
+    ("Gemma4-26B",  "google/gemma-4-26b-a4b-it:free"),
+    ("Hermes-405B", "nousresearch/hermes-3-llama-3.1-405b:free"),
+]
+
 # Send analysts sequentially with a gap to avoid simultaneous 429s
-ANALYST_DELAY_SECONDS = 3   # wait between each analyst call
+ANALYST_DELAY_SECONDS = 5   # wait between each analyst call
 
 # Max coins to include in the AI prompt (pre-filtered by data quality)
 PROMPT_COIN_LIMIT = 20
+
+# Minimum successful analysts needed before calling the judge
+MIN_SUCCESSFUL_ANALYSTS = 1
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -579,14 +590,36 @@ class SmartScanner:
 
         logger.info("SmartScanner: got %d coins (after filtering stablecoins)", len(coins))
 
-        # 2. Run analysts sequentially with a small delay between each
-        # to avoid simultaneous 429s from OpenRouter
+        # 2. Run analysts sequentially with a delay between each.
+        # If a primary analyst fails, try a fallback model in its slot.
         reports: List[AnalystReport] = []
+        fallback_iter = iter(FALLBACK_ANALYST_MODELS)
+
         for i, (name, model) in enumerate(ANALYST_MODELS):
             if i > 0:
                 await asyncio.sleep(ANALYST_DELAY_SECONDS)
             report = await _run_analyst(name, model, coins)
+
+            # If primary failed, try one fallback in its place
+            if report.error:
+                try:
+                    fb_name, fb_model = next(fallback_iter)
+                    logger.info(
+                        "Primary analyst %s failed — trying fallback %s", name, fb_name
+                    )
+                    await asyncio.sleep(2)
+                    fb_report = await _run_analyst(fb_name, fb_model, coins)
+                    if not fb_report.error:
+                        report = fb_report
+                except StopIteration:
+                    pass  # no more fallbacks
+
             reports.append(report)
+
+        successful = sum(1 for r in reports if not r.error)
+        logger.info(
+            "SmartScanner: %d/%d analysts succeeded", successful, len(reports)
+        )
 
         # 3. Merge results
         merged = _merge_analyst_reports(reports)
