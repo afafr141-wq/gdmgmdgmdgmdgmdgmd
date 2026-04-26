@@ -3,3 +3,4 @@ asyncpg==0.29.0
 python-telegram-bot==21.5
 python-dotenv==1.0.1
 psycopg2-binary==2.9.9
+# SuperConsensus Bot — no extra deps needed (pure Python math, no numpy/pandas)
