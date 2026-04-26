@@ -19,6 +19,7 @@ from super_consensus.bot.super_bot import (
     build_super_application,
     send_super_notification,
 )
+from super_consensus.bot.menu_bot import register_menu_handlers
 from super_consensus.utils.super_db import (
     init_super_db,
     close_super_db,
@@ -172,6 +173,9 @@ def main() -> None:
     app.bot_data["client"]       = client
     app.bot_data["super_engine"] = engine
     app.bot_data["auto_engine"]  = auto_engine
+
+    # Register interactive menu handlers (/menu + inline keyboards)
+    register_menu_handlers(app)
 
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown

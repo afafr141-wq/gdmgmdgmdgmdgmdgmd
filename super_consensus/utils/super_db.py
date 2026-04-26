@@ -480,3 +480,18 @@ async def get_auto_trades(limit: int = 50) -> list[dict]:
             limit,
         )
     return [dict(r) for r in rows]
+
+
+async def get_auto_trades_by_period(hours: int = 24) -> list[dict]:
+    """Return all auto_mode_trades within the last N hours."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM auto_mode_trades
+            WHERE executed_at >= NOW() - ($1 || ' hours')::INTERVAL
+            ORDER BY executed_at DESC
+            """,
+            str(hours),
+        )
+    return [dict(r) for r in rows]
