@@ -1,16 +1,8 @@
 """
-SuperConsensus Telegram Bot.
+SuperConsensus Telegram Bot — handlers only.
 
-Commands:
-  /start_super SYMBOL INVESTMENT  — start bot
-  /stop_super SYMBOL              — stop bot (sells open position)
-  /status_super SYMBOL            — show status
-  /signals SYMBOL                 — show live signals without trading
-  /list_super                     — list all active bots
-  /pause_super SYMBOL             — pause monitoring
-  /resume_super SYMBOL            — resume monitoring
-
-Interactive inline keyboard for quick access.
+Registered into the main bot's Application via register_super_handlers().
+Notifications go through the shared _send() from telegram_bot.py.
 """
 from __future__ import annotations
 
@@ -30,17 +22,12 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-from config.settings import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ALLOWED_USER_IDS
+from config.settings import ALLOWED_USER_IDS
 from super_consensus.core.consensus_engine import ConsensusEngine, CANDLE_TIMEFRAME, CANDLE_LIMIT
 from super_consensus.utils.super_db import (
     upsert_bot,
     deactivate_bot,
-    get_bot,
-    get_all_active_bots,
-    get_trades,
     make_db_fns,
-    log_cycle,
-    record_trade,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,25 +42,6 @@ def _authorized(update: Update) -> bool:
 
 async def _deny(update: Update) -> None:
     await update.message.reply_text("⛔ غير مصرح لك باستخدام هذا البوت.")
-
-
-# ── Notification helper ────────────────────────────────────────────────────────
-
-_application: Optional[Application] = None
-
-
-async def send_super_notification(text: str, application: Optional[Application] = None) -> None:
-    app = application or _application
-    if not app or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        await app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as exc:
-        logger.error("send_super_notification failed: %s", exc)
 
 
 # ── Signal emoji helpers ───────────────────────────────────────────────────────
@@ -444,30 +412,20 @@ async def handle_super_callback(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
 
-# ── Application builder ────────────────────────────────────────────────────────
+# ── Handler registration (called from telegram_bot.build_application) ──────────
 
-def build_super_application(engine: ConsensusEngine, client) -> Application:
-    global _application
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    _application = app
-
-    # Store shared objects
+def register_super_handlers(app: Application, engine: ConsensusEngine) -> None:
+    """Add all SuperConsensus commands to an existing Application."""
     app.bot_data["super_engine"] = engine
-    app.bot_data["client"]       = client
 
-    # Commands
-    app.add_handler(CommandHandler("super_menu",    cmd_super_menu))
-    app.add_handler(CommandHandler("start_super",   cmd_start_super))
-    app.add_handler(CommandHandler("stop_super",    cmd_stop_super))
-    app.add_handler(CommandHandler("status_super",  cmd_status_super))
-    app.add_handler(CommandHandler("signals",       cmd_signals))
-    app.add_handler(CommandHandler("list_super",    cmd_list_super))
-    app.add_handler(CommandHandler("pause_super",   cmd_pause_super))
-    app.add_handler(CommandHandler("resume_super",  cmd_resume_super))
-
-    # Inline keyboard
+    app.add_handler(CommandHandler("super_menu",   cmd_super_menu))
+    app.add_handler(CommandHandler("start_super",  cmd_start_super))
+    app.add_handler(CommandHandler("stop_super",   cmd_stop_super))
+    app.add_handler(CommandHandler("status_super", cmd_status_super))
+    app.add_handler(CommandHandler("signals",      cmd_signals))
+    app.add_handler(CommandHandler("list_super",   cmd_list_super))
+    app.add_handler(CommandHandler("pause_super",  cmd_pause_super))
+    app.add_handler(CommandHandler("resume_super", cmd_resume_super))
     app.add_handler(CallbackQueryHandler(handle_super_callback, pattern=r"^super:"))
 
-    logger.info("SuperConsensus Telegram handlers registered")
-    return app
+    logger.info("SuperConsensus handlers registered into main bot")

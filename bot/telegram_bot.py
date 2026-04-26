@@ -969,11 +969,13 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
-def build_application(engine, client) -> Application:
+def build_application(engine, client, super_engine=None) -> Application:
     global _application
     set_engine(engine, client)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     _application = app
+
+    # ── Grid bot handlers ──────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("start_ai", cmd_start_ai))
@@ -987,6 +989,13 @@ def build_application(engine, client) -> Application:
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("upgrade", cmd_upgrade))
     app.add_handler(CommandHandler("balance", cmd_balance))
+
+    # ── SuperConsensus handlers (registered if engine provided) ───────────────
+    if super_engine is not None:
+        from super_consensus.bot.super_bot import register_super_handlers
+        register_super_handlers(app, super_engine)
+
+    # ── Catch-all handlers (must be last) ─────────────────────────────────────
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

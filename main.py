@@ -1,6 +1,6 @@
 """
 Entry point. Validates env, initialises DB + MEXC client, wires the
-GridEngine to the Telegram bot, then starts long-polling.
+GridEngine and ConsensusEngine to the Telegram bot, then starts long-polling.
 """
 import asyncio
 import logging
@@ -20,6 +20,14 @@ from bot.telegram_bot import (
     notify_error,
 )
 from utils.db_manager import init_db, close_db, get_all_active_grids
+from super_consensus.core.consensus_engine import ConsensusEngine
+from super_consensus.utils.super_db import (
+    init_super_db,
+    close_super_db,
+    get_all_active_bots,
+    make_db_fns,
+    upsert_bot,
+)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -50,14 +58,15 @@ async def _on_startup(application) -> None:
     """Called once after the bot is initialised, before polling starts."""
     logger.info("Bot starting up…")
 
-    # DB
+    # ── Databases ──────────────────────────────────────────────────────────────
     await init_db()
+    await init_super_db()
 
-    # MEXC
+    # ── MEXC ───────────────────────────────────────────────────────────────────
     client = application.bot_data["client"]
     await client.load_markets()
 
-    # Recover any grids that were active before a restart
+    # ── Recover grid bots ──────────────────────────────────────────────────────
     engine: GridEngine = application.bot_data["engine"]
     active = await get_all_active_grids()
     recovered, upgraded, failed = 0, 0, 0
@@ -78,17 +87,64 @@ async def _on_startup(application) -> None:
                 failed += 1
                 continue
 
-        # Upgrade all recovered grids to the latest engine logic
         await _upgrade_existing_grids(engine, application)
         upgraded = recovered
 
+    # ── Recover SuperConsensus bots ────────────────────────────────────────────
+    super_engine: ConsensusEngine = application.bot_data["super_engine"]
+    super_active = await get_all_active_bots()
+    super_recovered = 0
+
+    if super_active:
+        logger.info("Recovering %d SuperConsensus bot(s)…", len(super_active))
+        for row in super_active:
+            symbol = row["symbol"]
+            try:
+                db_fns = make_db_fns(symbol)
+                from super_consensus.core.consensus_engine import BotState
+                state = BotState(symbol=symbol, total_investment=float(row["total_investment"]))
+                super_engine._bots[symbol] = state
+
+                task = asyncio.create_task(
+                    super_engine._loop(symbol, db_fns), name=f"super_{symbol}"
+                )
+                state._task = task
+
+                # Restore open position if any
+                if float(row["current_position_qty"]) > 0:
+                    from super_consensus.core.consensus_engine import Position
+                    from datetime import timezone
+                    import datetime as _dt
+                    state.position = Position(
+                        qty=float(row["current_position_qty"]),
+                        entry_price=float(row["current_position_entry_price"]),
+                        entry_time=(
+                            row["current_position_entry_time"].replace(tzinfo=timezone.utc)
+                            if row["current_position_entry_time"]
+                            else _dt.datetime.now(timezone.utc)
+                        ),
+                        cost_usdt=float(row["current_position_qty"])
+                        * float(row["current_position_entry_price"]),
+                    )
+
+                state.realized_pnl = float(row["realized_pnl"])
+                state.total_trades = int(row["total_trades"])
+                state.is_paused    = bool(row["is_paused"])
+
+                super_recovered += 1
+                logger.info("Recovered SuperConsensus bot: %s", symbol)
+            except Exception as exc:
+                logger.error("Failed to recover SuperConsensus bot %s: %s", symbol, exc)
+
+    # ── Startup notification ───────────────────────────────────────────────────
     await send_notification(
         "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
         f"📊 شبكات مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
-        "اكتب /start للقائمة الرئيسية.",
+        f"🧠 *SuperConsensus* — بوتات مستردة: `{super_recovered}`\n"
+        "اكتب /start للقائمة الرئيسية | /super\\_menu للإجماع.",
         application=application,
     )
-    logger.info("Startup complete.")
+    logger.info("Startup complete. Grids=%d SuperBots=%d", recovered, super_recovered)
 
 
 async def _on_shutdown(application) -> None:
@@ -96,6 +152,7 @@ async def _on_shutdown(application) -> None:
     logger.info("Shutting down…")
     engine: GridEngine = application.bot_data["engine"]
     client: MexcClient = application.bot_data["client"]
+    super_engine: ConsensusEngine = application.bot_data.get("super_engine")
 
     # Stop all running grids gracefully (cancel orders, save snapshots)
     for symbol in list(engine.active_symbols()):
@@ -104,8 +161,17 @@ async def _on_shutdown(application) -> None:
         except Exception as exc:
             logger.error("Error stopping grid %s: %s", symbol, exc)
 
+    # Stop all SuperConsensus bots (keep positions open across restarts)
+    if super_engine:
+        for symbol in list(super_engine.active_symbols()):
+            try:
+                await super_engine.stop(symbol, market_sell=False)
+            except Exception as exc:
+                logger.error("Error stopping SuperConsensus bot %s: %s", symbol, exc)
+
     await client.close()
     await close_db()
+    await close_super_db()
     logger.info("Shutdown complete.")
 
 
@@ -114,33 +180,38 @@ def main() -> None:
 
     client = MexcClient()
 
-    # Notify callback — needs the application reference, injected after build
+    # Shared notify ref — filled after app is built
     _notify_ref: dict = {}
 
     async def notify(text: str) -> None:
         app = _notify_ref.get("app")
         await send_notification(text, application=app)
 
+    # Grid engine
     engine = GridEngine(client=client, notify=notify)
 
-    app = build_application(engine, client)
+    # SuperConsensus engine — same notify channel
+    super_engine = ConsensusEngine(client=client, notify=notify)
+
+    # Build single Application with both sets of handlers
+    app = build_application(engine, client, super_engine=super_engine)
     _notify_ref["app"] = app
 
-    # Wire notification functions into the engine (after app is built
-    # so _application is set inside telegram_bot)
+    # Wire grid notification callbacks
     set_notifiers(
-        buy_filled    = notify_buy_filled,
-        sell_filled   = notify_sell_filled,
-        grid_rebuild  = notify_grid_rebuild,
+        buy_filled     = notify_buy_filled,
+        sell_filled    = notify_sell_filled,
+        grid_rebuild   = notify_grid_rebuild,
         grid_expansion = notify_grid_expansion,
-        error         = notify_error,
+        error          = notify_error,
     )
 
-    # Inject shared objects so startup/shutdown hooks can access them
-    app.bot_data["client"] = client
-    app.bot_data["engine"] = engine
+    # Inject shared objects for startup/shutdown hooks
+    app.bot_data["client"]       = client
+    app.bot_data["engine"]       = engine
+    app.bot_data["super_engine"] = super_engine
 
-    app.post_init = _on_startup
+    app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
 
     logger.info("Starting Telegram long-polling…")
