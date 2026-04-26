@@ -1,310 +1,309 @@
 """
-Giants Engine — five independent signal sources.
+Giants Engine — five signal sources for SuperConsensus Bot.
 
-Each giant receives OHLCV candle data and returns one of:
-  Signal.BUY / Signal.SELL / Signal.NEUTRAL
+Architecture:
+  Giant1 — MarketSentiment  : CoinGecko + Fear & Greed Index (live data)
+  Giant2 — AIJudge          : OpenRouter LLM — receives all other giants'
+                              reports and issues the FINAL decision
+  Giant3/4/5                : Placeholder stubs ready for future APIs
 
-Adding a new giant: subclass BaseGiant and implement `compute()`.
-The consensus engine discovers giants via the GIANTS registry list.
+Each giant returns a GiantReport:
+  signal     : "BUY" | "SELL" | "HOLD"
+  confidence : 0-100
+  reason     : one short sentence
+
+Giant2 (AIJudge) is special — it does NOT produce its own market signal.
+Instead, consensus_engine feeds it the other giants' reports and it
+returns the authoritative final decision.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
-from enum import Enum
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
+
+from config.settings import OPENROUTER_API_KEY, OPENROUTER_MODEL
 
 logger = logging.getLogger(__name__)
 
 
-# ── Signal type ────────────────────────────────────────────────────────────────
+# ── Report dataclass ───────────────────────────────────────────────────────────
 
-class Signal(str, Enum):
-    BUY     = "BUY"
-    SELL    = "SELL"
-    NEUTRAL = "NEUTRAL"
+@dataclass
+class GiantReport:
+    name:       str
+    signal:     str   # "BUY" | "SELL" | "HOLD"
+    confidence: int   # 0-100
+    reason:     str
 
-
-# ── OHLCV helpers ──────────────────────────────────────────────────────────────
-
-def _closes(candles: list) -> list[float]:
-    return [float(c[4]) for c in candles]
-
-def _highs(candles: list) -> list[float]:
-    return [float(c[2]) for c in candles]
-
-def _lows(candles: list) -> list[float]:
-    return [float(c[3]) for c in candles]
-
-def _volumes(candles: list) -> list[float]:
-    return [float(c[5]) for c in candles]
+    def to_prompt_line(self) -> str:
+        return (
+            f"- {self.name}: signal={self.signal}, "
+            f"confidence={self.confidence}, reason='{self.reason}'"
+        )
 
 
 # ── Base class ─────────────────────────────────────────────────────────────────
 
 class BaseGiant(ABC):
-    """Abstract base for every signal source (giant)."""
-
     name: str = "BaseGiant"
 
     @abstractmethod
-    def compute(self, candles: list) -> Signal:
-        """
-        Receive the last N OHLCV candles and return a Signal.
-        candles: list of [timestamp, open, high, low, close, volume]
-        """
+    async def analyze(self, symbol: str, price: float) -> GiantReport:
+        """Fetch data and return a GiantReport for the given symbol."""
 
     def __repr__(self) -> str:
         return f"<Giant:{self.name}>"
 
 
-# ── Giant 1 — RSI ──────────────────────────────────────────────────────────────
+# ── HTTP helper ────────────────────────────────────────────────────────────────
 
-class RSIGiant(BaseGiant):
-    """Relative Strength Index (period=14). BUY < 30, SELL > 70."""
-
-    name = "RSI"
-
-    def __init__(self, period: int = 14, oversold: float = 30, overbought: float = 70):
-        self.period     = period
-        self.oversold   = oversold
-        self.overbought = overbought
-
-    def _rsi(self, closes: list[float]) -> float:
-        if len(closes) < self.period + 1:
-            return 50.0
-        gains, losses = [], []
-        for i in range(1, self.period + 1):
-            diff = closes[-self.period + i] - closes[-self.period + i - 1]
-            (gains if diff > 0 else losses).append(abs(diff))
-        avg_gain = sum(gains) / self.period if gains else 0.0
-        avg_loss = sum(losses) / self.period if losses else 0.0
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    def compute(self, candles: list) -> Signal:
-        closes = _closes(candles)
-        rsi = self._rsi(closes)
-        logger.debug("RSI=%.2f", rsi)
-        if rsi < self.oversold:
-            return Signal.BUY
-        if rsi > self.overbought:
-            return Signal.SELL
-        return Signal.NEUTRAL
-
-    def get_value(self, candles: list) -> float:
-        return self._rsi(_closes(candles))
+def _get_json(url: str, timeout: int = 10) -> dict:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "SuperConsensusBot/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
 
 
-# ── Giant 2 — MACD ─────────────────────────────────────────────────────────────
+# ── Giant 1 — Market Sentiment ─────────────────────────────────────────────────
 
-class MACDGiant(BaseGiant):
-    """MACD crossover. BUY when MACD crosses above signal, SELL when below."""
-
-    name = "MACD"
-
-    def __init__(self, fast: int = 12, slow: int = 26, signal: int = 9):
-        self.fast   = fast
-        self.slow   = slow
-        self.signal = signal
-
-    def _ema(self, values: list[float], period: int) -> list[float]:
-        if not values:
-            return []
-        k = 2 / (period + 1)
-        emas = [values[0]]
-        for v in values[1:]:
-            emas.append(v * k + emas[-1] * (1 - k))
-        return emas
-
-    def _macd_lines(self, closes: list[float]):
-        ema_fast   = self._ema(closes, self.fast)
-        ema_slow   = self._ema(closes, self.slow)
-        min_len    = min(len(ema_fast), len(ema_slow))
-        macd_line  = [ema_fast[i] - ema_slow[i] for i in range(min_len)]
-        signal_line = self._ema(macd_line, self.signal)
-        return macd_line, signal_line
-
-    def compute(self, candles: list) -> Signal:
-        closes = _closes(candles)
-        if len(closes) < self.slow + self.signal:
-            return Signal.NEUTRAL
-        macd_line, signal_line = self._macd_lines(closes)
-        if len(macd_line) < 2 or len(signal_line) < 2:
-            return Signal.NEUTRAL
-        # Crossover detection: compare last two bars
-        prev_diff = macd_line[-2] - signal_line[-2]
-        curr_diff = macd_line[-1] - signal_line[-1]
-        logger.debug("MACD diff prev=%.6f curr=%.6f", prev_diff, curr_diff)
-        if prev_diff < 0 and curr_diff > 0:
-            return Signal.BUY
-        if prev_diff > 0 and curr_diff < 0:
-            return Signal.SELL
-        return Signal.NEUTRAL
-
-    def get_values(self, candles: list) -> dict:
-        closes = _closes(candles)
-        macd_line, signal_line = self._macd_lines(closes)
-        return {
-            "macd":   macd_line[-1] if macd_line else 0,
-            "signal": signal_line[-1] if signal_line else 0,
-        }
-
-
-# ── Giant 3 — EMA Crossover ────────────────────────────────────────────────────
-
-class EMAGiant(BaseGiant):
-    """EMA 20 / EMA 50 crossover. BUY when EMA20 crosses above EMA50."""
-
-    name = "EMA"
-
-    def __init__(self, fast: int = 20, slow: int = 50):
-        self.fast = fast
-        self.slow = slow
-
-    def _ema(self, values: list[float], period: int) -> list[float]:
-        if not values:
-            return []
-        k = 2 / (period + 1)
-        emas = [values[0]]
-        for v in values[1:]:
-            emas.append(v * k + emas[-1] * (1 - k))
-        return emas
-
-    def compute(self, candles: list) -> Signal:
-        closes = _closes(candles)
-        if len(closes) < self.slow + 2:
-            return Signal.NEUTRAL
-        ema_fast = self._ema(closes, self.fast)
-        ema_slow = self._ema(closes, self.slow)
-        min_len  = min(len(ema_fast), len(ema_slow))
-        if min_len < 2:
-            return Signal.NEUTRAL
-        prev_diff = ema_fast[-2] - ema_slow[-2]
-        curr_diff = ema_fast[-1] - ema_slow[-1]
-        logger.debug("EMA diff prev=%.6f curr=%.6f", prev_diff, curr_diff)
-        if prev_diff < 0 and curr_diff > 0:
-            return Signal.BUY
-        if prev_diff > 0 and curr_diff < 0:
-            return Signal.SELL
-        return Signal.NEUTRAL
-
-    def get_values(self, candles: list) -> dict:
-        closes = _closes(candles)
-        ema_fast = self._ema(closes, self.fast)
-        ema_slow = self._ema(closes, self.slow)
-        return {
-            f"ema{self.fast}": ema_fast[-1] if ema_fast else 0,
-            f"ema{self.slow}": ema_slow[-1] if ema_slow else 0,
-        }
-
-
-# ── Giant 4 — Bollinger Bands ──────────────────────────────────────────────────
-
-class BollingerGiant(BaseGiant):
-    """Bollinger Bands (20, 2σ). BUY when price ≤ lower band, SELL when ≥ upper."""
-
-    name = "Bollinger"
-
-    def __init__(self, period: int = 20, std_dev: float = 2.0):
-        self.period  = period
-        self.std_dev = std_dev
-
-    def _bands(self, closes: list[float]):
-        if len(closes) < self.period:
-            return None, None, None
-        window = closes[-self.period:]
-        mid    = sum(window) / self.period
-        var    = sum((x - mid) ** 2 for x in window) / self.period
-        std    = var ** 0.5
-        return mid - self.std_dev * std, mid, mid + self.std_dev * std
-
-    def compute(self, candles: list) -> Signal:
-        closes = _closes(candles)
-        lower, mid, upper = self._bands(closes)
-        if lower is None:
-            return Signal.NEUTRAL
-        price = closes[-1]
-        logger.debug("BB lower=%.4f price=%.4f upper=%.4f", lower, price, upper)
-        if price <= lower:
-            return Signal.BUY
-        if price >= upper:
-            return Signal.SELL
-        return Signal.NEUTRAL
-
-    def get_values(self, candles: list) -> dict:
-        closes = _closes(candles)
-        lower, mid, upper = self._bands(closes)
-        return {"lower": lower, "mid": mid, "upper": upper, "price": closes[-1]}
-
-
-# ── Giant 5 — Volume + Momentum ────────────────────────────────────────────────
-
-class VolumeMomentumGiant(BaseGiant):
+class MarketSentimentGiant(BaseGiant):
     """
-    High volume + rapid price move.
-    BUY:  volume > avg_volume * threshold AND price change > +momentum_pct
-    SELL: volume > avg_volume * threshold AND price change < -momentum_pct
+    Combines three free data sources:
+      1. Fear & Greed Index (alternative.me)
+      2. CoinGecko 24h price change for the symbol
+      3. CoinGecko global market cap change
+
+    Decision logic:
+      BUY  — Fear & Greed < 30 (extreme fear) AND price recovering (24h > -2%)
+      SELL — Fear & Greed > 70 (extreme greed) OR price falling fast (24h < -5%)
+      HOLD — everything else
     """
 
-    name = "Volume"
+    name = "MarketSentiment"
 
-    def __init__(
-        self,
-        vol_period: int   = 20,
-        vol_threshold: float = 1.5,
-        momentum_pct: float  = 0.5,   # percent
-    ):
-        self.vol_period    = vol_period
-        self.vol_threshold = vol_threshold
-        self.momentum_pct  = momentum_pct
+    _SYMBOL_MAP = {
+        "BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana",
+        "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano",
+        "DOGE": "dogecoin", "AVAX": "avalanche-2", "DOT": "polkadot",
+        "MATIC": "matic-network", "LINK": "chainlink", "UNI": "uniswap",
+        "LTC": "litecoin", "ATOM": "cosmos", "NEAR": "near",
+    }
 
-    def compute(self, candles: list) -> Signal:
-        closes  = _closes(candles)
-        volumes = _volumes(candles)
-        if len(candles) < self.vol_period + 1:
-            return Signal.NEUTRAL
+    def _coingecko_id(self, symbol: str) -> str:
+        base = symbol.replace("/USDT", "").replace("USDT", "").upper()
+        return self._SYMBOL_MAP.get(base, base.lower())
 
-        avg_vol    = sum(volumes[-self.vol_period - 1:-1]) / self.vol_period
-        curr_vol   = volumes[-1]
-        price_chg  = (closes[-1] - closes[-2]) / closes[-2] * 100 if closes[-2] else 0
+    async def analyze(self, symbol: str, price: float) -> GiantReport:
+        try:
+            return self._fetch_and_decide(symbol, price)
+        except Exception as exc:
+            logger.warning("MarketSentiment fetch failed: %s", exc)
+            return GiantReport(
+                name=self.name,
+                signal="HOLD",
+                confidence=30,
+                reason=f"Data fetch failed: {exc}",
+            )
 
-        logger.debug(
-            "Volume curr=%.2f avg=%.2f ratio=%.2f price_chg=%.3f%%",
-            curr_vol, avg_vol, curr_vol / avg_vol if avg_vol else 0, price_chg,
+    def _fetch_and_decide(self, symbol: str, price: float) -> GiantReport:
+        # 1. Fear & Greed
+        fg_data  = _get_json("https://api.alternative.me/fng/?limit=1")
+        fg_value = int(fg_data["data"][0]["value"])
+        fg_label = fg_data["data"][0]["value_classification"]
+
+        # 2. 24h price change from CoinGecko
+        cg_id = self._coingecko_id(symbol)
+        try:
+            price_data = _get_json(
+                f"https://api.coingecko.com/api/v3/simple/price"
+                f"?ids={cg_id}&vs_currencies=usd&include_24hr_change=true"
+            )
+            change_24h = float(price_data.get(cg_id, {}).get("usd_24h_change", 0) or 0)
+        except Exception:
+            change_24h = 0.0
+
+        # 3. Global market cap change
+        try:
+            global_data  = _get_json("https://api.coingecko.com/api/v3/global")
+            global_change = float(
+                global_data["data"].get("market_cap_change_percentage_24h_usd", 0) or 0
+            )
+        except Exception:
+            global_change = 0.0
+
+        signal, confidence, reason = self._decide(fg_value, fg_label, change_24h, global_change)
+
+        logger.info(
+            "MarketSentiment [%s]: F&G=%d (%s) 24h=%.2f%% global=%.2f%% -> %s (%d%%)",
+            symbol, fg_value, fg_label, change_24h, global_change, signal, confidence,
+        )
+        return GiantReport(name=self.name, signal=signal, confidence=confidence, reason=reason)
+
+    def _decide(self, fg: int, fg_label: str, change_24h: float, global_change: float):
+        if fg < 25 and change_24h > -3:
+            conf = min(90, 60 + (25 - fg))
+            return "BUY", conf, f"Extreme fear ({fg_label}, {fg}) with stable/recovering price"
+        if fg > 75:
+            conf = min(90, 55 + (fg - 75))
+            return "SELL", conf, f"Extreme greed ({fg_label}, {fg}) — market overheated"
+        if change_24h < -6:
+            return "SELL", 70, f"Sharp 24h drop ({change_24h:.1f}%) signals bearish momentum"
+        if fg < 40 and global_change > 1:
+            return "BUY", 55, f"Fear index ({fg}) with positive global market (+{global_change:.1f}%)"
+        if fg > 60 and global_change < -1:
+            return "SELL", 55, f"Greed index ({fg}) with declining global market ({global_change:.1f}%)"
+        return "HOLD", 50, f"Neutral conditions — F&G={fg}, 24h={change_24h:.1f}%"
+
+
+# ── Giant 2 — AI Judge (OpenRouter) ───────────────────────────────────────────
+
+class AIJudgeGiant(BaseGiant):
+    """
+    The final decision-maker. Does NOT produce its own market signal.
+    Receives reports from all other giants and calls OpenRouter LLM
+    to synthesize a final BUY/SELL/HOLD with confidence and reason.
+
+    Rate-limiting is enforced by ConsensusEngine (AI_JUDGE_INTERVAL_MINUTES).
+    """
+
+    name = "AIJudge"
+
+    _SYSTEM_PROMPT = (
+        "You are an expert crypto trading judge. "
+        "You receive analysis reports from specialized market agents and must "
+        "synthesize them into one final trading decision. "
+        "Be concise and decisive. "
+        "Always respond with ONLY a valid JSON object — no markdown, no explanation outside JSON."
+    )
+
+    def __init__(self, model: str = OPENROUTER_MODEL) -> None:
+        self.model = model
+
+    async def analyze(self, symbol: str, price: float) -> GiantReport:
+        return GiantReport(
+            name=self.name, signal="HOLD", confidence=0,
+            reason="AIJudge must be called via judge(reports), not analyze()",
         )
 
-        if avg_vol == 0:
-            return Signal.NEUTRAL
+    async def judge(
+        self,
+        symbol: str,
+        price: float,
+        reports: List[GiantReport],
+    ) -> GiantReport:
+        """Call OpenRouter with all giant reports and return final decision."""
+        if not OPENROUTER_API_KEY:
+            logger.warning("OPENROUTER_API_KEY not set — AIJudge returning HOLD")
+            return GiantReport(
+                name=self.name, signal="HOLD", confidence=0,
+                reason="OpenRouter API key not configured",
+            )
 
-        high_volume = curr_vol > avg_vol * self.vol_threshold
-        if high_volume and price_chg > self.momentum_pct:
-            return Signal.BUY
-        if high_volume and price_chg < -self.momentum_pct:
-            return Signal.SELL
-        return Signal.NEUTRAL
+        agent_lines = "\n".join(r.to_prompt_line() for r in reports)
+        user_prompt = (
+            f"Symbol: {symbol} | Current Price: {price:.4f} USDT\n\n"
+            f"Agent Reports:\n{agent_lines}\n\n"
+            f"Based on these reports, provide your final trading decision.\n"
+            f'Respond with ONLY this JSON (no other text):\n'
+            f'{{"signal": "BUY|SELL|HOLD", "confidence": 0-100, "reason": "one clear sentence"}}'
+        )
 
-    def get_values(self, candles: list) -> dict:
-        closes  = _closes(candles)
-        volumes = _volumes(candles)
-        avg_vol = sum(volumes[-self.vol_period - 1:-1]) / self.vol_period if len(volumes) > self.vol_period else 0
-        price_chg = (closes[-1] - closes[-2]) / closes[-2] * 100 if len(closes) >= 2 and closes[-2] else 0
-        return {
-            "current_volume": volumes[-1] if volumes else 0,
-            "avg_volume":     avg_vol,
-            "price_change_pct": price_chg,
-        }
+        payload = json.dumps({
+            "model": self.model,
+            "temperature": 0.2,
+            "max_tokens": 150,
+            "messages": [
+                {"role": "system", "content": self._SYSTEM_PROMPT},
+                {"role": "user",   "content": user_prompt},
+            ],
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type":  "application/json",
+                "HTTP-Referer":  "https://github.com/mejodmando-art/orderbook",
+                "X-Title":       "SuperConsensus Bot",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read())
+
+            content = data["choices"][0]["message"]["content"].strip()
+            logger.debug("AIJudge raw response: %s", content)
+
+            match = re.search(r"\{[^{}]+\}", content, re.DOTALL)
+            if not match:
+                raise ValueError(f"No JSON in response: {content[:200]}")
+
+            result     = json.loads(match.group())
+            signal     = str(result.get("signal", "HOLD")).upper()
+            confidence = int(result.get("confidence", 50))
+            reason     = str(result.get("reason", "No reason provided"))
+
+            if signal not in ("BUY", "SELL", "HOLD"):
+                signal = "HOLD"
+
+            logger.info("AIJudge [%s]: %s (%d%%) — %s", symbol, signal, confidence, reason)
+            return GiantReport(name=self.name, signal=signal, confidence=confidence, reason=reason)
+
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode()[:200]
+            logger.error("AIJudge HTTP error %d: %s", exc.code, body)
+            return GiantReport(
+                name=self.name, signal="HOLD", confidence=0,
+                reason=f"AI API error {exc.code}: {body[:80]}",
+            )
+        except Exception as exc:
+            logger.error("AIJudge failed: %s", exc)
+            return GiantReport(
+                name=self.name, signal="HOLD", confidence=0,
+                reason=f"AI judge unavailable: {exc}",
+            )
+
+
+# ── Giants 3 / 4 / 5 — Placeholder stubs ──────────────────────────────────────
+
+class PlaceholderGiant(BaseGiant):
+    """
+    Ready-to-replace stub. Returns HOLD with 0 confidence so AIJudge
+    knows this source has no data yet.
+
+    To activate: subclass PlaceholderGiant, override analyze(),
+    and replace the instance in MARKET_GIANTS below.
+    """
+
+    def __init__(self, slot: int) -> None:
+        self.name = f"Giant{slot}"
+        self.slot = slot
+
+    async def analyze(self, symbol: str, price: float) -> GiantReport:
+        return GiantReport(
+            name=self.name, signal="HOLD", confidence=0,
+            reason=f"Slot {self.slot} — not yet connected to an API",
+        )
 
 
 # ── Registry ───────────────────────────────────────────────────────────────────
-# Add or swap giants here without touching the consensus engine.
 
-GIANTS: List[BaseGiant] = [
-    RSIGiant(),
-    MACDGiant(),
-    EMAGiant(),
-    BollingerGiant(),
-    VolumeMomentumGiant(),
+MARKET_GIANTS: List[BaseGiant] = [
+    MarketSentimentGiant(),   # Giant1 — live data
+    PlaceholderGiant(3),      # Giant3 — future API slot
+    PlaceholderGiant(4),      # Giant4 — future API slot
+    PlaceholderGiant(5),      # Giant5 — future API slot
 ]
+
+AI_JUDGE = AIJudgeGiant()

@@ -1,16 +1,19 @@
 """
-Consensus Engine — orchestrates the five giants, applies voting logic,
-and executes trades via the MEXC client.
+Consensus Engine — AI-driven trading loop.
 
-State per symbol:
-  - is_active / is_paused
-  - current open position (qty, entry_price, entry_time)
-  - realized PnL and trade count
+Flow per cycle:
+  1. Fetch current price from MEXC
+  2. Run MARKET_GIANTS in parallel (Giant1, Giant3, Giant4, Giant5)
+  3. Feed their reports to AIJudge (Giant2) — rate-limited per symbol
+  4. AIJudge returns: signal, confidence, reason
+  5. Act on signal:
+       BUY  (confidence >= threshold, no open position) → market buy
+       SELL (confidence >= threshold, open position)    → market sell
+       HOLD → do nothing
+  6. Log everything to DB
 
-Lifecycle:
-  start(symbol, total_investment) → begins the 60-second polling loop
-  stop(symbol, market_sell)       → cancels loop, optionally exits position
-  pause(symbol) / resume(symbol)  → freeze/unfreeze without closing position
+Rate limiting: AIJudge is called at most once per AI_JUDGE_INTERVAL_MINUTES.
+Between calls, the last AIJudge decision is reused.
 """
 from __future__ import annotations
 
@@ -20,30 +23,35 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Coroutine, Dict, List, Optional
 
-from super_consensus.core.giants_engine import GIANTS, Signal, BaseGiant
+from config.settings import AI_JUDGE_INTERVAL_MINUTES
+from super_consensus.core.giants_engine import (
+    MARKET_GIANTS,
+    AI_JUDGE,
+    GiantReport,
+    BaseGiant,
+    AIJudgeGiant,
+)
 
 logger = logging.getLogger(__name__)
 
-# Minimum votes required to act
-CONSENSUS_THRESHOLD = 3
+# Minimum confidence for AIJudge decision to trigger a trade
+CONFIDENCE_THRESHOLD = 55
 
-# Capital allocation by vote count
-VOTE_ALLOCATION: Dict[int, float] = {3: 0.50, 4: 0.75, 5: 1.00}
+# Seconds between full market scans
+POLL_INTERVAL = 60
 
-# Candle settings
-CANDLE_TIMEFRAME = "5m"
-CANDLE_LIMIT     = 60   # enough for all indicators (EMA50 needs 50+)
-POLL_INTERVAL    = 60   # seconds between cycles
+# Seconds between AIJudge LLM calls (rate-limit guard)
+AI_JUDGE_INTERVAL_SECONDS = AI_JUDGE_INTERVAL_MINUTES * 60
 
 
-# ── Position state ─────────────────────────────────────────────────────────────
+# ── Position & state ───────────────────────────────────────────────────────────
 
 @dataclass
 class Position:
-    qty:        float
+    qty:         float
     entry_price: float
     entry_time:  datetime
-    cost_usdt:   float   # actual USDT spent
+    cost_usdt:   float
 
 
 @dataclass
@@ -55,53 +63,50 @@ class BotState:
     position:         Optional[Position] = None
     realized_pnl:     float = 0.0
     total_trades:     int   = 0
-    last_signals:     Dict[str, str] = field(default_factory=dict)
-    last_buy_votes:   int = 0
-    last_sell_votes:  int = 0
-    _task:            Optional[asyncio.Task] = field(default=None, repr=False)
+
+    # Last reports from each giant
+    last_market_reports: List[GiantReport] = field(default_factory=list)
+    last_judge_report:   Optional[GiantReport] = None
+
+    # Rate-limit tracking for AIJudge
+    last_judge_call_ts:  float = 0.0   # monotonic timestamp
+
+    _task: Optional[asyncio.Task] = field(default=None, repr=False)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────────
 
 class ConsensusEngine:
-    """
-    Manages one polling loop per symbol.
-    Inject a MexcClient and optional async notify callback.
-    """
-
     def __init__(
         self,
-        client,                                          # MexcClient instance
+        client,
         notify: Optional[Callable[[str], Coroutine]] = None,
-        giants: Optional[List[BaseGiant]] = None,
+        market_giants: Optional[List[BaseGiant]] = None,
+        ai_judge: Optional[AIJudgeGiant] = None,
     ) -> None:
-        self._client  = client
-        self._notify  = notify
-        self._giants  = giants or GIANTS
-        self._bots:   Dict[str, BotState] = {}
+        self._client        = client
+        self._notify        = notify
+        self._market_giants = market_giants or MARKET_GIANTS
+        self._ai_judge      = ai_judge or AI_JUDGE
+        self._bots: Dict[str, BotState] = {}
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    async def start(
-        self,
-        symbol: str,
-        total_investment: float,
-        db_save_fn: Optional[Callable] = None,
-    ) -> None:
-        """Start monitoring symbol. Raises if already active."""
-        sym = symbol.upper()
-        if sym in self._bots and self._bots[sym].is_active:
-            raise ValueError(f"{sym} is already running")
+    def active_symbols(self) -> List[str]:
+        return [s for s, b in self._bots.items() if b.is_active]
 
-        state = BotState(symbol=sym, total_investment=total_investment)
-        self._bots[sym] = state
+    def get_state(self, symbol: str) -> Optional[BotState]:
+        return self._bots.get(symbol.upper())
 
-        if db_save_fn:
-            await db_save_fn(state)
+    def pause(self, symbol: str) -> None:
+        state = self._bots.get(symbol.upper())
+        if state:
+            state.is_paused = True
 
-        task = asyncio.create_task(self._loop(sym, db_save_fn), name=f"super_{sym}")
-        state._task = task
-        logger.info("SuperConsensus started for %s (investment=%.2f)", sym, total_investment)
+    def resume(self, symbol: str) -> None:
+        state = self._bots.get(symbol.upper())
+        if state:
+            state.is_paused = False
 
     async def stop(
         self,
@@ -109,11 +114,7 @@ class ConsensusEngine:
         market_sell: bool = True,
         db_fns: Optional[dict] = None,
     ) -> Optional[float]:
-        """
-        Stop the bot. If market_sell=True and a position is open, close it.
-        Returns realized PnL from the closing trade (or None).
-        """
-        sym = symbol.upper()
+        sym   = symbol.upper()
         state = self._bots.get(sym)
         if not state:
             return None
@@ -134,26 +135,7 @@ class ConsensusEngine:
             await db_fns["deactivate"](sym)
 
         del self._bots[sym]
-        logger.info("SuperConsensus stopped for %s", sym)
         return pnl
-
-    def pause(self, symbol: str) -> None:
-        state = self._bots.get(symbol.upper())
-        if state:
-            state.is_paused = True
-            logger.info("Paused %s", symbol)
-
-    def resume(self, symbol: str) -> None:
-        state = self._bots.get(symbol.upper())
-        if state:
-            state.is_paused = False
-            logger.info("Resumed %s", symbol)
-
-    def active_symbols(self) -> List[str]:
-        return [s for s, b in self._bots.items() if b.is_active]
-
-    def get_state(self, symbol: str) -> Optional[BotState]:
-        return self._bots.get(symbol.upper())
 
     # ── Polling loop ───────────────────────────────────────────────────────────
 
@@ -168,66 +150,71 @@ class ConsensusEngine:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.error("Cycle error for %s: %s", symbol, exc, exc_info=True)
+                    logger.error("Cycle error [%s]: %s", symbol, exc, exc_info=True)
                     await self._send(f"⚠️ SuperConsensus [{symbol}] خطأ: {exc}")
             await asyncio.sleep(POLL_INTERVAL)
 
     async def _cycle(self, symbol: str, state: BotState, db_fns: Optional[dict]) -> None:
-        """One full scan: fetch data → compute signals → vote → act."""
-        # 1. Fetch candles
-        candles = await self._client.fetch_ohlcv(symbol, CANDLE_TIMEFRAME, CANDLE_LIMIT)
-        if not candles or len(candles) < 10:
-            logger.warning("Not enough candles for %s", symbol)
+        # 1. Current price
+        price = await self._client.get_current_price(symbol)
+
+        # 2. Run market giants concurrently
+        tasks = [g.analyze(symbol, price) for g in self._market_giants]
+        market_reports: List[GiantReport] = await asyncio.gather(*tasks, return_exceptions=False)
+        state.last_market_reports = list(market_reports)
+
+        # 3. AIJudge — rate-limited
+        import time
+        now = time.monotonic()
+        if now - state.last_judge_call_ts >= AI_JUDGE_INTERVAL_SECONDS:
+            judge_report = await self._ai_judge.judge(symbol, price, market_reports)
+            state.last_judge_report  = judge_report
+            state.last_judge_call_ts = now
+            logger.info(
+                "[%s] AIJudge called: %s (%d%%) — %s",
+                symbol, judge_report.signal, judge_report.confidence, judge_report.reason,
+            )
+        else:
+            judge_report = state.last_judge_report
+            remaining = int(AI_JUDGE_INTERVAL_SECONDS - (now - state.last_judge_call_ts))
+            logger.info("[%s] AIJudge reusing last decision (next call in %ds)", symbol, remaining)
+
+        if judge_report is None:
+            logger.info("[%s] No AIJudge decision yet — skipping", symbol)
             return
 
-        price = float(candles[-1][4])   # last close
-
-        # 2. Compute signals from each giant
-        signals: Dict[str, Signal] = {}
-        for giant in self._giants:
-            try:
-                signals[giant.name] = giant.compute(candles)
-            except Exception as exc:
-                logger.error("Giant %s error: %s", giant.name, exc)
-                signals[giant.name] = Signal.NEUTRAL
-
-        buy_votes  = sum(1 for s in signals.values() if s == Signal.BUY)
-        sell_votes = sum(1 for s in signals.values() if s == Signal.SELL)
-
-        state.last_signals   = {k: v.value for k, v in signals.items()}
-        state.last_buy_votes  = buy_votes
-        state.last_sell_votes = sell_votes
-
+        # 4. Act on decision
         action = "none"
+        sig  = judge_report.signal
+        conf = judge_report.confidence
 
-        # 3. Consensus logic
-        if buy_votes >= CONSENSUS_THRESHOLD and state.position is None:
+        if sig == "BUY" and conf >= CONFIDENCE_THRESHOLD and state.position is None:
             action = "buy"
-            await self._open_position(symbol, state, price, buy_votes, db_fns)
+            await self._open_position(symbol, state, price, judge_report, db_fns)
 
-        elif sell_votes >= CONSENSUS_THRESHOLD and state.position is not None:
+        elif sig == "SELL" and conf >= CONFIDENCE_THRESHOLD and state.position is not None:
             action = "sell"
-            await self._close_position(symbol, state, reason="consensus", db_fns=db_fns)
+            await self._close_position(symbol, state, reason="AIJudge", db_fns=db_fns)
 
-        # 4. Log to DB
+        # 5. Log cycle to DB
         if db_fns and "log_cycle" in db_fns:
             await db_fns["log_cycle"]({
                 "symbol":        symbol,
                 "timestamp":     datetime.now(timezone.utc),
                 "price":         price,
-                "rsi_signal":    signals.get("RSI", Signal.NEUTRAL).value,
-                "macd_signal":   signals.get("MACD", Signal.NEUTRAL).value,
-                "ema_signal":    signals.get("EMA", Signal.NEUTRAL).value,
-                "bb_signal":     signals.get("Bollinger", Signal.NEUTRAL).value,
-                "volume_signal": signals.get("Volume", Signal.NEUTRAL).value,
-                "buy_votes":     buy_votes,
-                "sell_votes":    sell_votes,
+                "rsi_signal":    market_reports[0].signal if len(market_reports) > 0 else "HOLD",
+                "macd_signal":   market_reports[1].signal if len(market_reports) > 1 else "HOLD",
+                "ema_signal":    market_reports[2].signal if len(market_reports) > 2 else "HOLD",
+                "bb_signal":     market_reports[3].signal if len(market_reports) > 3 else "HOLD",
+                "volume_signal": judge_report.signal,
+                "buy_votes":     conf if sig == "BUY" else 0,
+                "sell_votes":    conf if sig == "SELL" else 0,
                 "action_taken":  action,
             })
 
         logger.info(
-            "[%s] price=%.4f BUY=%d SELL=%d action=%s",
-            symbol, price, buy_votes, sell_votes, action,
+            "[%s] price=%.4f judge=%s conf=%d%% action=%s",
+            symbol, price, sig, conf, action,
         )
 
     # ── Trade execution ────────────────────────────────────────────────────────
@@ -237,15 +224,11 @@ class ConsensusEngine:
         symbol: str,
         state: BotState,
         price: float,
-        votes: int,
+        judge: GiantReport,
         db_fns: Optional[dict],
     ) -> None:
-        allocation = VOTE_ALLOCATION.get(min(votes, 5), 0.50)
-        usdt_to_spend = state.total_investment * allocation
-
-        # Calculate qty from USDT budget
-        qty = usdt_to_spend / price
-        qty = self._client.round_amount(symbol, qty)
+        usdt_to_spend = state.total_investment
+        qty = self._client.round_amount(symbol, usdt_to_spend / price)
 
         if qty <= 0 or qty < self._client.min_amount(symbol):
             logger.warning("Open position: qty too small for %s", symbol)
@@ -253,10 +236,8 @@ class ConsensusEngine:
 
         order = await self._client.market_buy(symbol, qty)
         if not order:
-            logger.error("market_buy failed for %s", symbol)
             return
 
-        # Use filled price if available, else current price
         filled_price = float(order.get("average") or order.get("price") or price)
         filled_qty   = float(order.get("filled") or qty)
 
@@ -272,7 +253,8 @@ class ConsensusEngine:
             f"💰 السعر: `{filled_price:.4f}`\n"
             f"📦 الكمية: `{filled_qty:.6f}`\n"
             f"💵 التكلفة: `{filled_qty * filled_price:.2f} USDT`\n"
-            f"🗳️ أصوات BUY: `{votes}/5` ({int(allocation*100)}% من رأس المال)"
+            f"🧠 قرار القاضي: `{judge.signal}` — ثقة `{judge.confidence}%`\n"
+            f"💬 السبب: _{judge.reason}_"
         )
         await self._send(msg)
 
@@ -283,7 +265,7 @@ class ConsensusEngine:
                 "entry_price":     filled_price,
                 "qty":             filled_qty,
                 "pnl":             0.0,
-                "consensus_votes": votes,
+                "consensus_votes": judge.confidence,
             })
         if db_fns and "update_bot" in db_fns:
             await db_fns["update_bot"](state)
@@ -292,7 +274,7 @@ class ConsensusEngine:
         self,
         symbol: str,
         state: BotState,
-        reason: str = "consensus",
+        reason: str = "AIJudge",
         db_fns: Optional[dict] = None,
     ) -> Optional[float]:
         if not state.position:
@@ -300,19 +282,24 @@ class ConsensusEngine:
 
         order = await self._client.market_sell_all(symbol)
         if not order:
-            logger.error("market_sell_all failed for %s", symbol)
             return None
 
         exit_price = float(order.get("average") or order.get("price") or 0)
         sold_qty   = float(order.get("filled") or state.position.qty)
-
         if exit_price == 0:
-            # Fallback: fetch current price
             exit_price = await self._client.get_current_price(symbol)
 
         pnl = (exit_price - state.position.entry_price) * sold_qty
         state.realized_pnl += pnl
         state.total_trades += 1
+
+        judge = state.last_judge_report
+        judge_line = ""
+        if judge:
+            judge_line = (
+                f"\n🧠 قرار القاضي: `{judge.signal}` — ثقة `{judge.confidence}%`"
+                f"\n💬 السبب: _{judge.reason}_"
+            )
 
         msg = (
             f"{'✅' if pnl >= 0 else '❌'} *SuperConsensus [{symbol}]* — خروج ({reason})\n"
@@ -321,6 +308,7 @@ class ConsensusEngine:
             f"📦 الكمية: `{sold_qty:.6f}`\n"
             f"{'💚' if pnl >= 0 else '🔴'} الربح/الخسارة: `{pnl:+.4f} USDT`\n"
             f"📊 إجمالي الربح: `{state.realized_pnl:+.4f} USDT`"
+            f"{judge_line}"
         )
         await self._send(msg)
 
@@ -331,11 +319,10 @@ class ConsensusEngine:
                 "entry_price":     exit_price,
                 "qty":             sold_qty,
                 "pnl":             pnl,
-                "consensus_votes": state.last_sell_votes,
+                "consensus_votes": judge.confidence if judge else 0,
             })
 
         state.position = None
-
         if db_fns and "update_bot" in db_fns:
             await db_fns["update_bot"](state)
 
@@ -350,13 +337,12 @@ class ConsensusEngine:
             except Exception as exc:
                 logger.error("Notify failed: %s", exc)
 
-    def get_signals_now(self, candles: list) -> Dict[str, str]:
-        """Compute signals synchronously from provided candles (for /signals command)."""
-        result = {}
-        for giant in self._giants:
-            try:
-                result[giant.name] = giant.compute(candles).value
-            except Exception as exc:
-                logger.error("Giant %s error: %s", giant.name, exc)
-                result[giant.name] = Signal.NEUTRAL.value
-        return result
+    async def get_signals_now(self, symbol: str, price: float) -> dict:
+        """Run all giants + AIJudge immediately (for /signals command)."""
+        tasks = [g.analyze(symbol, price) for g in self._market_giants]
+        market_reports = await asyncio.gather(*tasks, return_exceptions=False)
+        judge_report   = await self._ai_judge.judge(symbol, price, list(market_reports))
+        return {
+            "market_reports": market_reports,
+            "judge":          judge_report,
+        }

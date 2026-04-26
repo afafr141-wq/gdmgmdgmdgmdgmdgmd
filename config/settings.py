@@ -17,6 +17,13 @@ TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_URL: str = os.getenv("DATABASE_URL", "")
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# ── SuperConsensus AI ───────────────────────────────────────────────────────────
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
+# Primary model (free tier). Override via env var to use GPT-4 etc.
+OPENROUTER_MODEL: str = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+# Minimum minutes between AIJudge calls per symbol (rate-limit guard)
+AI_JUDGE_INTERVAL_MINUTES: int = int(os.getenv("AI_JUDGE_INTERVAL_MINUTES", "10"))
+
 # ── Allowed Telegram users ─────────────────────────────────────────────────────
 _raw_ids = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USER_IDS: set[int] = (
