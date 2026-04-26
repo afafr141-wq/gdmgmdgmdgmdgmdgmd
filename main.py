@@ -22,7 +22,6 @@ from bot.telegram_bot import (
 from utils.db_manager import init_db, close_db, get_all_active_grids
 from super_consensus.core.consensus_engine import ConsensusEngine
 from super_consensus.core.auto_trade_engine import AutoTradeEngine
-from super_consensus.bot.menu_bot import register_menu_handlers
 from super_consensus.utils.super_db import (
     init_super_db,
     close_super_db,
@@ -229,13 +228,10 @@ def main() -> None:
     # AutoTrade engine — same notify channel
     auto_engine = AutoTradeEngine(client=client, notify=notify)
 
-    # Build single Application with both sets of handlers
+    # Build single Application with all handlers
+    # menu_bot handlers are registered inside build_application
     app = build_application(engine, client, super_engine=super_engine)
     _notify_ref["app"] = app
-
-    # Register interactive /menu handlers
-    app.bot_data["auto_engine"] = auto_engine
-    register_menu_handlers(app)
 
     # Wire grid notification callbacks
     set_notifiers(
