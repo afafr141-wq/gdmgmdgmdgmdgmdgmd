@@ -67,6 +67,9 @@ COINGECKO_MARKETS_URL = (
     "&price_change_percentage=24h,7d"
 )
 
+# CoinPaprika fallback — completely free, no key, generous rate limits
+COINPAPRIKA_TICKERS_URL = "https://api.coinpaprika.com/v1/tickers?limit={count}"
+
 # Stablecoins to exclude from analysis
 STABLECOINS = {
     "usdt", "usdc", "busd", "dai", "tusd", "usdp", "usdd",
@@ -134,38 +137,36 @@ class ScanResult:
     timestamp:        float = field(default_factory=time.time)
 
 
-# ── CoinGecko data fetch ───────────────────────────────────────────────────────
+# ── Market data fetch (CoinGecko → CoinPaprika fallback) ──────────────────────
 
-def _fetch_top_coins_raw(count: int, retries: int = 4) -> list:
-    """Single CoinGecko request with exponential backoff on 429."""
+def _http_get_json(url: str, timeout: int = 25) -> object:
+    req = urllib.request.Request(url, headers={"User-Agent": "SuperConsensusBot/2.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _fetch_coingecko_raw(count: int, retries: int = 3) -> list:
+    """CoinGecko /coins/markets — retries on 429 with backoff."""
     url = COINGECKO_MARKETS_URL.format(count=count)
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "SuperConsensusBot/2.0"},
-    )
-    last_exc: Exception = RuntimeError("No attempts made")
+    last_exc: Exception = RuntimeError("No attempts")
     for attempt in range(1, retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                return json.loads(r.read())
+            return _http_get_json(url)
         except urllib.error.HTTPError as exc:
             last_exc = exc
             if exc.code == 429:
-                wait = 5 * attempt   # 5s, 10s, 15s, 20s
-                logger.warning(
-                    "CoinGecko 429 — waiting %ds (attempt %d/%d)", wait, attempt, retries
-                )
+                wait = 10 * attempt          # 10s, 20s, 30s
+                logger.warning("CoinGecko 429 — sleeping %ds (attempt %d/%d)", wait, attempt, retries)
                 time.sleep(wait)
             else:
                 raise
         except Exception as exc:
             last_exc = exc
-            if attempt < retries:
-                time.sleep(2)
+            time.sleep(3)
     raise last_exc
 
 
-def _parse_coins(raw: list) -> List[CoinData]:
+def _parse_coingecko(raw: list) -> List[CoinData]:
     coins = []
     for i, item in enumerate(raw, start=1):
         sym = (item.get("symbol") or "").lower()
@@ -185,20 +186,74 @@ def _parse_coins(raw: list) -> List[CoinData]:
     return coins
 
 
-def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
-    # Serve from cache if data is fresh
-    cached = _coingecko_cache.get(count)
-    if cached:
-        cached_at, raw = cached
-        age = time.monotonic() - cached_at
-        if age < COINGECKO_CACHE_TTL:
-            logger.info("CoinGecko cache hit (age=%.0fs)", age)
-            return _parse_coins(raw)
+def _fetch_coinpaprika_fallback(count: int) -> List[CoinData]:
+    """
+    CoinPaprika /v1/tickers — free, no key, 25 000 req/month.
+    Used when CoinGecko is rate-limiting.
+    """
+    logger.info("Falling back to CoinPaprika for market data")
+    # CoinPaprika returns all tickers sorted by rank; we slice after filtering
+    url = "https://api.coinpaprika.com/v1/tickers"
+    raw = _http_get_json(url, timeout=30)
 
-    raw = _fetch_top_coins_raw(count)
-    _coingecko_cache[count] = (time.monotonic(), raw)
-    logger.info("CoinGecko fetched %d items, cached for %ds", len(raw), COINGECKO_CACHE_TTL)
-    return _parse_coins(raw)
+    coins = []
+    rank = 0
+    for item in raw:
+        sym = (item.get("symbol") or "").lower()
+        if sym in STABLECOINS:
+            continue
+        rank += 1
+        if rank > count:
+            break
+        quotes = item.get("quotes", {}).get("USD", {})
+        coins.append(CoinData(
+            id=item.get("id", ""),
+            symbol=sym,
+            name=item.get("name", ""),
+            price=float(quotes.get("price") or 0),
+            market_cap=float(quotes.get("market_cap") or 0),
+            volume_24h=float(quotes.get("volume_24h") or 0),
+            change_24h=float(quotes.get("percent_change_24h") or 0),
+            change_7d=float(quotes.get("percent_change_7d") or 0),
+            rank=rank,
+        ))
+    return coins
+
+
+# Shared cache — keyed by count, stores (monotonic_ts, List[CoinData])
+_market_cache: Dict[int, tuple] = {}
+MARKET_CACHE_TTL = 300   # 5 minutes
+
+
+def _fetch_top_coins(count: int = SCAN_COIN_COUNT) -> List[CoinData]:
+    # Serve from cache if fresh
+    cached = _market_cache.get(count)
+    if cached:
+        cached_at, coins = cached
+        age = time.monotonic() - cached_at
+        if age < MARKET_CACHE_TTL:
+            logger.info("Market cache hit (age=%.0fs, %d coins)", age, len(coins))
+            return coins
+
+    # Try CoinGecko first, fall back to CoinPaprika
+    try:
+        raw = _fetch_coingecko_raw(count)
+        coins = _parse_coingecko(raw)
+        source = "CoinGecko"
+    except Exception as cg_exc:
+        logger.warning("CoinGecko failed (%s) — trying CoinPaprika", cg_exc)
+        try:
+            coins = _fetch_coinpaprika_fallback(count)
+            source = "CoinPaprika"
+        except Exception as cp_exc:
+            raise RuntimeError(
+                f"Both market data sources failed. "
+                f"CoinGecko: {cg_exc} | CoinPaprika: {cp_exc}"
+            ) from cp_exc
+
+    _market_cache[count] = (time.monotonic(), coins)
+    logger.info("%s: fetched %d coins, cached for %ds", source, len(coins), MARKET_CACHE_TTL)
+    return coins
 
 
 # ── OpenRouter call (sync, runs in thread) ─────────────────────────────────────
