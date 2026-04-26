@@ -179,15 +179,9 @@ def _fmt_report(r: dict) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
-    from super_consensus.bot.menu_bot import _kb_main
-    auto = ctx.bot_data.get("auto_engine")
-    status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
-    open_c = len(auto.open_positions()) if auto else 0
+    from super_consensus.bot.menu_bot import _kb_main, _main_menu_text
     await update.message.reply_text(
-        "🤖 *AI Trading Bot — MEXC*\n\n"
-        f"الوضع الآلي: {status}\n"
-        f"صفقات مفتوحة: `{open_c}`\n\n"
-        "اختر من القائمة:",
+        _main_menu_text(ctx),
         parse_mode="Markdown",
         reply_markup=_kb_main(),
     )
@@ -433,15 +427,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
 
     if data == "menu_main":
-        from super_consensus.bot.menu_bot import _kb_main
-        auto = ctx.bot_data.get("auto_engine")
-        status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
-        open_c = len(auto.open_positions()) if auto else 0
+        from super_consensus.bot.menu_bot import _kb_main, _main_menu_text
         await query.edit_message_text(
-            "🤖 *AI Trading Bot — MEXC*\n\n"
-            f"الوضع الآلي: {status}\n"
-            f"صفقات مفتوحة: `{open_c}`\n\n"
-            "اختر من القائمة:",
+            _main_menu_text(ctx),
             parse_mode="Markdown",
             reply_markup=_kb_main(),
         )

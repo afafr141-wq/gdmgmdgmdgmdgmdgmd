@@ -232,33 +232,54 @@ class AutoTradeEngine:
         s = self.settings
         coin_count = max(s.min_coins_scanned, 50)
 
-        logger.info("AutoTrade: scanning %d coins…", coin_count)
+        logger.info(
+            "AutoTrade: starting scan — %d coins, min_conf=%d%%, open=%d/%d",
+            coin_count, s.min_analyst_conf,
+            len(self._positions), s.max_open_trades,
+        )
         result = await scanner.scan(coin_count=coin_count)
+
+        logger.info(
+            "AutoTrade: scan done — %d coins scanned, %d final picks",
+            result.coins_scanned, len(result.final_picks),
+        )
 
         if result.coins_scanned < s.min_coins_scanned:
             logger.info(
-                "AutoTrade: only %d coins scanned (need %d) — skipping",
+                "AutoTrade: SKIP scan results — only %d coins scanned (need %d)",
                 result.coins_scanned, s.min_coins_scanned,
             )
             return
 
-        # Check each final pick for full consensus
+        # Check each final pick — require at least 2 analysts + min confidence
+        analyst_count = len(result.analyst_reports)
+        min_votes = max(2, analyst_count - 1)   # 2 out of 3 analysts is enough
+
         for pick in result.final_picks:
             if pick.signal.upper() != "BUY":
+                logger.debug(
+                    "AutoTrade: SKIP %s — signal=%s (not BUY)",
+                    pick.symbol, pick.signal,
+                )
                 continue
             if pick.confidence < s.min_analyst_conf:
-                continue
-
-            # Require all 3 analysts to agree (votes == number of analysts)
-            analyst_count = len(result.analyst_reports)
-            if len(pick.analysts) < analyst_count:
                 logger.info(
-                    "AutoTrade: %s has %d/%d analysts — need full consensus",
-                    pick.symbol, len(pick.analysts), analyst_count,
+                    "AutoTrade: SKIP %s — confidence %d%% < threshold %d%%",
+                    pick.symbol, pick.confidence, s.min_analyst_conf,
+                )
+                continue
+            if len(pick.analysts) < min_votes:
+                logger.info(
+                    "AutoTrade: SKIP %s — only %d/%d analysts agree (need %d)",
+                    pick.symbol, len(pick.analysts), analyst_count, min_votes,
                 )
                 continue
 
             symbol = f"{pick.symbol}/USDT" if "/" not in pick.symbol else pick.symbol
+            logger.info(
+                "AutoTrade: CANDIDATE %s — %d/%d analysts, conf=%d%%",
+                symbol, len(pick.analysts), analyst_count, pick.confidence,
+            )
             await self._try_open(symbol, pick.confidence, pick.reason)
 
         # Also check open positions for analyst reversal (SELL consensus)
@@ -357,19 +378,23 @@ class AutoTradeEngine:
 
         # Guard: already have a position in this symbol
         if symbol.upper() in self._positions:
+            logger.info("AutoTrade: SKIP %s — position already open", symbol)
             return
 
         # Guard: max open trades
         if len(self._positions) >= s.max_open_trades:
-            logger.info("AutoTrade: max open trades (%d) reached — skip %s", s.max_open_trades, symbol)
+            logger.info(
+                "AutoTrade: SKIP %s — max open trades reached (%d/%d)",
+                symbol, len(self._positions), s.max_open_trades,
+            )
             return
 
         # Guard: cooldown
         elapsed = (time.monotonic() - self._last_trade_ts) / 60
         if self._last_trade_ts > 0 and elapsed < s.cooldown_minutes:
             logger.info(
-                "AutoTrade: cooldown active (%.0f/%d min) — skip %s",
-                elapsed, s.cooldown_minutes, symbol,
+                "AutoTrade: SKIP %s — cooldown active (%.1f/%.0f min remaining)",
+                symbol, s.cooldown_minutes - elapsed, s.cooldown_minutes,
             )
             return
 
@@ -379,15 +404,18 @@ class AutoTradeEngine:
             invested_pct = (invested / s.total_capital_usdt) * 100
             if invested_pct >= s.max_capital_pct:
                 logger.info(
-                    "AutoTrade: capital cap %.0f%% reached — skip %s",
-                    s.max_capital_pct, symbol,
+                    "AutoTrade: SKIP %s — capital cap reached (%.1f%% / %.0f%%)",
+                    symbol, invested_pct, s.max_capital_pct,
                 )
                 return
 
         # Determine trade size
         usdt_to_spend = await self._calc_trade_size(invested)
         if usdt_to_spend <= 0:
-            logger.warning("AutoTrade: trade size is 0 — skip %s", symbol)
+            logger.warning(
+                "AutoTrade: SKIP %s — trade size is 0 (balance too low or not configured)",
+                symbol,
+            )
             return
 
         # Execute buy
@@ -503,14 +531,27 @@ class AutoTradeEngine:
     async def _calc_trade_size(self, already_invested: float) -> float:
         s = self.settings
         if s.trade_amount_usdt is not None:
+            logger.info(
+                "AutoTrade: trade size = %.2f USDT (fixed amount)",
+                s.trade_amount_usdt,
+            )
             return float(s.trade_amount_usdt)
         if s.risk_pct is not None:
             try:
                 free = await self._client.get_balance("USDT")
-                return float(free) * (s.risk_pct / 100)
+                size = float(free) * (s.risk_pct / 100)
+                logger.info(
+                    "AutoTrade: trade size = %.2f USDT (%.1f%% of %.2f free balance)",
+                    size, s.risk_pct, float(free),
+                )
+                return size
             except Exception as exc:
-                logger.warning("Balance fetch failed: %s", exc)
+                logger.warning("AutoTrade: balance fetch failed: %s", exc)
                 return 0.0
+        logger.warning(
+            "AutoTrade: trade size = 0 — neither trade_amount_usdt nor risk_pct is set. "
+            "Use /auto_mode <amount> to configure."
+        )
         return 0.0
 
     async def _send(self, text: str) -> None:

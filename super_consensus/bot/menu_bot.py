@@ -63,13 +63,30 @@ async def _deny(update: Update) -> None:
 # Keyboard builders
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _main_menu_text(ctx=None) -> str:
+    """Build the main menu header text with live status."""
+    auto = ctx.bot_data.get("auto_engine") if ctx and hasattr(ctx, "bot_data") else None
+    status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
+    open_c = len(auto.open_positions()) if auto else 0
+    return (
+        "🤖 *AI Trading Bot — MEXC*\n\n"
+        f"الوضع الآلي: {status} | صفقات مفتوحة: `{open_c}`\n\n"
+        "اختر من القائمة:"
+    )
+
+
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 شبكة AI الذكية (Grid Bot)",     callback_data="menu:grid")],
-        [InlineKeyboardButton("🧠 إجماع الخارق (SuperConsensus)", callback_data="menu:super")],
-        [InlineKeyboardButton("⚡ تداول آلي كامل (Auto-Trade)",   callback_data="menu:auto_mode")],
-        [InlineKeyboardButton("📊 حالة البوت والصفقات (Status)",  callback_data="menu:status")],
-        [InlineKeyboardButton("⚙️ الإعدادات (Settings)",          callback_data="menu:settings")],
+        [
+            InlineKeyboardButton("🤖 شبكة AI",      callback_data="menu:grid"),
+            InlineKeyboardButton("🧠 إجماع خارق",   callback_data="menu:super"),
+            InlineKeyboardButton("⚡ تداول آلي",    callback_data="menu:auto_mode"),
+        ],
+        [
+            InlineKeyboardButton("📊 الحالة",        callback_data="menu:status"),
+            InlineKeyboardButton("⚙️ إعدادات",      callback_data="menu:settings"),
+            InlineKeyboardButton("📈 الأرباح",       callback_data="menu:profit"),
+        ],
     ])
 
 
@@ -218,16 +235,11 @@ async def _edit(query, text: str, kb: InlineKeyboardMarkup) -> None:
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return await _deny(update)
-    auto = ctx.bot_data.get("auto_engine")
-    status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
-    open_c = len(auto.open_positions()) if auto else 0
-    text = (
-        "🤖 *القائمة الرئيسية — SuperConsensus Bot*\n\n"
-        f"الوضع الآلي: {status}\n"
-        f"صفقات مفتوحة: `{open_c}`\n\n"
-        "اختر من القائمة:"
+    await update.message.reply_text(
+        _main_menu_text(ctx),
+        reply_markup=_kb_main(),
+        parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.reply_text(text, reply_markup=_kb_main(), parse_mode=ParseMode.MARKDOWN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,15 +253,7 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
     auto = ctx.bot_data.get("auto_engine")
 
     if action == "back":
-        status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
-        open_c = len(auto.open_positions()) if auto else 0
-        await _edit(query,
-            "🤖 *القائمة الرئيسية — SuperConsensus Bot*\n\n"
-            f"الوضع الآلي: {status}\n"
-            f"صفقات مفتوحة: `{open_c}`\n\n"
-            "اختر من القائمة:",
-            _kb_main(),
-        )
+        await _edit(query, _main_menu_text(ctx), _kb_main())
         return ConversationHandler.END
 
     if action == "grid":

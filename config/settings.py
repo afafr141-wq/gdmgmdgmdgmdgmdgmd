@@ -45,7 +45,7 @@ AUTO_MAX_OPEN_TRADES: int    = int(os.getenv("AUTO_MAX_OPEN_TRADES", "2"))
 AUTO_MAX_CAPITAL_PCT: float  = float(os.getenv("AUTO_MAX_CAPITAL_PCT", "70.0"))
 AUTO_MAX_HOLD_HOURS: int     = int(os.getenv("AUTO_MAX_HOLD_HOURS", "24"))
 AUTO_MIN_COINS_SCANNED: int  = int(os.getenv("AUTO_MIN_COINS_SCANNED", "30"))
-AUTO_MIN_ANALYST_CONF: int   = int(os.getenv("AUTO_MIN_ANALYST_CONF", "75"))
+AUTO_MIN_ANALYST_CONF: int   = int(os.getenv("AUTO_MIN_ANALYST_CONF", "50"))
 AUTO_COOLDOWN_MINUTES: int   = int(os.getenv("AUTO_COOLDOWN_MINUTES", "120"))
 AUTO_REPORT_INTERVAL_HOURS: int = int(os.getenv("AUTO_REPORT_INTERVAL_HOURS", "4"))
 
