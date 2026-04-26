@@ -14,6 +14,7 @@ import sys
 from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
 from super_consensus.core.consensus_engine import ConsensusEngine
+from super_consensus.core.auto_trade_engine import AutoTradeEngine
 from super_consensus.bot.super_bot import (
     build_super_application,
     send_super_notification,
@@ -24,6 +25,8 @@ from super_consensus.utils.super_db import (
     get_all_active_bots,
     make_db_fns,
     upsert_bot,
+    get_auto_settings,
+    get_auto_positions,
 )
 from super_consensus.core.giants_engine import GIANTS
 
@@ -45,7 +48,7 @@ async def _on_startup(application) -> None:
     client: MexcClient = application.bot_data["client"]
     await client.load_markets()
 
-    # Recover active bots from DB
+    # ── Recover manual consensus bots ──────────────────────────────────────────
     engine: ConsensusEngine = application.bot_data["super_engine"]
     active = await get_all_active_bots()
     recovered = 0
@@ -93,9 +96,33 @@ async def _on_startup(application) -> None:
             except Exception as exc:
                 logger.error("Failed to recover bot %s: %s", symbol, exc)
 
+    # ── Recover Auto-Trade Engine ───────────────────────────────────────────────
+    auto_engine: AutoTradeEngine = application.bot_data["auto_engine"]
+    auto_recovered = False
+    try:
+        auto_settings = await get_auto_settings()
+        auto_positions = await get_auto_positions()
+        if auto_settings:
+            await auto_engine.restore_from_db(auto_settings, auto_positions)
+            auto_recovered = auto_settings.get("is_active", False)
+            logger.info(
+                "AutoTradeEngine restored: active=%s, positions=%d",
+                auto_recovered, len(auto_positions),
+            )
+    except Exception as exc:
+        logger.error("Failed to restore AutoTradeEngine: %s", exc)
+
+    # ── Startup notification ───────────────────────────────────────────────────
+    auto_line = (
+        f"🤖 *الوضع الآلي:* مُستعاد ✅ ({len(auto_positions)} صفقة مفتوحة)"
+        if auto_recovered
+        else "🤖 *الوضع الآلي:* موقوف — فعّله بـ /auto\\_mode"
+    )
+
     await send_super_notification(
         f"🤖 *SuperConsensus Bot* — تم التشغيل!\n"
-        f"📊 بوتات مستردة: `{recovered}`\n"
+        f"📊 بوتات يدوية مستردة: `{recovered}`\n"
+        f"{auto_line}\n"
         f"👑 العمالقة: `{', '.join(g.name for g in GIANTS)}`\n"
         f"🔍 الماسح الذكي: جاهز — اكتب /scan لمسح السوق\n"
         "اكتب /super\\_menu للقائمة الرئيسية.",
@@ -106,15 +133,19 @@ async def _on_startup(application) -> None:
 
 async def _on_shutdown(application) -> None:
     logger.info("SuperConsensus Bot shutting down…")
-    engine: ConsensusEngine = application.bot_data["super_engine"]
-    client: MexcClient      = application.bot_data["client"]
+    engine: ConsensusEngine  = application.bot_data["super_engine"]
+    auto_engine: AutoTradeEngine = application.bot_data["auto_engine"]
+    client: MexcClient       = application.bot_data["client"]
 
-    # Stop all running bots gracefully (do NOT sell positions on restart)
+    # Stop manual consensus bots (keep positions open across restarts)
     for symbol in list(engine.active_symbols()):
         try:
             await engine.stop(symbol, market_sell=False)
         except Exception as exc:
             logger.error("Error stopping bot %s: %s", symbol, exc)
+
+    # Stop auto-trade background tasks (positions persist in DB)
+    await auto_engine.disable()
 
     await client.close()
     await close_super_db()
@@ -132,13 +163,15 @@ def main() -> None:
         app = _notify_ref.get("app")
         await send_super_notification(text, application=app)
 
-    engine = ConsensusEngine(client=client, notify=notify)
+    engine      = ConsensusEngine(client=client, notify=notify)
+    auto_engine = AutoTradeEngine(client=client, notify=notify)
 
-    app = build_super_application(engine, client)
+    app = build_super_application(engine, client, auto_engine=auto_engine)
     _notify_ref["app"] = app
 
     app.bot_data["client"]       = client
     app.bot_data["super_engine"] = engine
+    app.bot_data["auto_engine"]  = auto_engine
 
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown

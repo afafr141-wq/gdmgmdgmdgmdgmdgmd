@@ -36,6 +36,19 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
+# ── Auto-Trade Mode defaults ───────────────────────────────────────────────────
+# All values are overridable at runtime via Telegram commands.
+AUTO_SCAN_INTERVAL_MINUTES: int = int(os.getenv("AUTO_SCAN_INTERVAL_MINUTES", "60"))
+AUTO_TAKE_PROFIT_PCT: float  = float(os.getenv("AUTO_TAKE_PROFIT_PCT", "3.0"))
+AUTO_STOP_LOSS_PCT: float    = float(os.getenv("AUTO_STOP_LOSS_PCT", "2.0"))
+AUTO_MAX_OPEN_TRADES: int    = int(os.getenv("AUTO_MAX_OPEN_TRADES", "2"))
+AUTO_MAX_CAPITAL_PCT: float  = float(os.getenv("AUTO_MAX_CAPITAL_PCT", "70.0"))
+AUTO_MAX_HOLD_HOURS: int     = int(os.getenv("AUTO_MAX_HOLD_HOURS", "24"))
+AUTO_MIN_COINS_SCANNED: int  = int(os.getenv("AUTO_MIN_COINS_SCANNED", "30"))
+AUTO_MIN_ANALYST_CONF: int   = int(os.getenv("AUTO_MIN_ANALYST_CONF", "75"))
+AUTO_COOLDOWN_MINUTES: int   = int(os.getenv("AUTO_COOLDOWN_MINUTES", "120"))
+AUTO_REPORT_INTERVAL_HOURS: int = int(os.getenv("AUTO_REPORT_INTERVAL_HOURS", "4"))
+
 
 def validate_env() -> None:
     """Raise if any required variable is missing."""
