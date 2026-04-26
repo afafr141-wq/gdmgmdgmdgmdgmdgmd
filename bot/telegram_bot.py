@@ -179,10 +179,17 @@ def _fmt_report(r: dict) -> str:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
+    from super_consensus.bot.menu_bot import _kb_main
+    auto = ctx.bot_data.get("auto_engine")
+    status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
+    open_c = len(auto.open_positions()) if auto else 0
     await update.message.reply_text(
-        "🤖 *AI Grid Bot — MEXC*\nاختر من القائمة:",
+        "🤖 *AI Trading Bot — MEXC*\n\n"
+        f"الوضع الآلي: {status}\n"
+        f"صفقات مفتوحة: `{open_c}`\n\n"
+        "اختر من القائمة:",
         parse_mode="Markdown",
-        reply_markup=_main_menu_kb(),
+        reply_markup=_kb_main(),
     )
 
 
@@ -426,61 +433,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     data = query.data
 
     if data == "menu_main":
-        await query.edit_message_text("🤖 *AI Grid Bot — MEXC*\nاختر من القائمة:", parse_mode="Markdown", reply_markup=_main_menu_kb())
-
-    elif data == "menu_start":
-        pairs = await _load_popular_pairs()
+        from super_consensus.bot.menu_bot import _kb_main
+        auto = ctx.bot_data.get("auto_engine")
+        status = "🟢 مفعّل" if auto and auto.is_active() else "🔴 موقوف"
+        open_c = len(auto.open_positions()) if auto else 0
         await query.edit_message_text(
-            "🚀 *بدء شبكة جديدة*\nاختر الزوج أو اضغط 🔍 لإدخال أي زوج:",
+            "🤖 *AI Trading Bot — MEXC*\n\n"
+            f"الوضع الآلي: {status}\n"
+            f"صفقات مفتوحة: `{open_c}`\n\n"
+            "اختر من القائمة:",
             parse_mode="Markdown",
-            reply_markup=_pair_kb(pairs),
+            reply_markup=_kb_main(),
         )
-
-    elif data in ("menu_status", "menu_list"):
-        symbols = _engine.active_symbols()
-        if not symbols:
-            await query.edit_message_text("📭 لا توجد شبكات نشطة.", reply_markup=_main_menu_kb())
-        else:
-            rows = [[InlineKeyboardButton(f"📊 {s}", callback_data=f"detail_{s}")] for s in symbols]
-            rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
-            await query.edit_message_text(f"📋 *الأزواج النشطة ({len(symbols)}):*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-
-    elif data == "menu_stopall":
-        symbols = _engine.active_symbols()
-        if not symbols:
-            await query.edit_message_text("📭 لا توجد شبكات لإيقافها.", reply_markup=_main_menu_kb())
-        else:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"⛔ تأكيد إيقاف الكل ({len(symbols)} أزواج)", callback_data="confirmstopall")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="menu_main")],
-            ])
-            await query.edit_message_text(f"⚠️ هل تريد إيقاف *{len(symbols)}* شبكة وبيع كل الكميات؟", parse_mode="Markdown", reply_markup=kb)
-
-    elif data == "confirmstopall":
-        symbols = _engine.active_symbols()
-        await query.edit_message_text("⏳ جاري إيقاف كل الشبكات…")
-        results = []
-        for sym in symbols:
-            try:
-                val = await _engine.stop(sym, market_sell=True)
-                results.append(f"✅ {sym}: ${val:.2f}")
-            except Exception as exc:
-                results.append(f"❌ {sym}: {exc}")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")]])
-        await query.edit_message_text("🏁 *تم إيقاف الكل:*\n" + "\n".join(results), parse_mode="Markdown", reply_markup=kb)
-
-    elif data == "menu_settings":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
-        await query.edit_message_text("⚙️ *الإعدادات*\n\nمثال: `/start_ai BTCUSDT 500 medium`", parse_mode="Markdown", reply_markup=kb)
-
-    elif data == "menu_reports":
-        symbols = _engine.active_symbols()
-        if not symbols:
-            await query.edit_message_text("📭 لا توجد شبكات نشطة.", reply_markup=_main_menu_kb())
-        else:
-            rows = [[InlineKeyboardButton(f"📈 {s}", callback_data=f"reports_{s}")] for s in symbols]
-            rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
-            await query.edit_message_text("📈 *اختر الزوج لعرض تقاريره:*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
     elif data == "pair_custom":
         ctx.user_data["awaiting"] = "custom_symbol"

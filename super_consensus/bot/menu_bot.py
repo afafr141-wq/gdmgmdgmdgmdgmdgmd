@@ -65,15 +65,11 @@ async def _deny(update: Update) -> None:
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 شبكة AI الذكية (Grid Bot)",       callback_data="menu:grid")],
-        [InlineKeyboardButton("🧠 إجماع الخارق (SuperConsensus)",   callback_data="menu:super")],
-        [InlineKeyboardButton("⚡ تداول آلي كامل (Auto-Trade)",     callback_data="menu:auto_mode")],
-        [InlineKeyboardButton("🔍 مسح السوق الآن",                  callback_data="menu:scan")],
-        [
-            InlineKeyboardButton("📊 الحالة",      callback_data="menu:status"),
-            InlineKeyboardButton("⚙️ الإعدادات",  callback_data="menu:settings"),
-        ],
-        [InlineKeyboardButton("📈 تقرير الأرباح", callback_data="menu:profit")],
+        [InlineKeyboardButton("🤖 شبكة AI الذكية (Grid Bot)",     callback_data="menu:grid")],
+        [InlineKeyboardButton("🧠 إجماع الخارق (SuperConsensus)", callback_data="menu:super")],
+        [InlineKeyboardButton("⚡ تداول آلي كامل (Auto-Trade)",   callback_data="menu:auto_mode")],
+        [InlineKeyboardButton("📊 حالة البوت والصفقات (Status)",  callback_data="menu:status")],
+        [InlineKeyboardButton("⚙️ الإعدادات (Settings)",          callback_data="menu:settings")],
     ])
 
 
@@ -96,19 +92,11 @@ def _kb_auto_mode() -> InlineKeyboardMarkup:
 def _kb_settings(auto_engine) -> InlineKeyboardMarkup:
     s = auto_engine.settings
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(f"🛑 وقف الخسارة ({s.stop_loss_pct}%)",    callback_data="set:stop_loss"),
-            InlineKeyboardButton(f"🎯 هدف الربح ({s.take_profit_pct}%)",    callback_data="set:take_profit"),
-        ],
-        [
-            InlineKeyboardButton("💵 رأس المال/صفقة",                       callback_data="set:trade_amount"),
-            InlineKeyboardButton("📊 عدد عملات المسح",                      callback_data="set:coin_count"),
-        ],
-        [
-            InlineKeyboardButton(f"🔢 حد الصفقات ({s.max_open_trades})",    callback_data="set:max_trades"),
-            InlineKeyboardButton(f"⏱️ فترة المسح ({s.scan_interval_min}د)", callback_data="set:scan_interval"),
-        ],
-        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")],
+        [InlineKeyboardButton(f"🛑 Stop Loss ({s.stop_loss_pct}%)",          callback_data="set:stop_loss")],
+        [InlineKeyboardButton(f"🎯 Take Profit ({s.take_profit_pct}%)",      callback_data="set:take_profit")],
+        [InlineKeyboardButton(f"🔢 الحد الأقصى للصفقات ({s.max_open_trades})", callback_data="set:max_trades")],
+        [InlineKeyboardButton(f"⏱️ فترة مسح السوق ({s.scan_interval_min} دقيقة)", callback_data="set:scan_interval")],
+        [InlineKeyboardButton("🔙 رجوع",                                     callback_data="menu:back")],
     ])
 
 
@@ -178,10 +166,11 @@ def _kb_grid_menu(has_last: bool = False) -> InlineKeyboardMarkup:
 
 def _kb_super_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 مسح يدوي الآن",        callback_data="super:scan_now")],
-        [InlineKeyboardButton("⏱️ مسح تلقائي دوري",      callback_data="super:scan_auto")],
-        [InlineKeyboardButton("📋 آخر تقرير مسح",        callback_data="super:last_report")],
-        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")],
+        [InlineKeyboardButton("🔍 مسح السوق الآن (Scan Now)",      callback_data="super:scan_now")],
+        [InlineKeyboardButton("⏱️ مسح تلقائي كل ساعة",             callback_data="super:scan_auto")],
+        [InlineKeyboardButton("🛑 إيقاف المسح التلقائي",            callback_data="super:stop_scan")],
+        [InlineKeyboardButton("📋 آخر تقرير",                       callback_data="super:last_report")],
+        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية",           callback_data="menu:back")],
     ])
 
 
@@ -319,13 +308,14 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
         if not auto:
             await query.answer("⚠️ محرك التداول غير متاح.", show_alert=True)
             return None
+        s = auto.settings
         await _edit(query,
-            "⚙️ *الإعدادات الحالية*\n\n"
-            f"🛑 وقف الخسارة: `{auto.settings.stop_loss_pct}%`\n"
-            f"🎯 هدف الربح: `{auto.settings.take_profit_pct}%`\n"
-            f"🔢 حد الصفقات: `{auto.settings.max_open_trades}`\n"
-            f"⏱️ فترة المسح: `{auto.settings.scan_interval_min}` دقيقة\n\n"
-            "اضغط على الإعداد لتعديله:",
+            "⚙️ *الإعدادات*\n\n"
+            f"🛑 Stop Loss: `{s.stop_loss_pct}%`\n"
+            f"🎯 Take Profit: `{s.take_profit_pct}%`\n"
+            f"🔢 الحد الأقصى للصفقات: `{s.max_open_trades}`\n"
+            f"⏱️ فترة مسح السوق: `{s.scan_interval_min}` دقيقة\n\n"
+            "اضغط على أي إعداد لتعديله:",
             _kb_settings(auto),
         )
         return None
@@ -610,18 +600,44 @@ async def _cb_super(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[
         return None
 
     if action == "scan_auto":
+        # تفعيل المسح التلقائي كل 60 دقيقة مباشرة
+        auto = ctx.bot_data.get("auto_engine")
+        if auto:
+            auto.settings.scan_interval_min = 60
+            try:
+                from super_consensus.utils.super_db import upsert_auto_settings
+                await upsert_auto_settings(auto._settings_dict())
+            except Exception:
+                pass
         await _edit(query,
-            "⏱️ *مسح تلقائي دوري*\n\n"
-            "أرسل الفترة بالدقائق (مثال: `60` = كل ساعة):",
-            _kb_back(),
+            "✅ *المسح التلقائي مُفعَّل*\n\n"
+            "⏱️ سيتم مسح السوق كل `60` دقيقة تلقائياً.\n\n"
+            "اضغط '🛑 إيقاف المسح التلقائي' لإيقافه.",
+            _kb_super_menu(),
         )
-        ctx.user_data["setting_action"] = "scan_interval"
-        return AWAIT_SCAN_AUTO_MIN
+        return None
+
+    if action == "stop_scan":
+        auto = ctx.bot_data.get("auto_engine")
+        if auto:
+            # تعيين الفترة إلى 0 لإيقاف المسح التلقائي
+            auto.settings.scan_interval_min = 0
+            try:
+                from super_consensus.utils.super_db import upsert_auto_settings
+                await upsert_auto_settings(auto._settings_dict())
+            except Exception:
+                pass
+        await _edit(query,
+            "🛑 *تم إيقاف المسح التلقائي*\n\n"
+            "يمكنك تشغيل مسح يدوي في أي وقت.",
+            _kb_super_menu(),
+        )
+        return None
 
     if action == "last_report":
         last = ctx.bot_data.get("last_scan_report")
         if not last:
-            await query.answer("لا يوجد تقرير مسح سابق بعد. اضغط 'مسح يدوي' أولاً.", show_alert=True)
+            await query.answer("لا يوجد تقرير مسح سابق بعد. اضغط 'مسح السوق الآن' أولاً.", show_alert=True)
             return None
         # Send as new message (may be long)
         await query.message.reply_text(last, parse_mode=ParseMode.MARKDOWN)
@@ -820,53 +836,73 @@ async def _do_scan(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     auto   = ctx.bot_data.get("auto_engine")
+    engine = ctx.bot_data.get("engine")
     client = ctx.bot_data.get("client")
 
-    if not auto:
-        await _edit(query, "⚠️ محرك التداول غير متاح.", _kb_back())
-        return
+    lines = ["📊 *حالة البوت والصفقات*\n", "━━━━━━━━━━━━━━━━━━━━"]
 
-    s          = auto.settings
-    positions  = auto.open_positions()
-    status_str = "🟢 مفعّل" if auto.is_active() else "🔴 موقوف"
-    mode_str   = (
-        f"`{s.trade_amount_usdt:.0f} USDT` ثابت"
-        if s.trade_amount_usdt is not None
-        else f"`{s.risk_pct:.1f}%` من رأس المال"
-        if s.risk_pct is not None
-        else "غير محدد"
-    )
+    # ── قسم 1: شبكات Grid Bot ─────────────────────────────────────────────────
+    lines.append("\n🤖 *شبكة AI الذكية (Grid Bot):*")
+    if engine:
+        active_symbols = engine.active_symbols()
+        if active_symbols:
+            lines.append(f"  شبكات نشطة: `{len(active_symbols)}`")
+            for sym in active_symbols:
+                lines.append(f"  • `{sym}`")
+        else:
+            lines.append("  لا توجد شبكات نشطة")
+    else:
+        lines.append("  محرك الشبكة غير متاح")
 
-    unrealized = 0.0
-    pos_lines  = []
-    for pos in positions:
-        try:
-            price = await client.get_current_price(pos.symbol)
-            unr   = (price - pos.entry_price) * pos.qty
-            unrealized += unr
-            pct   = (price / pos.entry_price - 1) * 100
-            pos_lines.append(
-                f"  • `{pos.symbol}` {'+' if pct >= 0 else ''}{pct:.2f}%"
-                f" ({'+' if unr >= 0 else ''}{unr:.4f} USDT)"
-            )
-        except Exception:
-            pos_lines.append(f"  • `{pos.symbol}` — لا يمكن جلب السعر")
+    # ── قسم 2: SuperConsensus ─────────────────────────────────────────────────
+    lines.append("\n🧠 *إجماع الخارق (SuperConsensus):*")
+    last_scan = ctx.bot_data.get("last_scan_report")
+    if last_scan:
+        lines.append("  آخر مسح: ✅ متاح")
+    else:
+        lines.append("  آخر مسح: لم يتم بعد")
+    if auto:
+        scan_min = auto.settings.scan_interval_min
+        if scan_min and scan_min > 0:
+            lines.append(f"  المسح التلقائي: 🟢 كل `{scan_min}` دقيقة")
+        else:
+            lines.append("  المسح التلقائي: 🔴 موقوف")
+    else:
+        lines.append("  المسح التلقائي: غير متاح")
 
-    pos_block = "\n".join(pos_lines) if pos_lines else "  لا توجد صفقات مفتوحة"
+    # ── قسم 3: Auto-Trade ─────────────────────────────────────────────────────
+    lines.append("\n⚡ *التداول الآلي (Auto-Trade):*")
+    if auto:
+        s          = auto.settings
+        positions  = auto.open_positions()
+        status_str = "🟢 مفعّل" if auto.is_active() else "🔴 موقوف"
+        lines.append(f"  الحالة: {status_str}")
+        lines.append(f"  صفقات مفتوحة: `{len(positions)}/{s.max_open_trades}`")
+        lines.append(f"  🎯 TP: `+{s.take_profit_pct}%` | 🛑 SL: `-{s.stop_loss_pct}%`")
 
-    text = (
-        f"📊 *حالة البوت والصفقات*\n\n"
-        f"الوضع الآلي: {status_str}\n"
-        f"حجم الصفقة: {mode_str}\n"
-        f"🎯 TP: `+{s.take_profit_pct}%` | 🛡️ SL: `-{s.stop_loss_pct}%`\n\n"
-        f"📈 *الأداء:*\n"
-        f"  صفقات منفذة: `{s.total_auto_trades}`\n"
-        f"  ربح محقق: `{s.realized_pnl:+.4f} USDT`\n"
-        f"  غير محقق: `{unrealized:+.4f} USDT`\n"
-        f"  رأس المال: `{s.total_capital_usdt:.2f} USDT`\n\n"
-        f"📌 *مراكز مفتوحة ({len(positions)}/{s.max_open_trades}):*\n{pos_block}"
-    )
-    await _edit(query, text, _kb_back())
+        # حساب الأرباح غير المحققة
+        unrealized = 0.0
+        if client and positions:
+            for pos in positions:
+                try:
+                    price = await client.get_current_price(pos.symbol)
+                    unrealized += (price - pos.entry_price) * pos.qty
+                except Exception:
+                    pass
+
+        lines.append(f"  ربح محقق: `{s.realized_pnl:+.4f} USDT`")
+        lines.append(f"  غير محقق: `{unrealized:+.4f} USDT`")
+        lines.append(f"  إجمالي الصفقات: `{s.total_auto_trades}`")
+    else:
+        lines.append("  محرك التداول غير متاح")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تحديث", callback_data="menu:status")],
+        [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")],
+    ])
+    await _edit(query, "\n".join(lines), kb)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
