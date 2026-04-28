@@ -64,9 +64,8 @@ def _main_menu_text(ctx=None) -> str:
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🤖 شبكة AI",    callback_data="menu:grid"),
-            InlineKeyboardButton("📊 الحالة",      callback_data="menu:status"),
-            InlineKeyboardButton("📈 الأرباح",     callback_data="menu:profit"),
+            InlineKeyboardButton("🤖 شبكة AI",          callback_data="menu:grid"),
+            InlineKeyboardButton("📋 عرض الشبكات",       callback_data="menu:status"),
         ],
     ])
 
@@ -106,19 +105,7 @@ def _kb_grid_risk() -> InlineKeyboardMarkup:
     ])
 
 
-def _kb_profit() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("24 ساعة",  callback_data="profit:24h"),
-            InlineKeyboardButton("7 أيام",   callback_data="profit:7d"),
-            InlineKeyboardButton("30 يوم",   callback_data="profit:30d"),
-        ],
-        [
-            InlineKeyboardButton("إجمالي",   callback_data="profit:total"),
-            InlineKeyboardButton("تفاصيل",   callback_data="profit:details"),
-        ],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="menu:back")],
-    ])
+
 
 
 def _kb_back() -> InlineKeyboardMarkup:
@@ -170,10 +157,6 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
 
     if action == "status":
         await _show_status(query, ctx)
-        return None
-
-    if action == "profit":
-        await _edit(query, "📈 *تقرير الأرباح*\n\nاختر الفترة الزمنية:", _kb_profit())
         return None
 
     return None
@@ -337,55 +320,7 @@ async def _recv_grid_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
     return ConversationHandler.END
 
 
-# ── profit: callbacks ──────────────────────────────────────────────────────────
 
-async def _cb_profit(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    action = query.data.split(":")[1]
-
-    from utils.db_manager import get_trade_history
-
-    period_map = {"24h": (1, "آخر 24 ساعة"), "7d": (7, "آخر 7 أيام"),
-                  "30d": (30, "آخر 30 يوم"), "total": (3650, "إجمالي"),
-                  "details": (3650, "آخر 15 صفقة")}
-    if action not in period_map:
-        return
-
-    days, period_label = period_map[action]
-
-    engine  = ctx.bot_data.get("engine")
-    symbols = engine.active_symbols() if engine else []
-
-    all_trades = []
-    for sym in symbols:
-        all_trades += await get_trade_history(sym, days=days)
-    # Also fetch all if no active symbols (historical)
-    if not symbols:
-        all_trades = await get_trade_history("", days=days) if False else []
-
-    sells   = [t for t in all_trades if t.get("side") == "sell"]
-    total   = sum(float(t.get("pnl") or 0) for t in sells)
-    wins    = [t for t in sells if float(t.get("pnl") or 0) > 0]
-    losses  = [t for t in sells if float(t.get("pnl") or 0) <= 0]
-    win_pct = (len(wins) / len(sells) * 100) if sells else 0
-
-    lines = [
-        f"📈 *تقرير الأرباح — {period_label}*\n",
-        f"💰 إجمالي الربح/الخسارة: `{total:+.4f} USDT`",
-        f"📊 صفقات مكتملة: `{len(sells)}`",
-        f"✅ رابحة: `{len(wins)}` | ❌ خاسرة: `{len(losses)}`",
-        f"🎯 نسبة النجاح: `{win_pct:.1f}%`",
-    ]
-
-    if action == "details" and sells:
-        lines.append("\n*آخر الصفقات:*")
-        for t in sells[:15]:
-            pnl  = float(t.get("pnl") or 0)
-            icon = "✅" if pnl >= 0 else "❌"
-            lines.append(f"{icon} `{t['symbol']}` {pnl:+.4f} USDT")
-
-    await _edit(query, "\n".join(lines), _kb_profit())
 
 
 # ── status helper ──────────────────────────────────────────────────────────────
@@ -444,7 +379,6 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(_cb_menu,     pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(_cb_profit,   pattern=r"^profit:"))
     app.add_handler(CallbackQueryHandler(_cb_grid,     pattern=r"^grid:"))
     app.add_handler(CallbackQueryHandler(_cb_gridrisk, pattern=r"^gridrisk:"))
     app.add_handler(CallbackQueryHandler(_cb_gridstop, pattern=r"^gridstop:"))
