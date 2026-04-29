@@ -120,59 +120,67 @@ def _active_grid_kb(symbol: str) -> InlineKeyboardMarkup:
     mute_label = "🔔 تفعيل الإشعارات" if muted else "🔕 كتم الإشعارات"
     mute_cb    = f"unmute_{symbol}" if muted else f"mute_{symbol}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 تفاصيل الربح", callback_data=f"detail_{symbol}"),
-         InlineKeyboardButton("🔄 إعادة تشكيل", callback_data=f"rebuild_{symbol}")],
-        [InlineKeyboardButton(mute_label, callback_data=mute_cb)],
-        [InlineKeyboardButton("⛔ إيقاف", callback_data=f"stop_{symbol}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="menu_list")],
+        [InlineKeyboardButton("📊 تفاصيل الربح",  callback_data=f"detail_{symbol}"),
+         InlineKeyboardButton("🔄 إعادة تشكيل",  callback_data=f"rebuild_{symbol}")],
+        [InlineKeyboardButton("📈 تقارير الفترة", callback_data=f"reports_{symbol}"),
+         InlineKeyboardButton(mute_label,          callback_data=mute_cb)],
+        [InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}")],
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")],
     ])
 
 
 def _confirm_stop_kb(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ نعم، أوقف وبيع", callback_data=f"confirmstop_{symbol}"),
-         InlineKeyboardButton("❌ إلغاء", callback_data=f"detail_{symbol}")],
+        [InlineKeyboardButton("✅ نعم، أوقف وبيع الكل", callback_data=f"confirmstop_{symbol}")],
+        [InlineKeyboardButton("❌ إلغاء — ابقِ الشبكة",  callback_data=f"detail_{symbol}")],
     ])
 
 
 def _reports_kb(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 يومي", callback_data=f"report_1_{symbol}"),
-         InlineKeyboardButton("📅 أسبوعي", callback_data=f"report_7_{symbol}"),
-         InlineKeyboardButton("📅 شهري", callback_data=f"report_30_{symbol}")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")],
+        [InlineKeyboardButton("📅 اليوم",    callback_data=f"report_1_{symbol}"),
+         InlineKeyboardButton("📅 الأسبوع",  callback_data=f"report_7_{symbol}"),
+         InlineKeyboardButton("📅 الشهر",    callback_data=f"report_30_{symbol}")],
+        [InlineKeyboardButton("📊 تفاصيل الشبكة", callback_data=f"detail_{symbol}"),
+         InlineKeyboardButton("🏠 القائمة",        callback_data="menu_main")],
     ])
 
 
 def _fmt_report(r: dict) -> str:
+    total = r['total_profit']
+    pnl_icon = "📈" if total >= 0 else "📉"
+    pnl_sign = "+" if total >= 0 else ""
+    risk_icons = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
     return (
-        f"📊 *{_fmt_symbol(r['symbol'])}* — تقرير الشبكة\n"
+        f"╔══════════════════════╗\n"
+        f"║  📊 *{_fmt_symbol(r['symbol'])}*  ║\n"
+        f"╚══════════════════════╝\n\n"
+        f"💰 *الاستثمار والنطاق*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 الاستثمار: `${r['total_investment']:.2f}`\n"
-        f"📐 النطاق: `{r['lower']:.4f}` — `{r['upper']:.4f}`\n"
-        f"🔢 عدد الشبكات: `{r['grid_count']}`\n"
-        f"📏 فارق الشبكة: `{r['grid_spacing']:.4f}`\n"
-        f"💲 ميزانية كل شبكة: `{r.get('qty_per_grid_usdt', 0):.2f}` USDT\n"
-        f"🏦 الحد الأدنى MEXC: `{r.get('min_order_cost', 1):.2f}` USDT\n"
-        f"📡 ATR: `{r['atr']:.4f}`\n"
+        f"💵 مخصص: `${r['total_investment']:.2f}` USDT\n"
+        f"📐 النطاق: `{r['lower']:.4f}` ↔ `{r['upper']:.4f}`\n"
+        f"🔢 شبكات: `{r['grid_count'] // 2}` شراء + `{r['grid_count'] // 2}` بيع\n"
+        f"📏 فارق: `{r['grid_spacing']:.4f}` | ميزانية/شبكة: `{r.get('qty_per_grid_usdt', 0):.2f}$`\n\n"
+        f"💹 *السعر والمركز*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💵 السعر الحالي: `{r['current_price']:.4f}`\n"
-        f"📦 متوسط سعر الشراء: `{r['avg_buy_price']:.4f}`\n"
-        f"🪙 الكمية المحتجزة: `{r['held_qty']:.6f}`\n"
-        f"✅ أوامر بيع منفذة: `{r['sell_count']}`\n"
+        f"📦 متوسط الشراء: `{r['avg_buy_price']:.4f}`\n"
+        f"🪙 الكمية: `{r['held_qty']:.6f}`\n\n"
+        f"📋 *الأوامر المفتوحة*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 أوامر شراء نشطة: `{r.get('active_buys', 0)}`\n"
-        f"🔴 أوامر بيع نشطة: `{r.get('active_sells', 0)}`\n"
-        f"🔓 إجمالي الأوامر المفتوحة: `{r['open_orders']}`\n"
+        f"🟢 شراء: `{r.get('active_buys', 0)}` | 🔴 بيع: `{r.get('active_sells', 0)}` | 🔓 إجمالي: `{r['open_orders']}`\n"
+        f"✅ صفقات بيع منفذة: `{r['sell_count']}`\n\n"
+        f"{pnl_icon} *الأرباح*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💹 ربح الشبكة: `${r['grid_profit']:.4f}`\n"
-        f"📈 أرباح غير محققة: `${r['unrealised_pnl']:.4f}`\n"
-        f"✅ أرباح محققة: `${r['realized_pnl']:.4f}`\n"
-        f"🏆 إجمالي الربح: `${r['total_profit']:.4f}`\n"
+        f"💹 ربح الشبكة: `${r['grid_profit']:+.4f}`\n"
+        f"📈 غير محقق: `${r['unrealised_pnl']:+.4f}`\n"
+        f"✅ محقق: `${r['realized_pnl']:+.4f}`\n"
+        f"🏆 *الإجمالي: `${pnl_sign}{r['total_profit']:.4f}`*\n\n"
+        f"📊 *الأداء*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 أيام التشغيل: `{r['days_running']:.1f}`\n"
-        f"📊 APY الكلي: `{r['apy']:.2f}%`\n"
-        f"📊 APY الشبكة: `{r['grid_apy']:.2f}%`\n"
-        f"⚠️ المخاطرة: `{r['risk']}`"
+        f"📊 APY: `{r['apy']:.2f}%` | APY الشبكة: `{r['grid_apy']:.2f}%`\n"
+        f"⚖️ المخاطرة: {risk_icons.get(r['risk'], r['risk'])}"
     )
 
 
@@ -434,6 +442,231 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             reply_markup=_kb_main(),
         )
 
+    elif data == "menu_start":
+        pairs = await _load_popular_pairs()
+        await query.edit_message_text(
+            "🚀 *بدء شبكة جديدة*\n\nاختر الزوج:",
+            parse_mode="Markdown",
+            reply_markup=_pair_kb(pairs),
+        )
+
+    elif data == "menu_status":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+            await query.edit_message_text("📭 لا توجد شبكات نشطة حالياً.", reply_markup=kb)
+            return
+        rows = [[InlineKeyboardButton(f"📊 {s}", callback_data=f"detail_{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
+        await query.edit_message_text(
+            f"📊 *حالة الشبكات النشطة ({len(symbols)}):*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif data == "menu_list":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+            await query.edit_message_text("📭 لا توجد شبكات نشطة حالياً.", reply_markup=kb)
+            return
+        rows = [[InlineKeyboardButton(f"📊 {s}", callback_data=f"detail_{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
+        await query.edit_message_text(
+            f"📋 *الأزواج النشطة ({len(symbols)}):*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif data == "menu_stopall":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+            await query.edit_message_text("📭 لا توجد شبكات نشطة للإيقاف.", reply_markup=kb)
+            return
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ نعم، أوقف الكل وبيع", callback_data="confirmstopall")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="menu_main")],
+        ])
+        await query.edit_message_text(
+            f"⚠️ *تأكيد إيقاف الكل*\n\nسيتم إيقاف *{len(symbols)}* شبكة وبيع جميع الكميات.\nهل أنت متأكد؟",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data == "confirmstopall":
+        symbols = _engine.active_symbols() if _engine else []
+        await query.edit_message_text("⏳ جاري إيقاف جميع الشبكات…", parse_mode="Markdown")
+        results = []
+        for sym in symbols:
+            try:
+                val = await _engine.stop(sym, market_sell=True)
+                results.append(f"✅ `{_fmt_symbol(sym)}` — `${val:.2f}`")
+            except Exception as exc:
+                results.append(f"❌ `{_fmt_symbol(sym)}` — {exc}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")]])
+        await query.edit_message_text(
+            "🛑 *تم إيقاف جميع الشبكات*\n\n" + "\n".join(results),
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data == "menu_settings":
+        pairs = await _load_popular_pairs()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ إضافة زوج", callback_data="settings_addpair"),
+             InlineKeyboardButton("➖ حذف زوج", callback_data="settings_rmpair")],
+            [InlineKeyboardButton("🔕 كتم الكل", callback_data="settings_muteall"),
+             InlineKeyboardButton("🔔 تفعيل الكل", callback_data="settings_unmuteall")],
+            [InlineKeyboardButton("🔄 ترقية كل الشبكات", callback_data="settings_upgradeall")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")],
+        ])
+        pairs_text = " | ".join(f"`{p}`" for p in pairs)
+        await query.edit_message_text(
+            f"⚙️ *الإعدادات*\n\n"
+            f"📋 الأزواج السريعة:\n{pairs_text}\n\n"
+            f"🔕 مكتوم: `{'الكل' if 'ALL' in _muted_symbols else ', '.join(_muted_symbols) or 'لا شيء'}`",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data == "settings_muteall":
+        _muted_symbols.add("ALL")
+        await query.answer("🔕 تم كتم جميع الإشعارات", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔔 تفعيل الكل", callback_data="settings_unmuteall")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")],
+        ]))
+
+    elif data == "settings_unmuteall":
+        _muted_symbols.clear()
+        await query.answer("🔔 تم تفعيل جميع الإشعارات", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔕 كتم الكل", callback_data="settings_muteall")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")],
+        ]))
+
+    elif data == "settings_upgradeall":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            await query.answer("لا توجد شبكات نشطة.", show_alert=True)
+            return
+        await query.edit_message_text("⏳ جاري ترقية جميع الشبكات…", parse_mode="Markdown")
+        ok, failed = [], []
+        for sym in symbols:
+            try:
+                await _engine.upgrade_grid(sym)
+                ok.append(sym)
+            except Exception as exc:
+                failed.append(f"`{_fmt_symbol(sym)}`: {exc}")
+        lines = []
+        if ok:
+            lines.append("✅ *تمت الترقية:*\n" + "\n".join(f"• `{_fmt_symbol(s)}`" for s in ok))
+        if failed:
+            lines.append("❌ *فشلت:*\n" + "\n".join(f"• {e}" for e in failed))
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")]])
+        await query.edit_message_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+    elif data == "settings_addpair":
+        ctx.user_data["awaiting"] = "settings_addpair"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")]])
+        await query.edit_message_text(
+            "➕ *إضافة زوج للقائمة السريعة*\n\nأرسل رمز الزوج (مثال: `ADAUSDT`):",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data == "settings_rmpair":
+        pairs = await _load_popular_pairs()
+        rows = [[InlineKeyboardButton(f"🗑 {p}", callback_data=f"rmpair_{p}")] for p in pairs]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
+        await query.edit_message_text(
+            "➖ *حذف زوج من القائمة السريعة*\n\nاختر الزوج للحذف:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif data.startswith("rmpair_"):
+        symbol = data[7:]
+        pairs = await _load_popular_pairs()
+        if symbol in pairs:
+            pairs.remove(symbol)
+            await _save_popular_pairs(pairs)
+        await query.answer(f"✅ تم حذف {symbol}", show_alert=False)
+        rows = [[InlineKeyboardButton(f"🗑 {p}", callback_data=f"rmpair_{p}")] for p in pairs]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "menu_reports":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+            await query.edit_message_text("📭 لا توجد شبكات نشطة.", reply_markup=kb)
+            return
+        rows = [[InlineKeyboardButton(f"📈 {s}", callback_data=f"reports_{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")])
+        await query.edit_message_text(
+            "📈 *تقارير الأرباح*\n\nاختر الشبكة:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif data == "menu_balance":
+        symbols = _engine.active_symbols() if _engine else []
+        if not symbols:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+            await query.edit_message_text("📭 لا توجد شبكات نشطة.", reply_markup=kb)
+            return
+        lines = ["💼 *ميزان المحافظ*\n━━━━━━━━━━━━━━━━━━━━"]
+        for sym in symbols:
+            state = _engine.get_state(sym)
+            if not state:
+                continue
+            try:
+                price      = await _client.get_current_price(sym)
+                held_value = state.held_qty * price
+                allocated  = state.total_investment
+                pct        = (held_value / allocated * 100) if allocated else 0
+                icon       = "✅" if held_value <= allocated else "🚨"
+                lines.append(
+                    f"\n{icon} *{_fmt_symbol(sym)}*\n"
+                    f"  💰 مخصص: `{allocated:.2f}` USDT\n"
+                    f"  📦 فعلي: `{held_value:.2f}` USDT ({pct:.1f}%)\n"
+                    f"  📊 فرق: `{allocated - held_value:+.2f}` USDT"
+                )
+            except Exception as exc:
+                lines.append(f"\n⚠️ *{_fmt_symbol(sym)}*: {exc}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]])
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+    elif data == "menu_help":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 بدء شبكة", callback_data="menu:grid"),
+             InlineKeyboardButton("📊 الحالة",   callback_data="menu:status")],
+            [InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="menu_main")],
+        ])
+        await query.edit_message_text(
+            "❓ *دليل الاستخدام*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "🚀 *بدء شبكة جديدة*\n"
+            "اختر الزوج ← المبلغ ← عدد الشبكات ← نسبة الخروج ← المخاطرة\n\n"
+            "📊 *حالة الشبكات*\n"
+            "عرض الأرباح والأوامر المفتوحة لكل شبكة\n\n"
+            "🔄 *إعادة التمركز التلقائي*\n"
+            "عند تجاوز النسبة المحددة، ينتظر البوت إغلاق شمعة الدقيقة ثم ينقل الشبكة\n\n"
+            "🛑 *إيقاف الشبكة*\n"
+            "يلغي الأوامر ويبيع الكميات بسعر السوق\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "*الأوامر النصية:*\n"
+            "`/menu` — القائمة الرئيسية\n"
+            "`/list` — الشبكات النشطة\n"
+            "`/balance` — الرصيد\n"
+            "`/upgrade` — ترقية الشبكات\n"
+            "`/mute` / `/unmute` — الإشعارات",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
     elif data == "pair_custom":
         ctx.user_data["awaiting"] = "custom_symbol"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
@@ -550,15 +783,21 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         days, symbol = int(parts[1]), parts[2]
         from utils import db_manager as db
         trades = await db.get_trade_history(symbol, days)
+        buys  = [t for t in trades if t["side"] == "buy"]
         sells = [t for t in trades if t["side"] == "sell"]
-        total_pnl = sum(float(t["pnl"]) for t in sells)
-        label = {1: "اليوم", 7: "الأسبوع", 30: "الشهر"}.get(days, f"{days} يوم")
+        total_pnl  = sum(float(t["pnl"]) for t in sells)
+        total_vol  = sum(float(t["price"]) * float(t["qty"]) for t in trades)
+        label      = {1: "اليوم", 7: "الأسبوع", 30: "الشهر"}.get(days, f"{days} يوم")
+        pnl_icon   = "📈" if total_pnl >= 0 else "📉"
+        pnl_sign   = "+" if total_pnl >= 0 else ""
         await query.edit_message_text(
-            f"📈 *{symbol}* — تقرير {label}\n"
+            f"📈 *{_fmt_symbol(symbol)}* — تقرير {label}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔢 عدد الصفقات: `{len(trades)}`\n"
-            f"✅ صفقات بيع: `{len(sells)}`\n"
-            f"💹 إجمالي الربح المحقق: `${total_pnl:.4f}`",
+            f"🔢 إجمالي الصفقات: `{len(trades)}`\n"
+            f"🟢 شراء: `{len(buys)}` | 🔴 بيع: `{len(sells)}`\n"
+            f"💱 حجم التداول: `${total_vol:.2f}` USDT\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{pnl_icon} الربح المحقق: `${pnl_sign}{total_pnl:.4f}` USDT",
             parse_mode="Markdown",
             reply_markup=_reports_kb(symbol),
         )
@@ -585,6 +824,30 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_start")]])
         await update.message.reply_text(
             f"✅ *{symbol}* — السعر الحالي: `{price:.4f}`\n\nأدخل المبلغ بالـ USDT:\n(مثال: `500`)",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Settings: add pair ────────────────────────────────────────────────────
+    if awaiting == "settings_addpair":
+        symbol = _normalize_symbol(update.message.text.strip())
+        try:
+            await _client.get_current_price(symbol)
+        except Exception as exc:
+            await update.message.reply_text(
+                f"❌ الزوج `{symbol}` غير موجود على MEXC:\n`{exc}`\n\nحاول مرة أخرى:",
+                parse_mode="Markdown",
+            )
+            return
+        pairs = await _load_popular_pairs()
+        if symbol not in pairs:
+            pairs.append(symbol)
+            await _save_popular_pairs(pairs)
+        ctx.user_data["awaiting"] = None
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للإعدادات", callback_data="menu_settings")]])
+        await update.message.reply_text(
+            f"✅ تمت إضافة `{symbol}` للقائمة السريعة.",
             parse_mode="Markdown",
             reply_markup=kb,
         )
