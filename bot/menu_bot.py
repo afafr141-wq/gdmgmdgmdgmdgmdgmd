@@ -24,9 +24,12 @@ logger = logging.getLogger(__name__)
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
-    AWAIT_GRID_PAIR,    # grid bot: trading pair (free text)
-    AWAIT_GRID_AMOUNT,  # grid bot: investment amount (free text)
-) = range(2)
+    AWAIT_GRID_PAIR,       # grid bot: trading pair (free text)
+    AWAIT_GRID_AMOUNT,     # grid bot: investment amount (free text)
+    AWAIT_GRID_COUNT,      # grid bot: number of grids per side (free text)
+    AWAIT_GRID_UPPER_PCT,  # grid bot: upper breakout % before rebuild
+    AWAIT_GRID_LOWER_PCT,  # grid bot: lower breakout % before rebuild
+) = range(5)
 
 POPULAR_PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
@@ -53,20 +56,35 @@ async def _deny(update: Update) -> None:
 
 def _main_menu_text(ctx=None) -> str:
     engine = ctx.bot_data.get("engine") if ctx and hasattr(ctx, "bot_data") else None
-    active = len(engine.active_symbols()) if engine else 0
+    symbols = engine.active_symbols() if engine else []
+    active  = len(symbols)
+    status_line = "🟢 يعمل" if active else "⚪ لا توجد شبكات"
+    grids_text  = "\n".join(f"  • `{s}`" for s in symbols) if symbols else "  _لا توجد شبكات نشطة_"
     return (
-        "🤖 *AI Grid Bot — MEXC*\n\n"
-        f"شبكات نشطة: `{active}`\n\n"
-        "اختر من القائمة:"
+        "╔══════════════════════╗\n"
+        "║   🤖 *AI Grid Bot*   ║\n"
+        "║      *MEXC Spot*     ║\n"
+        "╚══════════════════════╝\n\n"
+        f"📡 الحالة: {status_line}\n"
+        f"📊 شبكات نشطة: `{active}`\n"
+        f"{grids_text}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "اختر من القائمة أدناه:"
     )
 
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🤖 شبكة AI",          callback_data="menu:grid"),
-            InlineKeyboardButton("📋 عرض الشبكات",       callback_data="menu:status"),
-        ],
+        [InlineKeyboardButton("🚀 شبكة جديدة",        callback_data="menu:grid"),
+         InlineKeyboardButton("📊 حالة الشبكات",      callback_data="menu:status")],
+        [InlineKeyboardButton("📋 قائمة الأزواج",     callback_data="menu_list"),
+         InlineKeyboardButton("📈 تقارير الأرباح",    callback_data="menu_reports")],
+        [InlineKeyboardButton("💼 الرصيد",            callback_data="menu_balance"),
+         InlineKeyboardButton("⚙️ الإعدادات",         callback_data="menu_settings")],
+        [InlineKeyboardButton("🛑 إيقاف شبكة",        callback_data="menu:grid_stop"),
+         InlineKeyboardButton("⛔ إيقاف الكل",        callback_data="menu_stopall")],
+        [InlineKeyboardButton("🔄 ترقية الشبكات",     callback_data="settings_upgradeall"),
+         InlineKeyboardButton("❓ مساعدة",            callback_data="menu_help")],
     ])
 
 
@@ -76,8 +94,9 @@ def _kb_grid_menu(has_last: bool = False) -> InlineKeyboardMarkup:
     ]
     if has_last:
         rows.append([InlineKeyboardButton("⚡ تشغيل بآخر إعدادات", callback_data="grid:last")])
-    rows.append([InlineKeyboardButton("🛑 إيقاف شبكة",             callback_data="grid:stop_menu")])
-    rows.append([InlineKeyboardButton("🔙 رجوع",                   callback_data="menu:back")])
+    rows.append([InlineKeyboardButton("🛑 إيقاف شبكة",  callback_data="grid:stop_menu"),
+                 InlineKeyboardButton("📊 حالة الشبكات", callback_data="menu:status")])
+    rows.append([InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -148,7 +167,10 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
             lp = ctx.user_data.get("grid_last_pair", "")
             la = ctx.user_data.get("grid_last_amount", 0)
             lr = ctx.user_data.get("grid_last_risk", "medium")
-            last_info = f"\n⚡ آخر إعدادات: `{lp}` | `{la} USDT` | `{lr}`"
+            lc  = ctx.user_data.get("grid_last_count", 3)
+            lup = ctx.user_data.get("grid_last_upper_pct", 3.0)
+            ldo = ctx.user_data.get("grid_last_lower_pct", 3.0)
+            last_info = f"\n⚡ آخر إعدادات: `{lp}` | `{la} USDT` | `{lc}×2` | `+{lup}%/-{ldo}%` | `{lr}`"
         await _edit(query,
             f"🤖 *شبكة AI الذكية — Grid Bot*{last_info}\n\nاختر ما تريد:",
             _kb_grid_menu(has_last=has_last),
@@ -157,6 +179,17 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
 
     if action == "status":
         await _show_status(query, ctx)
+        return None
+
+    if action == "grid_stop":
+        engine = ctx.bot_data.get("engine")
+        symbols = engine.active_symbols() if engine else []
+        if not symbols:
+            await query.answer("لا توجد شبكات نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"🛑 {s}", callback_data=f"gridstop:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:back")])
+        await _edit(query, "🛑 *اختر الشبكة للإيقاف:*", InlineKeyboardMarkup(rows))
         return None
 
     return None
@@ -177,13 +210,16 @@ async def _cb_grid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
         return None
 
     if action == "last":
-        pair   = ctx.user_data.get("grid_last_pair")
-        amount = ctx.user_data.get("grid_last_amount")
-        risk   = ctx.user_data.get("grid_last_risk", "medium")
+        pair      = ctx.user_data.get("grid_last_pair")
+        amount    = ctx.user_data.get("grid_last_amount")
+        risk      = ctx.user_data.get("grid_last_risk", "medium")
+        num_grids = ctx.user_data.get("grid_last_count", 3)
+        upper_pct = ctx.user_data.get("grid_last_upper_pct", 3.0)
+        lower_pct = ctx.user_data.get("grid_last_lower_pct", 3.0)
         if not pair or not amount:
             await query.answer("لا توجد إعدادات سابقة.", show_alert=True)
             return None
-        await _launch_grid(query, ctx, pair, amount, risk)
+        await _launch_grid(query, ctx, pair, amount, risk, num_grids, upper_pct, lower_pct)
         return None
 
     if action == "custom":
@@ -222,13 +258,16 @@ async def _cb_grid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
 async def _cb_gridrisk(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    risk   = query.data.split(":")[1]
-    pair   = ctx.user_data.get("grid_pending_pair", "")
-    amount = ctx.user_data.get("grid_pending_amount", 0)
+    risk      = query.data.split(":")[1]
+    pair      = ctx.user_data.get("grid_pending_pair", "")
+    amount    = ctx.user_data.get("grid_pending_amount", 0)
+    num_grids  = ctx.user_data.get("grid_pending_count", 3)
+    upper_pct  = ctx.user_data.get("grid_pending_upper_pct", 3.0)
+    lower_pct  = ctx.user_data.get("grid_pending_lower_pct", 3.0)
     if not pair or not amount:
         await query.answer("بيانات ناقصة، ابدأ من جديد.", show_alert=True)
         return
-    await _launch_grid(query, ctx, pair, amount, risk)
+    await _launch_grid(query, ctx, pair, amount, risk, num_grids, upper_pct, lower_pct)
 
 
 async def _cb_gridstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -250,7 +289,13 @@ async def _cb_gridstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _edit(query, f"❌ خطأ في الإيقاف: `{exc}`", _kb_back())
 
 
-async def _launch_grid(query, ctx, pair: str, amount: float, risk: str) -> None:
+async def _launch_grid(
+    query, ctx,
+    pair: str, amount: float, risk: str,
+    num_grids: int = 3,
+    upper_pct: float = 3.0,
+    lower_pct: float = 3.0,
+) -> None:
     engine = ctx.bot_data.get("engine")
     if not engine:
         await _edit(query, "❌ محرك الشبكة غير متاح.", _kb_back())
@@ -258,14 +303,22 @@ async def _launch_grid(query, ctx, pair: str, amount: float, risk: str) -> None:
     risk_labels = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
     try:
         await _edit(query, f"⏳ جاري تشغيل شبكة `{pair}`...", _kb_back())
-        await engine.start(symbol=pair, total_investment=amount, risk=risk)
-        ctx.user_data["grid_last_pair"]   = pair
-        ctx.user_data["grid_last_amount"] = amount
-        ctx.user_data["grid_last_risk"]   = risk
+        await engine.start(
+            symbol=pair, total_investment=amount, risk=risk,
+            num_grids=num_grids, upper_pct=upper_pct, lower_pct=lower_pct,
+        )
+        ctx.user_data["grid_last_pair"]       = pair
+        ctx.user_data["grid_last_amount"]     = amount
+        ctx.user_data["grid_last_risk"]       = risk
+        ctx.user_data["grid_last_count"]      = num_grids
+        ctx.user_data["grid_last_upper_pct"]  = upper_pct
+        ctx.user_data["grid_last_lower_pct"]  = lower_pct
         await _edit(query,
             f"✅ *شبكة AI مُشغَّلة*\n\n"
             f"🪙 الزوج: `{pair}`\n"
             f"💵 الاستثمار: `{amount:.0f} USDT`\n"
+            f"🔢 الشبكات: `{num_grids}×2 = {num_grids*2}` أمر\n"
+            f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{lower_pct}%`\n"
             f"⚖️ المخاطرة: {risk_labels.get(risk, risk)}\n\n"
             "البوت يعمل الآن ويضع أوامر الشراء والبيع تلقائياً.",
             _kb_main(),
@@ -307,13 +360,100 @@ async def _recv_grid_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
 
     ctx.user_data["grid_pending_amount"] = amount
     pair = ctx.user_data.get("grid_pending_pair", "")
+    await update.message.reply_text(
+        f"🔢 *عدد الشبكات — {pair} | {amount:.0f} USDT*\n\n"
+        "كم شبكة تريد من كل جانب (شراء + بيع)؟\n"
+        "مثال: `3` يعني 3 أوامر شراء + 3 أوامر بيع = 6 أوامر إجمالاً\n\n"
+        "_النطاق المسموح: 1 إلى 10_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    ctx.user_data["grid_step"] = "count"
+    return AWAIT_GRID_COUNT
+
+
+async def _recv_grid_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip()
+    try:
+        count = int(text)
+        assert 1 <= count <= 10
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً صحيحاً بين 1 و 10 (مثال: `3`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return AWAIT_GRID_COUNT
+
+    ctx.user_data["grid_pending_count"] = count
+    pair   = ctx.user_data.get("grid_pending_pair", "")
+    amount = ctx.user_data.get("grid_pending_amount", 0)
+    await update.message.reply_text(
+        f"📈 *نسبة الخروج العلوي — {pair}*\n\n"
+        "كم % فوق السعر الحالي تريد قبل نقل الشبكة للأعلى؟\n"
+        "مثال: `3` يعني لو السعر ارتفع 3% فوق الحد العلوي للشبكة\n\n"
+        "_النطاق المسموح: 0.5 إلى 50_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    ctx.user_data["grid_step"] = "upper_pct"
+    return AWAIT_GRID_UPPER_PCT
+
+
+async def _recv_grid_upper_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        pct = float(text)
+        assert 0.5 <= pct <= 50
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً بين 0.5 و 50 (مثال: `3`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return AWAIT_GRID_UPPER_PCT
+
+    ctx.user_data["grid_pending_upper_pct"] = pct
+    pair = ctx.user_data.get("grid_pending_pair", "")
+    await update.message.reply_text(
+        f"📉 *نسبة الخروج السفلي — {pair}*\n\n"
+        "كم % تحت السعر الحالي تريد قبل نقل الشبكة للأسفل؟\n"
+        "مثال: `3` يعني لو السعر انخفض 3% تحت الحد السفلي للشبكة\n\n"
+        "_النطاق المسموح: 0.5 إلى 50_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    ctx.user_data["grid_step"] = "lower_pct"
+    return AWAIT_GRID_LOWER_PCT
+
+
+async def _recv_grid_lower_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        pct = float(text)
+        assert 0.5 <= pct <= 50
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً بين 0.5 و 50 (مثال: `3`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return AWAIT_GRID_LOWER_PCT
+
+    ctx.user_data["grid_pending_lower_pct"] = pct
+    pair      = ctx.user_data.get("grid_pending_pair", "")
+    amount    = ctx.user_data.get("grid_pending_amount", 0)
+    count     = ctx.user_data.get("grid_pending_count", 3)
+    upper_pct = ctx.user_data.get("grid_pending_upper_pct", pct)
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🟢 منخفض",  callback_data="gridrisk:low"),
         InlineKeyboardButton("🟡 متوسط",  callback_data="gridrisk:medium"),
         InlineKeyboardButton("🔴 مرتفع",  callback_data="gridrisk:high"),
     ]])
     await update.message.reply_text(
-        f"⚖️ *مستوى المخاطرة — {pair} | {amount:.0f} USDT*\n\nاختر مستوى المخاطرة:",
+        f"⚖️ *مستوى المخاطرة — {pair} | {amount:.0f} USDT | {count}×2 شبكة*\n"
+        f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{pct}%`\n\n"
+        "اختر مستوى المخاطرة:",
         reply_markup=kb,
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -329,32 +469,48 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     engine = ctx.bot_data.get("engine")
     client = ctx.bot_data.get("client")
 
-    lines = ["📊 *حالة بوت الشبكة*\n", "━━━━━━━━━━━━━━━━━━━━"]
-    lines.append("\n🤖 *شبكة AI الذكية (Grid Bot):*")
+    lines = [
+        "📊 *لوحة حالة الشبكات*",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
 
     if engine:
         active_symbols = engine.active_symbols()
         if active_symbols:
-            lines.append(f"  شبكات نشطة: `{len(active_symbols)}`")
+            lines.append(f"🟢 *{len(active_symbols)} شبكة نشطة*\n")
             for sym in active_symbols:
                 try:
+                    state  = engine.get_state(sym)
                     report = engine.calc_profit_report(sym)
                     pnl    = report.get("realized_pnl", 0)
+                    upnl   = report.get("unrealised_pnl", 0)
                     held   = report.get("held_qty", 0)
-                    lines.append(f"  • `{sym}` — ربح: `{pnl:+.4f}` | كمية: `{held:.4f}`")
+                    sells  = report.get("sell_count", 0)
+                    opens  = report.get("open_orders", 0)
+                    pnl_icon = "📈" if pnl >= 0 else "📉"
+                    pending = " ⏳" if (state and state._pending_rebuild) else ""
+                    lines.append(
+                        f"🔹 *{sym}*{pending}\n"
+                        f"  {pnl_icon} محقق: `{pnl:+.4f}` | غير محقق: `{upnl:+.4f}`\n"
+                        f"  🪙 كمية: `{held:.4f}` | ✅ بيع: `{sells}` | 🔓 مفتوح: `{opens}`"
+                    )
                 except Exception:
-                    lines.append(f"  • `{sym}`")
+                    lines.append(f"🔹 *{sym}*")
         else:
-            lines.append("  لا توجد شبكات نشطة حالياً")
+            lines.append("⚪ لا توجد شبكات نشطة حالياً")
     else:
-        lines.append("  محرك الشبكة غير متاح")
+        lines.append("❌ محرك الشبكة غير متاح")
 
     lines.append("\n━━━━━━━━━━━━━━━━━━━━")
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 تحديث",  callback_data="menu:status")],
-        [InlineKeyboardButton("🔙 رجوع",   callback_data="menu:back")],
-    ])
+    symbols = engine.active_symbols() if engine else []
+    detail_rows = [[InlineKeyboardButton(f"🔍 {s}", callback_data=f"detail_{s}")] for s in symbols]
+    kb = InlineKeyboardMarkup(
+        detail_rows + [
+            [InlineKeyboardButton("🔄 تحديث",          callback_data="menu:status"),
+             InlineKeyboardButton("🏠 القائمة",         callback_data="menu:back")],
+        ]
+    )
     await _edit(query, "\n".join(lines), kb)
 
 
@@ -366,8 +522,11 @@ def register_menu_handlers(app: Application) -> None:
             CallbackQueryHandler(_cb_grid, pattern=r"^grid:(new|custom|[A-Z]+/USDT)$"),
         ],
         states={
-            AWAIT_GRID_PAIR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_pair)],
-            AWAIT_GRID_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_amount)],
+            AWAIT_GRID_PAIR:      [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_pair)],
+            AWAIT_GRID_AMOUNT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_amount)],
+            AWAIT_GRID_COUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_count)],
+            AWAIT_GRID_UPPER_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_upper_pct)],
+            AWAIT_GRID_LOWER_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_lower_pct)],
         },
         fallbacks=[
             CommandHandler("menu", cmd_menu),

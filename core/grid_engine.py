@@ -93,17 +93,19 @@ def derive_grid_params(
     total_investment: float,
     client: MexcClient,
     symbol: str,
+    num_grids: int = MAX_ORDERS_PER_SIDE,
 ) -> GridParams:
     """
     Build fixed-spacing grid params.
-    - Range: ±(MAX_ORDERS_PER_SIDE × ORDER_PERCENT) around current_price.
-    - Each order is ORDER_PERCENT apart (compound, so level i = price × (1 ± i × ORDER_PERCENT)).
-    - qty_per_grid = total_investment / grid_count / current_price,
+    - num_grids: orders per side (buys = sells = num_grids).
+    - Range: ±(num_grids × ORDER_PERCENT) around current_price.
+    - qty_per_grid = total_investment / (num_grids*2) / current_price,
       capped at (total_investment / 2) / current_price.
     """
-    grid_count   = MAX_ORDERS_PER_SIDE * 2
-    lower        = current_price * (1 - MAX_ORDERS_PER_SIDE * ORDER_PERCENT)
-    upper        = current_price * (1 + MAX_ORDERS_PER_SIDE * ORDER_PERCENT)
+    n            = max(1, num_grids)
+    grid_count   = n * 2
+    lower        = current_price * (1 - n * ORDER_PERCENT)
+    upper        = current_price * (1 + n * ORDER_PERCENT)
     grid_spacing = current_price * ORDER_PERCENT   # nominal step for reference
 
     raw_qty      = total_investment / grid_count / current_price
@@ -128,6 +130,8 @@ class GridState:
     risk:             str
     total_investment: float
     params:           GridParams
+    upper_pct:        float = 3.0   # % above upper bound that triggers a rebuild
+    lower_pct:        float = 3.0   # % below lower bound that triggers a rebuild
     grid_id:          int = 0
     # order_id → {"side": "buy"|"sell", "price": float, "qty": float}
     open_orders:      dict = field(default_factory=dict)
@@ -137,6 +141,8 @@ class GridState:
     sell_count:       int   = 0
     started_at:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     running:          bool  = True
+    # set to True while waiting for the 1-min candle to close after a breakout
+    _pending_rebuild: bool  = field(default=False, repr=False)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────────
@@ -150,14 +156,25 @@ class GridEngine:
 
     # ── Public ─────────────────────────────────────────────────────────────────
 
-    async def start(self, symbol: str, total_investment: float, risk: str = "medium") -> GridState:
+    async def start(
+        self,
+        symbol: str,
+        total_investment: float,
+        risk: str = "medium",
+        num_grids: int = MAX_ORDERS_PER_SIDE,
+        upper_pct: float = 3.0,
+        lower_pct: float = 3.0,
+    ) -> GridState:
         if symbol in self._grids and self._grids[symbol].running:
             raise ValueError(f"Grid already running for {symbol}")
 
         price  = await self._client.get_current_price(symbol)
-        params = derive_grid_params(price, total_investment, self._client, symbol)
+        params = derive_grid_params(price, total_investment, self._client, symbol, num_grids=num_grids)
 
-        state = GridState(symbol=symbol, risk=risk, total_investment=total_investment, params=params)
+        state = GridState(
+            symbol=symbol, risk=risk, total_investment=total_investment,
+            params=params, upper_pct=upper_pct, lower_pct=lower_pct,
+        )
         self._grids[symbol] = state
 
         grid_id = await db.upsert_grid({
@@ -227,12 +244,12 @@ class GridEngine:
         Per-grid budget = total_investment / (MAX_ORDERS_PER_SIDE * 2).
         """
         cost     = price * qty
-        max_cost = (state.total_investment / (MAX_ORDERS_PER_SIDE * 2)) * 2
+        max_cost = (state.total_investment / state.params.grid_count) * 2
         if cost > max_cost:
             logger.error(
                 "ORDER BLOCKED %s: cost=%.4f USDT exceeds budget cap=%.4f USDT "
                 "(investment=%.2f / %d orders × 2)",
-                state.symbol, cost, max_cost, state.total_investment, MAX_ORDERS_PER_SIDE * 2,
+                state.symbol, cost, max_cost, state.total_investment, state.params.grid_count,
             )
             asyncio.ensure_future(_fire(
                 _notify_error and _notify_error(
@@ -287,14 +304,15 @@ class GridEngine:
             )
 
         # ── Step 2: limit buy orders below fill price ──────────────────────────
-        for i in range(1, MAX_ORDERS_PER_SIDE + 1):
+        n = p.grid_count // 2
+        for i in range(1, n + 1):
             level = self._client.round_price(state.symbol, fill_price * (1 - i * ORDER_PERCENT))
             order = await self._client.place_limit_buy(state.symbol, level, p.qty_per_grid)
             if order:
                 state.open_orders[order["id"]] = {"side": "buy", "price": level, "qty": p.qty_per_grid}
 
         # ── Step 3: limit sell orders above fill price ─────────────────────────
-        for i in range(1, MAX_ORDERS_PER_SIDE + 1):
+        for i in range(1, n + 1):
             level = self._client.round_price(state.symbol, fill_price * (1 + i * ORDER_PERCENT))
             order = await self._client.place_limit_sell(state.symbol, level, p.qty_per_grid)
             if order:
@@ -340,29 +358,87 @@ class GridEngine:
 
     async def _check_recentering(self, state: GridState) -> None:
         """
-        Rebuild the grid around the current price if it has escaped the range.
-        Triggered when: price < params.lower  OR  price > params.upper
+        Trigger a grid rebuild when price breaks out beyond the user-defined
+        threshold (upper_pct above params.upper, or lower_pct below params.lower).
+        The rebuild is deferred until the current 1-minute candle closes, so we
+        avoid reacting to wicks that immediately reverse.
         """
         price = await self._client.get_current_price(state.symbol)
-        if state.params.lower <= price <= state.params.upper:
-            return  # still inside range — nothing to do
 
-        direction = "العلوي" if price > state.params.upper else "السفلي"
+        breakout_upper = price > state.params.upper * (1 + state.upper_pct / 100)
+        breakout_lower = price < state.params.lower * (1 - state.lower_pct / 100)
+
+        if not breakout_upper and not breakout_lower:
+            state._pending_rebuild = False   # price came back — cancel any pending wait
+            return
+
+        if state._pending_rebuild:
+            return  # already waiting for candle close in _wait_and_rebuild
+
+        direction = "العلوي" if breakout_upper else "السفلي"
+        logger.info(
+            "Breakout detected for %s: price=%.4f | upper_trigger=%.4f | lower_trigger=%.4f",
+            state.symbol, price,
+            state.params.upper * (1 + state.upper_pct / 100),
+            state.params.lower * (1 - state.lower_pct / 100),
+        )
+        state._pending_rebuild = True
+        # Fire-and-forget: wait for 1-min candle close then rebuild
+        asyncio.ensure_future(self._wait_and_rebuild(state, direction))
+
+    async def _wait_and_rebuild(self, state: GridState, direction: str) -> None:
+        """
+        Wait until the current 1-minute candle closes, confirm the breakout is
+        still valid on the close price, then rebuild the grid.
+        """
+        import time as _time
+        CANDLE_SECONDS = 60   # 1 minute
+
+        # Seconds remaining until the next 1-min candle boundary
+        now_ts   = _time.time()
+        wait_sec = CANDLE_SECONDS - (now_ts % CANDLE_SECONDS)
+        logger.info(
+            "Waiting %.0fs for 1-min candle close before rebuilding %s",
+            wait_sec, state.symbol,
+        )
+        await asyncio.sleep(wait_sec)
+
+        if not state.running or not state._pending_rebuild:
+            return  # grid was stopped or breakout cancelled while waiting
+
+        # Re-check on the candle close price
+        try:
+            candles = await self._client.fetch_ohlcv(state.symbol, timeframe="1m", limit=2)
+            close_price = float(candles[-1][4]) if candles else await self._client.get_current_price(state.symbol)
+        except Exception:
+            close_price = await self._client.get_current_price(state.symbol)
+
+        still_upper = close_price > state.params.upper * (1 + state.upper_pct / 100)
+        still_lower = close_price < state.params.lower * (1 - state.lower_pct / 100)
+
+        if not still_upper and not still_lower:
+            logger.info(
+                "Breakout cancelled for %s: close_price=%.4f returned inside threshold",
+                state.symbol, close_price,
+            )
+            state._pending_rebuild = False
+            return
+
         old_lower = state.params.lower
         old_upper = state.params.upper
+        state._pending_rebuild = False
 
         logger.info(
-            "Re-centering grid for %s: price=%.4f escaped range [%.4f, %.4f]",
-            state.symbol, price, old_lower, old_upper,
+            "Rebuilding grid for %s after candle close: close=%.4f range was [%.4f, %.4f]",
+            state.symbol, close_price, old_lower, old_upper,
         )
-
-        await self._rebuild(state, price)
+        await self._rebuild(state, close_price)
 
         await _fire(_notify_grid_rebuild and _notify_grid_rebuild(
             state.symbol,
-            f"السعر تجاوز النطاق {direction}",
-            price,
-            price,
+            f"اختراق النطاق {direction} — تم نقل الشبكة بعد إغلاق الشمعة",
+            close_price,
+            close_price,
             state.params.lower,
             state.params.upper,
             state.params.grid_count,
@@ -393,10 +469,11 @@ class GridEngine:
         logger.info("Grid upgraded: %s @ %.4f", symbol, price)
 
     async def _rebuild(self, state: GridState, price: float) -> None:
-        """Cancel all orders and re-place the fixed 3+3 grid around the current price."""
+        """Cancel all orders and re-place the grid around the current price, preserving num_grids."""
         await self._client.cancel_all_orders(state.symbol)
         state.open_orders.clear()
-        params = derive_grid_params(price, state.total_investment, self._client, state.symbol)
+        n      = state.params.grid_count // 2
+        params = derive_grid_params(price, state.total_investment, self._client, state.symbol, num_grids=n)
         state.params = params
         await db.upsert_grid({
             "symbol":       state.symbol,
