@@ -122,9 +122,10 @@ def _active_grid_kb(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 تفاصيل الربح",  callback_data=f"detail_{symbol}"),
          InlineKeyboardButton("🔄 إعادة تشكيل",  callback_data=f"rebuild_{symbol}")],
-        [InlineKeyboardButton("📈 تقارير الفترة", callback_data=f"reports_{symbol}"),
-         InlineKeyboardButton(mute_label,          callback_data=mute_cb)],
-        [InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}")],
+        [InlineKeyboardButton("💰 تعديل الرصيد",  callback_data=f"adjinv_show:{symbol}"),
+         InlineKeyboardButton("📈 تقارير الفترة", callback_data=f"reports_{symbol}")],
+        [InlineKeyboardButton(mute_label,          callback_data=mute_cb),
+         InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")],
     ])
 
@@ -1212,7 +1213,7 @@ def build_application(engine, client) -> Application:
     # ── Catch-all legacy grid callbacks ───────────────────────────────────────
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:|adjinv:|adjinv_show:)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

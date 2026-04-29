@@ -468,6 +468,105 @@ class GridEngine:
         await self._rebuild(state, price)
         logger.info("Grid upgraded: %s @ %.4f", symbol, price)
 
+    async def adjust_investment(
+        self,
+        symbol: str,
+        new_investment: float,
+    ) -> dict:
+        """
+        Change total_investment for a running grid without stopping it.
+
+        - new_investment > current: buys the difference at market, then rebuilds.
+        - new_investment < current: sells enough base currency to cover the
+          difference, then rebuilds.
+        - Rebuilds the grid around the current price with the new budget so
+          qty_per_grid and range are recalculated correctly.
+
+        Returns a dict with keys:
+            old_investment, new_investment, diff_usdt, action, price
+        """
+        state = self._grids.get(symbol)
+        if not state or not state.running:
+            raise ValueError(f"No active grid for {symbol}")
+
+        min_investment = 10.0   # hard floor to avoid dust positions
+        if new_investment < min_investment:
+            raise ValueError(f"الحد الأدنى للاستثمار هو {min_investment} USDT")
+
+        price      = await self._client.get_current_price(symbol)
+        old_inv    = state.total_investment
+        diff_usdt  = new_investment - old_inv   # positive = add, negative = reduce
+
+        action = "unchanged"
+
+        if diff_usdt > 1.0:
+            # ── Increase: buy the extra allocation at market ───────────────────
+            buy_qty = self._client.round_amount(symbol, diff_usdt / price)
+            if buy_qty > 0:
+                order = await self._client.market_buy(symbol, buy_qty)
+                if order:
+                    filled_qty  = float(order.get("filled") or buy_qty)
+                    fill_price  = float(order.get("average") or order.get("price") or price)
+                    # Update average cost
+                    total_cost  = state.avg_buy_price * state.held_qty + fill_price * filled_qty
+                    state.held_qty      += filled_qty
+                    state.avg_buy_price  = total_cost / state.held_qty if state.held_qty else fill_price
+                    await db.record_trade(
+                        symbol, "buy", fill_price, filled_qty,
+                        order.get("id", ""), state.grid_id, pnl=0.0,
+                    )
+                    logger.info(
+                        "adjust_investment BUY %s: +%.4f USDT → qty=%.6f @ %.4f",
+                        symbol, diff_usdt, filled_qty, fill_price,
+                    )
+            action = "increased"
+
+        elif diff_usdt < -1.0:
+            # ── Decrease: sell the freed allocation at market ──────────────────
+            sell_usdt = abs(diff_usdt)
+            sell_qty  = self._client.round_amount(symbol, sell_usdt / price)
+            # Cap at actual holdings so we never oversell
+            sell_qty  = min(sell_qty, state.held_qty)
+            if sell_qty > 0:
+                order = await self._client.market_sell_qty(symbol, sell_qty)
+                if order:
+                    filled_qty = float(order.get("filled") or sell_qty)
+                    fill_price = float(order.get("average") or order.get("price") or price)
+                    pnl = (fill_price - state.avg_buy_price) * filled_qty
+                    state.realized_pnl += pnl
+                    state.held_qty     -= filled_qty
+                    if state.held_qty < 0:
+                        state.held_qty = 0.0
+                    await db.record_trade(
+                        symbol, "sell", fill_price, filled_qty,
+                        order.get("id", ""), state.grid_id, pnl=pnl,
+                    )
+                    logger.info(
+                        "adjust_investment SELL %s: -%.4f USDT → qty=%.6f @ %.4f | pnl=%.4f",
+                        symbol, sell_usdt, filled_qty, fill_price, pnl,
+                    )
+            action = "decreased"
+
+        # ── Update investment and rebuild grid ────────────────────────────────
+        state.total_investment = new_investment
+        await self._rebuild(state, price)
+        await db.upsert_grid({
+            "symbol":           symbol,
+            "total_investment": new_investment,
+        })
+
+        logger.info(
+            "adjust_investment done: %s | %.2f → %.2f USDT | action=%s",
+            symbol, old_inv, new_investment, action,
+        )
+        return {
+            "old_investment": old_inv,
+            "new_investment": new_investment,
+            "diff_usdt":      diff_usdt,
+            "action":         action,
+            "price":          price,
+        }
+
     async def _rebuild(self, state: GridState, price: float) -> None:
         """Cancel all orders and re-place the grid around the current price, preserving num_grids."""
         await self._client.cancel_all_orders(state.symbol)

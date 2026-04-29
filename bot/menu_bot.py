@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
     AWAIT_GRID_COUNT,      # grid bot: number of grids per side (free text)
     AWAIT_GRID_UPPER_PCT,  # grid bot: upper breakout % before rebuild
     AWAIT_GRID_LOWER_PCT,  # grid bot: lower breakout % before rebuild
-) = range(5)
+    AWAIT_ADJUST_INV,      # adjust investment: new amount (free text)
+) = range(6)
 
 POPULAR_PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
@@ -463,6 +464,159 @@ async def _recv_grid_lower_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 
 
 
+# ── Adjust investment ──────────────────────────────────────────────────────────
+
+def _kb_adjust_inv(symbol: str, current: float, usdt_free: float) -> InlineKeyboardMarkup:
+    """Quick-action buttons for investment adjustment."""
+    add10  = round(current * 0.10, 2)
+    add25  = round(current * 0.25, 2)
+    cut25  = round(current * 0.75, 2)   # reduce by 25%
+    cut50  = round(current * 0.50, 2)   # reduce by 50%
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ +10%  (+{add10:.0f}$)",  callback_data=f"adjinv:{symbol}:set:{current + add10:.2f}"),
+         InlineKeyboardButton(f"➕ +25%  (+{add25:.0f}$)",  callback_data=f"adjinv:{symbol}:set:{current + add25:.2f}")],
+        [InlineKeyboardButton(f"➖ -25%  (-{add25:.0f}$)",  callback_data=f"adjinv:{symbol}:set:{cut25:.2f}"),
+         InlineKeyboardButton(f"➖ -50%  (-{cut50:.0f}$)",  callback_data=f"adjinv:{symbol}:set:{cut50:.2f}")],
+        [InlineKeyboardButton(f"💰 رصيد كامل  ({usdt_free:.0f}$)", callback_data=f"adjinv:{symbol}:set:{usdt_free:.2f}")],
+        [InlineKeyboardButton("✏️ مبلغ مخصص",  callback_data=f"adjinv:{symbol}:custom"),
+         InlineKeyboardButton("🔙 رجوع",        callback_data=f"detail_{symbol}")],
+    ])
+
+
+async def _show_adjust_inv(query, ctx, symbol: str) -> None:
+    """Show the investment adjustment screen for a running grid."""
+    engine = ctx.bot_data.get("engine")
+    client = ctx.bot_data.get("client")
+    state  = engine.get_state(symbol) if engine else None
+    if not state:
+        await query.answer("الشبكة غير نشطة.", show_alert=True)
+        return
+    try:
+        usdt_free = await client.get_balance("USDT") if client else 0.0
+    except Exception:
+        usdt_free = 0.0
+    current = state.total_investment
+    await _edit(
+        query,
+        f"💰 *تعديل رصيد شبكة `{symbol}`*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 الاستثمار الحالي: `{current:.2f}` USDT\n"
+        f"🏦 رصيد USDT المتاح: `{usdt_free:.2f}` USDT\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"اختر خياراً أو اضغط *مبلغ مخصص* لإدخال رقم:",
+        _kb_adjust_inv(symbol, current, usdt_free),
+    )
+
+
+async def _cb_adjinv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Handle adjinv:SYMBOL:set:AMOUNT  and  adjinv:SYMBOL:custom callbacks."""
+    query = update.callback_query
+    await query.answer()
+    parts  = query.data.split(":", 3)   # adjinv : symbol : action : [value]
+    symbol = parts[1]
+    action = parts[2]
+
+    if action == "custom":
+        ctx.user_data["adjinv_symbol"] = symbol
+        await _edit(
+            query,
+            f"✏️ *مبلغ مخصص — `{symbol}`*\n\n"
+            f"أرسل المبلغ الجديد بـ USDT:\n"
+            f"• رقم موجب = الاستثمار الكلي الجديد\n"
+            f"• مثال: `300` يعني الشبكة ستعمل بـ 300 USDT\n\n"
+            f"_الحد الأدنى: 10 USDT_",
+            _kb_back(),
+        )
+        return AWAIT_ADJUST_INV
+
+    # action == "set"
+    new_inv = float(parts[3])
+    await _do_adjust(query, ctx, symbol, new_inv)
+    return None
+
+
+async def _recv_adjust_inv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive free-text investment amount for custom adjustment."""
+    if not _authorized(update):
+        return ConversationHandler.END
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        new_inv = float(text)
+        assert new_inv >= 10
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً موجباً لا يقل عن 10 USDT (مثال: `200`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return AWAIT_ADJUST_INV
+
+    symbol = ctx.user_data.get("adjinv_symbol", "")
+    if not symbol:
+        return ConversationHandler.END
+
+    engine = ctx.bot_data.get("engine")
+    if not engine:
+        await update.message.reply_text("❌ محرك الشبكة غير متاح.")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"⏳ جاري تعديل رصيد `{symbol}` إلى `{new_inv:.2f}` USDT…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    try:
+        result = await engine.adjust_investment(symbol, new_inv)
+        action_ar = {"increased": "زيادة ✅", "decreased": "تخفيض ✅", "unchanged": "بدون تغيير"}.get(result["action"], "")
+        diff_sign = "+" if result["diff_usdt"] >= 0 else ""
+        await update.message.reply_text(
+            f"✅ *تم تعديل رصيد `{symbol}`*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 القديم: `{result['old_investment']:.2f}` USDT\n"
+            f"📊 الجديد: `{result['new_investment']:.2f}` USDT\n"
+            f"💱 الفرق: `{diff_sign}{result['diff_usdt']:.2f}` USDT\n"
+            f"🔄 الإجراء: {action_ar}\n"
+            f"💵 السعر: `{result['price']:.4f}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"تمت إعادة بناء الشبكة بالميزانية الجديدة.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ فشل التعديل: `{exc}`", parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+
+async def _do_adjust(query, ctx, symbol: str, new_inv: float) -> None:
+    """Execute investment adjustment from a button press."""
+    engine = ctx.bot_data.get("engine")
+    if not engine:
+        await query.answer("محرك الشبكة غير متاح.", show_alert=True)
+        return
+    await _edit(query, f"⏳ جاري تعديل رصيد `{symbol}` إلى `{new_inv:.2f}` USDT…", _kb_back())
+    try:
+        result  = await engine.adjust_investment(symbol, new_inv)
+        action_ar = {"increased": "زيادة ✅", "decreased": "تخفيض ✅", "unchanged": "بدون تغيير"}.get(result["action"], "")
+        diff_sign = "+" if result["diff_usdt"] >= 0 else ""
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 تعديل مرة أخرى", callback_data=f"adjinv_show:{symbol}"),
+             InlineKeyboardButton("📊 تفاصيل",          callback_data=f"detail_{symbol}")],
+            [InlineKeyboardButton("🏠 القائمة",          callback_data="menu:back")],
+        ])
+        await _edit(
+            query,
+            f"✅ *تم تعديل رصيد `{symbol}`*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 القديم: `{result['old_investment']:.2f}` USDT\n"
+            f"📊 الجديد: `{result['new_investment']:.2f}` USDT\n"
+            f"💱 الفرق: `{diff_sign}{result['diff_usdt']:.2f}` USDT\n"
+            f"🔄 الإجراء: {action_ar}\n"
+            f"💵 السعر: `{result['price']:.4f}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"تمت إعادة بناء الشبكة بالميزانية الجديدة.",
+            kb,
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل التعديل: `{exc}`", _kb_back())
+
+
 # ── status helper ──────────────────────────────────────────────────────────────
 
 async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -527,6 +681,7 @@ def register_menu_handlers(app: Application) -> None:
             AWAIT_GRID_COUNT:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_count)],
             AWAIT_GRID_UPPER_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_upper_pct)],
             AWAIT_GRID_LOWER_PCT: [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_grid_lower_pct)],
+            AWAIT_ADJUST_INV:     [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_adjust_inv)],
         },
         fallbacks=[
             CommandHandler("menu", cmd_menu),
@@ -541,5 +696,10 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(_cb_grid,     pattern=r"^grid:"))
     app.add_handler(CallbackQueryHandler(_cb_gridrisk, pattern=r"^gridrisk:"))
     app.add_handler(CallbackQueryHandler(_cb_gridstop, pattern=r"^gridstop:"))
+    app.add_handler(CallbackQueryHandler(_cb_adjinv,   pattern=r"^adjinv:"))
+    app.add_handler(CallbackQueryHandler(
+        lambda u, c: _show_adjust_inv(u.callback_query, c, u.callback_query.data.split(":", 1)[1]),
+        pattern=r"^adjinv_show:",
+    ))
 
     logger.info("Grid Bot menu handlers registered")
