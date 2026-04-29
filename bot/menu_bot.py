@@ -446,18 +446,39 @@ async def _recv_grid_lower_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     amount    = ctx.user_data.get("grid_pending_amount", 0)
     count     = ctx.user_data.get("grid_pending_count", 3)
     upper_pct = ctx.user_data.get("grid_pending_upper_pct", pct)
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🟢 منخفض",  callback_data="gridrisk:low"),
-        InlineKeyboardButton("🟡 متوسط",  callback_data="gridrisk:medium"),
-        InlineKeyboardButton("🔴 مرتفع",  callback_data="gridrisk:high"),
-    ]])
+    # Launch directly with medium risk — no need to ask
+    risk = "medium"
     await update.message.reply_text(
-        f"⚖️ *مستوى المخاطرة — {pair} | {amount:.0f} USDT | {count}×2 شبكة*\n"
-        f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{pct}%`\n\n"
-        "اختر مستوى المخاطرة:",
-        reply_markup=kb,
+        f"⏳ جاري تشغيل شبكة `{pair}`...",
         parse_mode=ParseMode.MARKDOWN,
     )
+    engine = ctx.bot_data.get("engine")
+    if not engine:
+        await update.message.reply_text("❌ محرك الشبكة غير متاح.")
+        return ConversationHandler.END
+    try:
+        await engine.start(
+            symbol=pair, total_investment=amount, risk=risk,
+            num_grids=count, upper_pct=upper_pct, lower_pct=pct,
+        )
+        ctx.user_data["grid_last_pair"]       = pair
+        ctx.user_data["grid_last_amount"]     = amount
+        ctx.user_data["grid_last_risk"]       = risk
+        ctx.user_data["grid_last_count"]      = count
+        ctx.user_data["grid_last_upper_pct"]  = upper_pct
+        ctx.user_data["grid_last_lower_pct"]  = pct
+        await update.message.reply_text(
+            f"✅ *شبكة AI مُشغَّلة*\n\n"
+            f"🪙 الزوج: `{pair}`\n"
+            f"💵 الاستثمار: `{amount:.0f} USDT`\n"
+            f"🔢 الشبكات: `{count}×2 = {count*2}` أمر\n"
+            f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{pct}%`\n\n"
+            "البوت يعمل الآن ويضع أوامر الشراء والبيع تلقائياً.",
+            reply_markup=_kb_main(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ فشل تشغيل الشبكة: `{exc}`", parse_mode=ParseMode.MARKDOWN)
     return ConversationHandler.END
 
 

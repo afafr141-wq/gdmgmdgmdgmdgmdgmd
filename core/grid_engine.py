@@ -42,11 +42,12 @@ ORDER_PERCENT       = 0.025  # 2.5% spacing between each order
 MAX_ORDERS_PER_SIDE = 3      # 3 buys + 3 sells = 6 total orders per grid
 
 # Notification functions — injected at runtime to avoid circular import
-_notify_buy_filled    = None
-_notify_sell_filled   = None
-_notify_grid_rebuild  = None
+_notify_buy_filled     = None
+_notify_sell_filled    = None
+_notify_grid_rebuild   = None
 _notify_grid_expansion = None
-_notify_error         = None
+_notify_error          = None
+_notify_balance_drift  = None   # called when external purchase detected
 
 
 def set_notifiers(
@@ -55,15 +56,18 @@ def set_notifiers(
     grid_rebuild,
     grid_expansion,
     error,
+    balance_drift=None,
 ) -> None:
     """Called from main.py after both engine and bot are initialised."""
     global _notify_buy_filled, _notify_sell_filled
     global _notify_grid_rebuild, _notify_grid_expansion, _notify_error
-    _notify_buy_filled    = buy_filled
-    _notify_sell_filled   = sell_filled
-    _notify_grid_rebuild  = grid_rebuild
+    global _notify_balance_drift
+    _notify_buy_filled     = buy_filled
+    _notify_sell_filled    = sell_filled
+    _notify_grid_rebuild   = grid_rebuild
     _notify_grid_expansion = grid_expansion
-    _notify_error         = error
+    _notify_error          = error
+    _notify_balance_drift  = balance_drift
 
 
 async def _fire(coro_or_none) -> None:
@@ -143,6 +147,8 @@ class GridState:
     running:          bool  = True
     # set to True while waiting for the 1-min candle to close after a breakout
     _pending_rebuild: bool  = field(default=False, repr=False)
+    # set to True while waiting for user response to a balance-sync prompt
+    _pending_sync:    bool  = field(default=False, repr=False)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────────
@@ -330,7 +336,9 @@ class GridEngine:
     async def _run_loop(self, state: GridState) -> None:
         loop = asyncio.get_event_loop()
         last_hourly_report = loop.time()
+        last_balance_check = loop.time()
         HOURLY = 3600
+        BALANCE_CHECK_INTERVAL = 60  # check for external purchases every 60 s
 
         while state.running:
             try:
@@ -340,6 +348,11 @@ class GridEngine:
                 if now - last_hourly_report >= HOURLY:
                     await self._send_hourly_report(state)
                     last_hourly_report = now
+
+                # Detect external purchases (balance drift)
+                if now - last_balance_check >= BALANCE_CHECK_INTERVAL:
+                    await self._check_balance_drift(state)
+                    last_balance_check = now
 
                 # Re-center grid if price escaped the range
                 await self._check_recentering(state)
@@ -444,6 +457,68 @@ class GridEngine:
             state.params.grid_count,
             0.0,
         ))
+
+    async def _check_balance_drift(self, state: GridState) -> None:
+        """
+        Compare the real exchange balance for the base currency against
+        state.held_qty. If the exchange holds significantly more than the bot
+        tracks, the user likely bought externally — prompt them to sync.
+        """
+        if state._pending_sync:
+            return  # already waiting for user response
+
+        try:
+            base = state.symbol.split("/")[0]
+            real_qty = await self._client.get_balance(base)
+        except Exception as exc:
+            logger.debug("Balance drift check failed for %s: %s", state.symbol, exc)
+            return
+
+        # Threshold: ignore differences smaller than 1% of held_qty or dust < 0.0001
+        threshold = max(state.held_qty * 0.01, 0.0001)
+        drift = real_qty - state.held_qty
+
+        if drift > threshold:
+            logger.info(
+                "Balance drift detected for %s: exchange=%.6f bot=%.6f drift=%.6f",
+                state.symbol, real_qty, state.held_qty, drift,
+            )
+            state._pending_sync = True
+            await _fire(_notify_balance_drift and _notify_balance_drift(
+                state.symbol, state.held_qty, real_qty, drift,
+            ))
+
+    async def sync_balance(self, symbol: str) -> dict:
+        """
+        Update held_qty and avg_buy_price from the real exchange balance.
+        Called when the user confirms they want to sync after an external purchase.
+        Returns a dict with old_qty, new_qty, drift.
+        """
+        state = self._grids.get(symbol)
+        if not state or not state.running:
+            raise ValueError(f"No active grid for {symbol}")
+
+        base = symbol.split("/")[0]
+        real_qty = await self._client.get_balance(base)
+        old_qty  = state.held_qty
+        drift    = real_qty - old_qty
+
+        if drift > 0:
+            # External buy: update avg cost with current price for the extra qty
+            price = await self._client.get_current_price(symbol)
+            total_cost       = state.avg_buy_price * old_qty + price * drift
+            state.held_qty   = real_qty
+            state.avg_buy_price = total_cost / real_qty if real_qty else price
+        else:
+            state.held_qty = max(0.0, real_qty)
+
+        state._pending_sync = False
+        await self._sync_pnl(state)
+        logger.info(
+            "Balance synced for %s: %.6f → %.6f (drift=%.6f)",
+            symbol, old_qty, state.held_qty, drift,
+        )
+        return {"old_qty": old_qty, "new_qty": state.held_qty, "drift": drift}
 
     async def _send_hourly_report(self, state: GridState) -> None:
         try:

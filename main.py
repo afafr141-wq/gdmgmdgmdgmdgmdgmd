@@ -15,6 +15,7 @@ from bot.telegram_bot import (
     notify_grid_rebuild,
     notify_grid_expansion,
     notify_error,
+    notify_balance_drift,
 )
 from utils.db_manager import init_db, close_db, get_all_active_grids
 
@@ -117,6 +118,7 @@ def main() -> None:
         grid_rebuild   = notify_grid_rebuild,
         grid_expansion = notify_grid_expansion,
         error          = notify_error,
+        balance_drift  = notify_balance_drift,
     )
 
     app.bot_data["client"] = client

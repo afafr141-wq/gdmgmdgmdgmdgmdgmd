@@ -124,6 +124,8 @@ def _active_grid_kb(symbol: str) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🔄 إعادة تشكيل",  callback_data=f"rebuild_{symbol}")],
         [InlineKeyboardButton("💰 تعديل الرصيد",  callback_data=f"adjinv_show:{symbol}"),
          InlineKeyboardButton("📈 تقارير الفترة", callback_data=f"reports_{symbol}")],
+        [InlineKeyboardButton("⚙️ تعديل شبكات",   callback_data=f"editgrid_{symbol}"),
+         InlineKeyboardButton("🔄 مزامنة رصيد",   callback_data=f"syncbal_prompt:{symbol}")],
         [InlineKeyboardButton(mute_label,          callback_data=mute_cb),
          InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")],
@@ -775,6 +777,138 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as exc:
             await query.edit_message_text(f"❌ خطأ: {exc}")
 
+    elif data.startswith("syncbal_prompt:"):
+        symbol = data[15:]
+        state = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        try:
+            base = symbol.split("/")[0]
+            real_qty = await _client.get_balance(base)
+        except Exception:
+            real_qty = state.held_qty
+        drift = real_qty - state.held_qty
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ نعم، زامن الرصيد", callback_data=f"syncbal_yes:{symbol}"),
+             InlineKeyboardButton("❌ لا، تجاهل",        callback_data=f"syncbal_no:{symbol}")],
+        ])
+        diff_sign = "+" if drift >= 0 else ""
+        await query.edit_message_text(
+            f"🔄 *مزامنة رصيد — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 رصيد البوت: `{state.held_qty:.6f}`\n"
+            f"🏦 رصيد البورصة: `{real_qty:.6f}`\n"
+            f"📈 فرق: `{diff_sign}{drift:.6f}`\n\n"
+            f"هل تريد مزامنة رصيد البوت مع البورصة؟",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("editgrid_"):
+        symbol = data[9:]
+        state = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        n = state.params.grid_count // 2
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ +1 شبكة",  callback_data=f"gridcount:{symbol}:{n+1}"),
+             InlineKeyboardButton("➖ -1 شبكة",  callback_data=f"gridcount:{symbol}:{max(1,n-1)}")],
+            [InlineKeyboardButton("2 شبكات",  callback_data=f"gridcount:{symbol}:2"),
+             InlineKeyboardButton("3 شبكات",  callback_data=f"gridcount:{symbol}:3"),
+             InlineKeyboardButton("5 شبكات",  callback_data=f"gridcount:{symbol}:5")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")],
+        ])
+        await query.edit_message_text(
+            f"⚙️ *تعديل شبكات — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔢 الشبكات الحالية: `{n}` شراء + `{n}` بيع = `{n*2}` أمر\n\n"
+            f"اختر العدد الجديد لكل جانب:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("gridcount:"):
+        parts  = data.split(":", 2)
+        symbol = parts[1]
+        new_n  = int(parts[2])
+        state  = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        await query.edit_message_text(
+            f"⏳ جاري إعادة بناء شبكة `{_fmt_symbol(symbol)}` بـ `{new_n}×2` أوامر…",
+            parse_mode="Markdown",
+        )
+        try:
+            price = await _client.get_current_price(symbol)
+            # Update grid_count via rebuild with new num_grids
+            from core.grid_engine import derive_grid_params
+            await _engine._client.cancel_all_orders(symbol)
+            state.open_orders.clear()
+            params = derive_grid_params(price, state.total_investment, _engine._client, symbol, num_grids=new_n)
+            state.params = params
+            from utils import db_manager as db
+            await db.upsert_grid({
+                "symbol":       symbol,
+                "lower_price":  params.lower,
+                "upper_price":  params.upper,
+                "grid_count":   params.grid_count,
+                "grid_spacing": params.grid_spacing,
+                "current_atr":  0.0,
+            })
+            await _engine._place_initial_orders(state, price)
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 تفاصيل", callback_data=f"detail_{symbol}"),
+                 InlineKeyboardButton("🏠 القائمة", callback_data="menu_main")],
+            ])
+            await query.edit_message_text(
+                f"✅ *تم تعديل الشبكات — {_fmt_symbol(symbol)}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔢 الشبكات الجديدة: `{new_n}` شراء + `{new_n}` بيع = `{new_n*2}` أمر\n"
+                f"📐 النطاق: `{params.lower:.4f}` ↔ `{params.upper:.4f}`\n"
+                f"📏 الفارق: `{params.grid_spacing:.4f}`",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"❌ فشل التعديل: `{exc}`", parse_mode="Markdown",
+                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")]]))
+
+    elif data.startswith("syncbal_yes:"):
+        symbol = data[12:]
+        try:
+            result = await _engine.sync_balance(symbol)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 تفاصيل", callback_data=f"detail_{symbol}"),
+                                        InlineKeyboardButton("🏠 القائمة", callback_data="menu_main")]])
+            diff_sign = "+" if result["drift"] >= 0 else ""
+            await query.edit_message_text(
+                f"✅ *تمت المزامنة — {_fmt_symbol(symbol)}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 الكمية القديمة: `{result['old_qty']:.6f}`\n"
+                f"📦 الكمية الجديدة: `{result['new_qty']:.6f}`\n"
+                f"📈 الفرق: `{diff_sign}{result['drift']:.6f}`\n\n"
+                f"تم تحديث رصيد البوت من البورصة.",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"❌ فشلت المزامنة: `{exc}`", parse_mode="Markdown",
+                                          reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_main")]]))
+
+    elif data.startswith("syncbal_no:"):
+        symbol = data[11:]
+        # Clear the pending sync flag so the engine won't re-prompt immediately
+        state = _engine.get_state(symbol) if _engine else None
+        if state:
+            state._pending_sync = False
+        await query.edit_message_text(
+            f"❌ *تم تجاهل المزامنة — {_fmt_symbol(symbol)}*\n\nسيستمر البوت بالرصيد المسجّل لديه.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 القائمة", callback_data="menu_main")]]),
+        )
+
     elif data.startswith("reports_"):
         symbol = data[8:]
         await query.edit_message_text(f"📈 *تقارير {symbol}* — اختر الفترة:", parse_mode="Markdown", reply_markup=_reports_kb(symbol))
@@ -1031,6 +1165,40 @@ async def notify_grid_expansion(
         f"💵 السعر الجديد: `{new_price:,.4f}`\n"
         f"📋 نوع الأمر: {side_ar}"
     )
+
+
+async def notify_balance_drift(
+    symbol: str,
+    bot_qty: float,
+    real_qty: float,
+    drift: float,
+) -> None:
+    """Sent when the exchange holds more of a coin than the bot tracks — likely an external buy."""
+    if _is_muted(symbol):
+        return
+    if _dedup_key(symbol, "balance_drift", f"{drift:.6f}"):
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نعم، زامن الرصيد", callback_data=f"syncbal_yes:{symbol}"),
+         InlineKeyboardButton("❌ لا، تجاهل",        callback_data=f"syncbal_no:{symbol}")],
+    ])
+    try:
+        await _application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=(
+                f"🔄 *مزامنة رصيد — {_fmt_symbol(symbol)}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📦 رصيد البوت: `{bot_qty:.6f}`\n"
+                f"🏦 رصيد البورصة: `{real_qty:.6f}`\n"
+                f"📈 فرق: `+{drift:.6f}`\n\n"
+                f"يبدو أنك اشتريت `{_fmt_symbol(symbol)}` خارج البوت.\n"
+                f"هل تريد مزامنة الرصيد مع البورصة؟"
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+    except Exception as exc:
+        logger.error("notify_balance_drift send failed: %s", exc)
 
 
 async def notify_error(
