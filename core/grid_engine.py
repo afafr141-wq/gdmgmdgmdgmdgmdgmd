@@ -2,22 +2,22 @@
 Fixed-Spacing Grid Engine.
 
 Startup:
-  - Places MAX_ORDERS_PER_SIDE (3) limit buys below price, each 1% apart.
-  - Places MAX_ORDERS_PER_SIDE (3) limit sells above price, each 1% apart.
+  - Places MAX_ORDERS_PER_SIDE (3) limit buys below price, each 2.5% apart.
+  - Places MAX_ORDERS_PER_SIDE (3) limit sells above price, each 2.5% apart.
   - No upfront base-currency purchase; capital is deployed only as orders fill.
   - Each order size = total_investment / (MAX_ORDERS_PER_SIDE * 2) / current_price.
 
 Fill handling:
-  - Buy filled  → place sell at fill_price + ORDER_PERCENT, then next buy lower (if under holdings cap).
-  - Sell filled → place buy at fill_price - ORDER_PERCENT (if under holdings cap), then next sell higher.
+  - Buy filled  → place sell at fill_price × 1.025, then next buy lower (if under holdings cap).
+  - Sell filled → place buy at fill_price × 0.975 (if under holdings cap), then next sell higher.
 
 Holdings cap:
   - Max allowed qty = (total_investment / 2) / current_price.
   - No new buy orders are placed once this cap is reached.
 
 Range & re-centering:
-  - Fixed: lower = price × (1 - MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
-           upper = price × (1 + MAX_ORDERS_PER_SIDE × ORDER_PERCENT)
+  - Fixed: lower = price × (1 - 3 × 0.025) = price × 0.925
+           upper = price × (1 + 3 × 0.025) = price × 1.075
   - If the live price escapes the range (price < lower or price > upper),
     all orders are cancelled and the grid is rebuilt around the new price.
   - Checked every FILL_POLL_INTERVAL seconds (same cycle as fill polling).
@@ -38,7 +38,7 @@ from utils import db_manager as db
 logger = logging.getLogger(__name__)
 
 # ── Grid constants ─────────────────────────────────────────────────────────────
-ORDER_PERCENT       = 0.01   # 1% spacing between each order
+ORDER_PERCENT       = 0.025  # 2.5% spacing between each order
 MAX_ORDERS_PER_SIDE = 3      # 3 buys + 3 sells = 6 total orders per grid
 
 # Notification functions — injected at runtime to avoid circular import
