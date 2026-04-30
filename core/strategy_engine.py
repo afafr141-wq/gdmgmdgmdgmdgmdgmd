@@ -2,20 +2,21 @@
 Support & Resistance Strategy Engine.
 
 Logic per active strategy:
-  - Compute 2 support levels (S1 < S2, both below price) and
-    2 resistance levels (R1 < R2, both above price) via pivot-based detection.
-  - Place 2 limit buy orders:
-      BUY  @ S1  (50% of investment)
-      BUY  @ S2  (50% of investment)
-  - On each BUY fill, place/update sell orders:
-      SELL @ R1  (50% of held qty)
-      SELL @ R2  (50% of held qty)
-  - When all sells fill and position is cleared, restart the cycle.
-  - Poll fills every FILL_POLL_INTERVAL seconds.
-  - On a BUY fill: record trade, update held_qty / avg_buy_price.
-  - On a SELL fill: record trade, update realized_pnl.
-  - S/R levels are refreshed every SR_REFRESH_INTERVAL seconds so the
-    strategy adapts to new market structure without manual intervention.
+  - Compute N support levels (S1…SN, all below price) and
+    N resistance levels (R1…RN, all above price) via pivot-based detection.
+    Supports are sorted nearest-first; resistances nearest-first.
+  - Place N limit buy orders, one per support level (equal investment split).
+  - Each buy order is paired with the nearest resistance above that support
+    level as its sell target.
+  - On a BUY fill at Si: place a SELL order at the resistance paired with Si.
+  - On a SELL fill: update realized PnL.
+    • If price has since closed above that resistance (flip condition), the
+      resistance is promoted to a support and a new buy order is placed there.
+    • When all positions are cleared and no open orders remain, restart cycle.
+  - The run loop also checks for resistance flips every poll cycle: if the
+    current price has closed above a resistance level, that level is moved
+    from resistances to supports and buy orders are refreshed.
+  - S/R levels are refreshed every SR_REFRESH_INTERVAL seconds.
   - Notifiers are injected at runtime to avoid circular imports.
 """
 from __future__ import annotations
@@ -71,7 +72,7 @@ class StrategyState:
     levels:           SRLevels
     num_levels:       int   = 2   # number of support/resistance levels per side
     strategy_id:      int   = 0
-    # order_id → {side, price, qty, level: "s1"|"s2"|...|"r1"|"r2"|...}
+    # order_id → {side, price, qty, level: "s1"|"s2"|..., target_resistance: float|None}
     open_orders:      dict  = field(default_factory=dict)
     held_qty:         float = 0.0
     avg_buy_price:    float = 0.0
@@ -80,6 +81,9 @@ class StrategyState:
     sell_count:       int   = 0
     started_at:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     running:          bool  = True
+    # qty held per resistance target: resistance_price → qty waiting to sell there
+    # used to track partial positions when multiple buys target the same resistance
+    _sell_qty_map:    dict  = field(default_factory=dict)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────────
@@ -282,41 +286,117 @@ class StrategyEngine:
             report[f"resistance{i+1}"] = p
         return report
 
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _nearest_resistance_above(self, state: StrategyState, support_price: float) -> float:
+        """
+        Return the nearest resistance level strictly above support_price.
+        Falls back to the lowest resistance if none is strictly above
+        (e.g. price already above all resistances after a flip).
+        """
+        above = [r for r in state.levels.resistances if r > support_price]
+        if above:
+            return min(above)
+        # Fallback: lowest resistance available
+        return min(state.levels.resistances)
+
     # ── Order placement ────────────────────────────────────────────────────────
 
     async def _place_orders(self, state: StrategyState) -> None:
         """
-        Place buy orders at all support levels, split equally across them.
-        Sell orders are placed only after a buy fills — see _place_sell_orders().
+        Place one buy order per support level (equal investment split).
+        Each buy is tagged with its paired resistance target — the nearest
+        resistance strictly above that support.  Sell orders are placed only
+        after a buy fills (see _place_sell_for_buy).
         """
         lv     = state.levels
         inv    = state.total_investment
         symbol = state.symbol
         n      = len(lv.supports)
-        alloc  = inv / n   # equal split across all support levels
+        alloc  = inv / n
 
         for i, price in enumerate(lv.supports):
-            level_name = f"s{i + 1}"
-            qty = self._client.round_amount(symbol, alloc / price)
-            order = await self._client.place_limit_buy(symbol, price, qty)
+            level_name        = f"s{i + 1}"
+            target_resistance = self._nearest_resistance_above(state, price)
+            qty               = self._client.round_amount(symbol, alloc / price)
+            order             = await self._client.place_limit_buy(symbol, price, qty)
             if order:
                 state.open_orders[order["id"]] = {
-                    "side": "buy", "price": price, "qty": qty, "level": level_name,
+                    "side":              "buy",
+                    "price":             price,
+                    "qty":               qty,
+                    "level":             level_name,
+                    "target_resistance": target_resistance,
                 }
-                logger.info("Placed BUY @ %.6f (%s) qty=%.6f alloc=%.2f", price, level_name, qty, alloc)
+                logger.info(
+                    "Placed BUY @ %.6f (%s) qty=%.6f → target R=%.6f",
+                    price, level_name, qty, target_resistance,
+                )
+
+    async def _place_sell_for_buy(
+        self,
+        state: StrategyState,
+        qty: float,
+        target_resistance: float,
+    ) -> None:
+        """
+        Place (or top-up) a sell order at target_resistance for qty coins.
+
+        If an open sell already exists at that price, cancel it and re-place
+        with the combined qty so the order book always shows one clean order
+        per resistance level.
+        """
+        symbol  = state.symbol
+        min_amt = self._client.min_amount(symbol)
+
+        if qty < min_amt:
+            logger.warning(
+                "sell qty %.6f below min %.6f for %s — skipping",
+                qty, min_amt, symbol,
+            )
+            return
+
+        # Find and cancel any existing sell at this resistance
+        existing_qty = 0.0
+        for oid, meta in list(state.open_orders.items()):
+            if meta["side"] == "sell" and abs(meta["price"] - target_resistance) < 1e-12:
+                await self._client.cancel_order(symbol, oid)
+                existing_qty += meta["qty"]
+                state.open_orders.pop(oid, None)
+
+        combined_qty = self._client.round_amount(symbol, existing_qty + qty)
+        if combined_qty < min_amt:
+            return
+
+        # Find resistance label
+        res_label = "r?"
+        for i, r in enumerate(state.levels.resistances):
+            if abs(r - target_resistance) < 1e-12:
+                res_label = f"r{i + 1}"
+                break
+
+        order = await self._client.place_limit_sell(symbol, target_resistance, combined_qty)
+        if order:
+            state.open_orders[order["id"]] = {
+                "side":  "sell",
+                "price": target_resistance,
+                "qty":   combined_qty,
+                "level": res_label,
+            }
+            logger.info(
+                "Placed SELL @ %.6f (%s) qty=%.6f (prev=%.6f + new=%.6f)",
+                target_resistance, res_label, combined_qty, existing_qty, qty,
+            )
 
     async def _place_sell_orders(self, state: StrategyState) -> None:
         """
-        Place sell orders at R1 and R2 based on actual held_qty.
-        Called after every buy fill. Cancels existing sell orders first
-        so qty stays accurate as more buys fill.
+        Legacy helper used by sync_balance and restore: cancel all open sells
+        and re-place based on current held_qty, pairing each resistance with
+        an equal share of the position.
         """
         symbol = state.symbol
         lv     = state.levels
 
-        # Cancel any existing open sell orders before re-placing.
-        # Remove from open_orders regardless of cancel result — if the order
-        # was already filled/cancelled on the exchange, cancel_order returns True.
         for oid, meta in list(state.open_orders.items()):
             if meta["side"] == "sell":
                 await self._client.cancel_order(symbol, oid)
@@ -325,16 +405,14 @@ class StrategyEngine:
         if state.held_qty <= 0:
             return
 
-        # Split held_qty equally across all resistance levels
         n             = len(lv.resistances)
         sell_qty_each = self._client.round_amount(symbol, state.held_qty / n)
         min_amt       = self._client.min_amount(symbol)
 
         for i, price in enumerate(lv.resistances):
             level_name = f"r{i + 1}"
-            qty = sell_qty_each
+            qty        = sell_qty_each
 
-            # If qty too small for split, put everything on first resistance
             if qty < min_amt:
                 if i == 0:
                     qty = self._client.round_amount(symbol, state.held_qty)
@@ -461,13 +539,12 @@ class StrategyEngine:
         old_levels = state.levels
         state.levels = new_levels
 
-        await db.upsert_strategy({
-            "symbol":      state.symbol,
-            "support1":    new_levels.supports[0],
-            "support2":    new_levels.supports[1],
-            "resistance1": new_levels.resistances[0],
-            "resistance2": new_levels.resistances[1],
-        })
+        upsert_data = {"symbol": state.symbol}
+        for i, p in enumerate(new_levels.supports):
+            upsert_data[f"support{i + 1}"] = p
+        for i, p in enumerate(new_levels.resistances):
+            upsert_data[f"resistance{i + 1}"] = p
+        await db.upsert_strategy(upsert_data)
 
         await self._place_orders(state)
         if state.held_qty > 0:
@@ -477,12 +554,61 @@ class StrategyEngine:
             state.symbol, state.timeframe,
             old_levels, new_levels,
         ))
-        logger.info(
-            "S/R refreshed for %s: S=[%.4f,%.4f] R=[%.4f,%.4f]",
-            state.symbol,
-            new_levels.supports[0], new_levels.supports[1],
-            new_levels.resistances[0], new_levels.resistances[1],
-        )
+        sup_str = ", ".join(f"{p:.4f}" for p in new_levels.supports)
+        res_str = ", ".join(f"{p:.4f}" for p in new_levels.resistances)
+        logger.info("S/R refreshed for %s: S=[%s] R=[%s]", state.symbol, sup_str, res_str)
+
+    # ── Flip detection ─────────────────────────────────────────────────────────
+
+    async def _check_flips(self, state: StrategyState) -> None:
+        """
+        Detect resistance levels that price has closed above (flip to support).
+
+        When a resistance is breached:
+          1. Remove it from resistances list.
+          2. Add it to supports list (nearest-first order maintained).
+          3. Cancel all open buy orders and re-place at updated support levels.
+          4. Any open sell orders at the flipped resistance are left in place —
+             if they fill it means price came back down, which is fine.
+        """
+        try:
+            current_price = await self._client.get_current_price(state.symbol)
+        except Exception as exc:
+            logger.warning("flip check: get_current_price failed for %s: %s", state.symbol, exc)
+            return
+
+        lv = state.levels
+        flipped = [r for r in lv.resistances if current_price > r]
+        if not flipped:
+            return
+
+        for r in flipped:
+            logger.info(
+                "FLIP %s: resistance %.6f breached (price=%.6f) → promoted to support",
+                state.symbol, r, current_price,
+            )
+            lv.resistances = [x for x in lv.resistances if abs(x - r) > 1e-12]
+            # Insert into supports, keep sorted nearest-to-price first (descending)
+            lv.supports.append(r)
+            lv.supports.sort(reverse=True)
+
+        if not lv.resistances:
+            # No resistances left — trigger a full S/R refresh
+            logger.info("No resistances left for %s after flip — refreshing S/R", state.symbol)
+            await self._refresh_orders(state)
+            return
+
+        # Cancel pending buy orders and re-place at updated support levels
+        for oid, meta in list(state.open_orders.items()):
+            if meta["side"] == "buy":
+                await self._client.cancel_order(state.symbol, oid)
+                state.open_orders.pop(oid, None)
+
+        await self._place_orders(state)
+
+        await _fire(_notify_sr_refresh and _notify_sr_refresh(
+            state.symbol, state.timeframe, lv, lv,
+        ))
 
     # ── Main loop ──────────────────────────────────────────────────────────────
 
@@ -498,6 +624,9 @@ class StrategyEngine:
                 if now - last_refresh >= SR_REFRESH_INTERVAL:
                     await self._refresh_orders(state)
                     last_refresh = now
+                else:
+                    # Check for resistance→support flips every poll cycle
+                    await self._check_flips(state)
 
                 await self._poll_fills(state)
                 await asyncio.sleep(FILL_POLL_INTERVAL)
@@ -547,15 +676,20 @@ class StrategyEngine:
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else fill_price
             state.buy_count    += 1
 
+            # Determine sell target: use the paired resistance from order meta,
+            # falling back to nearest resistance above fill price.
+            target_resistance = meta.get("target_resistance") or \
+                self._nearest_resistance_above(state, fill_price)
+
             await _fire(_notify_buy_filled and _notify_buy_filled(
                 state.symbol, fill_price, qty, level,
             ))
             logger.info(
-                "BUY filled %s @ %.6f qty=%.6f level=%s | held=%.6f avg=%.6f",
-                state.symbol, fill_price, qty, level, state.held_qty, state.avg_buy_price,
+                "BUY filled %s @ %.6f qty=%.6f level=%s → sell target=%.6f | held=%.6f",
+                state.symbol, fill_price, qty, level, target_resistance, state.held_qty,
             )
-            # Place/update sell orders based on actual held qty
-            await self._place_sell_orders(state)
+            # Place sell at the specific resistance paired with this buy
+            await self._place_sell_for_buy(state, qty, target_resistance)
 
         else:  # sell
             pnl                 = (fill_price - state.avg_buy_price) * qty
@@ -575,14 +709,12 @@ class StrategyEngine:
             #   • no remaining position (within floating-point dust)
             #   • no open sell orders still waiting
             #   • no open buy orders already placed
-            # NOTE: the current order was already removed from open_orders before
-            # _handle_fill was called, so open_sells reflects the remaining sells.
             dust_qty   = self._client.min_amount(state.symbol)
             open_buys  = [m for m in state.open_orders.values() if m["side"] == "buy"]
             open_sells = [m for m in state.open_orders.values() if m["side"] == "sell"]
 
             if state.held_qty <= dust_qty and not open_sells and not open_buys:
-                state.held_qty      = 0.0   # clear floating-point dust
+                state.held_qty      = 0.0
                 state.avg_buy_price = 0.0
                 logger.info("Cycle complete for %s — re-placing buy orders", state.symbol)
                 await self._place_orders(state)

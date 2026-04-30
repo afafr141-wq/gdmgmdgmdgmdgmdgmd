@@ -696,6 +696,33 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _edit(query, "\n".join(lines), kb)
 
 
+# ── S&R helpers ────────────────────────────────────────────────────────────────
+
+def _fmt_sr_levels(supports: list, resistances: list) -> str:
+    """
+    Build a compact multi-line string showing all S/R levels.
+    Each support is paired with its nearest resistance target.
+    """
+    lines = []
+    for i, s in enumerate(supports):
+        # Nearest resistance above this support
+        above = [r for r in resistances if r > s]
+        target = min(above) if above else (min(resistances) if resistances else None)
+        target_str = f" → 🎯 `{target:.6f}`" if target else ""
+        lines.append(f"  🟢 S{i+1}: `{s:.6f}`{target_str}")
+    lines.append("")
+    for i, r in enumerate(resistances):
+        lines.append(f"  🔴 R{i+1}: `{r:.6f}`")
+    return "\n".join(lines)
+
+
+def _fmt_sr_levels_from_report(report: dict) -> str:
+    """Build S/R level text from a calc_report() dict."""
+    supports    = report.get("supports", [])
+    resistances = report.get("resistances", [])
+    return _fmt_sr_levels(supports, resistances)
+
+
 # ── S&R Menu ───────────────────────────────────────────────────────────────────
 
 def _kb_snr_main() -> InlineKeyboardMarkup:
@@ -854,19 +881,15 @@ async def _recv_snr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     )
     try:
         state = await snr_engine.start(symbol=pair, timeframe=tf, total_investment=amount)
-        lv = state.levels
+        lv    = state.levels
         await update.message.reply_text(
             f"✅ *استراتيجية S&R مُشغَّلة*\n\n"
             f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
-            f"💵 الاستثمار: `{amount:.0f}` USDT\n\n"
+            f"💵 الاستثمار: `{amount:.0f}` USDT | 🔢 مستويات: `{state.num_levels}`\n"
+            f"💵 السعر الحالي: `{lv.current_price:.6f}`\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📉 *شراء عند:*\n"
-            f"  🟢 S1: `{lv.supports[0]:.6f}`\n"
-            f"  🟢 S2: `{lv.supports[1]:.6f}`\n\n"
-            f"📈 *بيع عند:*\n"
-            f"  🔴 R1: `{lv.resistances[0]:.6f}`\n"
-            f"  🔴 R2: `{lv.resistances[1]:.6f}`\n\n"
-            f"💵 السعر الحالي: `{lv.current_price:.6f}`",
+            f"📉 *دعوم (شراء) → 🎯 هدف بيع:*\n"
+            f"{_fmt_sr_levels(lv.supports, lv.resistances)}",
             reply_markup=_kb_snr_strategy(pair),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -890,19 +913,21 @@ async def _cb_snrdetail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         upnl  = (price - report["avg_buy_price"]) * report["held_qty"] if report["held_qty"] else 0.0
     except Exception:
         price, upnl = report["current_price"], 0.0
-    total = report["realized_pnl"] + upnl
+    total    = report["realized_pnl"] + upnl
+    sr_lines = _fmt_sr_levels_from_report(report)
     await _edit(query,
         f"📊 *تفاصيل S&R — `{symbol}`*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱ التايم فريم: `{report['timeframe']}`\n"
+        f"⏱ التايم فريم: `{report['timeframe']}` | 🔢 مستويات: `{report['num_levels']}`\n"
         f"💵 الاستثمار: `{report['total_investment']:.2f}` USDT\n"
         f"💵 السعر الحالي: `{price:.6f}`\n\n"
-        f"📉 S1: `{report['support1']:.6f}` | S2: `{report['support2']:.6f}`\n"
-        f"📈 R1: `{report['resistance1']:.6f}` | R2: `{report['resistance2']:.6f}`\n\n"
+        f"📉 *دعوم → 🎯 هدف بيع:*\n"
+        f"{sr_lines}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 الكمية: `{report['held_qty']:.6f}` | متوسط: `{report['avg_buy_price']:.6f}`\n"
         f"✅ شراء: `{report['buy_count']}` | بيع: `{report['sell_count']}`\n"
-        f"🔓 أوامر مفتوحة: `{report['open_orders']}`\n\n"
+        f"🔓 أوامر مفتوحة: `{report['open_orders']}` "
+        f"(شراء: `{report['open_buys']}` | بيع: `{report['open_sells']}`)\n\n"
         f"💹 محقق: `{report['realized_pnl']:+.4f}` | غير محقق: `{upnl:+.4f}`\n"
         f"🏆 الإجمالي: `{total:+.4f}` USDT",
         _kb_snr_strategy(symbol),
@@ -924,8 +949,8 @@ async def _cb_snrrefresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         lv = state.levels
         await _edit(query,
             f"✅ *تم تحديث المستويات — `{symbol}`*\n\n"
-            f"📉 S1: `{lv.supports[0]:.6f}` | S2: `{lv.supports[1]:.6f}`\n"
-            f"📈 R1: `{lv.resistances[0]:.6f}` | R2: `{lv.resistances[1]:.6f}`",
+            f"📉 *دعوم → 🎯 هدف بيع:*\n"
+            f"{_fmt_sr_levels(lv.supports, lv.resistances)}",
             _kb_snr_strategy(symbol),
         )
     except Exception as exc:
@@ -979,10 +1004,8 @@ async def _cb_snredittf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await _edit(query,
             f"✅ *تم تغيير التايم فريم — `{symbol}`*\n\n"
             f"⏱ التايم فريم الجديد: `{new_tf}`\n\n"
-            f"📉 S1: `{lv.supports[0]:.6f}`" +
-            (f" | S2: `{lv.supports[1]:.6f}`" if len(lv.supports) > 1 else "") + "\n"
-            f"📈 R1: `{lv.resistances[0]:.6f}`" +
-            (f" | R2: `{lv.resistances[1]:.6f}`" if len(lv.resistances) > 1 else ""),
+            f"📉 *دعوم → 🎯 هدف بيع:*\n"
+            f"{_fmt_sr_levels(lv.supports, lv.resistances)}",
             _kb_snr_strategy(symbol),
         )
     except Exception as exc:
@@ -1100,14 +1123,12 @@ async def _cb_snreditlevels_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
     try:
         state.num_levels = new_levels
         await snr_engine._refresh_orders(state)
-        lv  = state.levels
-        sup = " | ".join(f"S{i+1}: `{p:.6f}`" for i, p in enumerate(lv.supports))
-        res = " | ".join(f"R{i+1}: `{p:.6f}`" for i, p in enumerate(lv.resistances))
+        lv = state.levels
         await _edit(query,
             f"✅ *تم تغيير عدد المستويات — `{symbol}`*\n\n"
             f"🔢 المستويات الجديدة: `{new_levels}` لكل جانب\n\n"
-            f"📉 {sup}\n"
-            f"📈 {res}",
+            f"📉 *دعوم → 🎯 هدف بيع:*\n"
+            f"{_fmt_sr_levels(lv.supports, lv.resistances)}",
             _kb_snr_strategy(symbol),
         )
     except Exception as exc:

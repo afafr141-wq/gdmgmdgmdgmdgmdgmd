@@ -1272,12 +1272,18 @@ async def notify_snr_sell_filled(symbol: str, price: float, qty: float, pnl: flo
 async def notify_snr_refresh(symbol: str, timeframe: str, old_levels, new_levels) -> None:
     if _is_muted(symbol):
         return
+    sup_lines = "\n".join(
+        f"  🟢 S{i+1}: `{p:.6f}`" for i, p in enumerate(new_levels.supports)
+    )
+    res_lines = "\n".join(
+        f"  🔴 R{i+1}: `{p:.6f}`" for i, p in enumerate(new_levels.resistances)
+    )
     await _send(
         f"🔄 *تحديث مستويات S&R — {_fmt_symbol(symbol)}*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱ التايم فريم: `{timeframe}`\n"
-        f"📉 S1: `{new_levels.supports[0]:.6f}` | S2: `{new_levels.supports[1]:.6f}`\n"
-        f"📈 R1: `{new_levels.resistances[0]:.6f}` | R2: `{new_levels.resistances[1]:.6f}`\n"
+        f"⏱ التايم فريم: `{timeframe}`\n\n"
+        f"📉 *دعوم:*\n{sup_lines}\n\n"
+        f"📈 *مقاومات:*\n{res_lines}\n\n"
         f"🕐 الوقت: `{_now_str()}`"
     )
 
