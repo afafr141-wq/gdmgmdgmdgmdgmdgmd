@@ -40,9 +40,9 @@ FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 SR_LOOKBACK_CANDLES: int    = 300   # candles fetched per S/R computation
 SR_PIVOT_LEFT:       int    = int(os.getenv("SR_PIVOT_LEFT",  "20"))  # bars left  of pivot
 SR_PIVOT_RIGHT:      int    = int(os.getenv("SR_PIVOT_RIGHT", "20"))  # bars right of pivot
-SR_MERGE_THRESHOLD:  float  = float(os.getenv("SR_MERGE_THRESHOLD", "0.3"))  # % proximity merge
-SR_MIN_DISTANCE_PCT: float  = float(os.getenv("SR_MIN_DISTANCE_PCT", "0.5")) # min % distance from current price
-SR_TOUCH_ZONE_PCT:   float  = float(os.getenv("SR_TOUCH_ZONE_PCT",   "0.3")) # % zone around level to count as a touch
+SR_MERGE_THRESHOLD:  float  = float(os.getenv("SR_MERGE_THRESHOLD", "1.0"))  # % proximity merge — levels within 1% merged
+SR_MIN_DISTANCE_PCT: float  = float(os.getenv("SR_MIN_DISTANCE_PCT", "1.0")) # min % distance from current price
+SR_TOUCH_ZONE_PCT:   float  = float(os.getenv("SR_TOUCH_ZONE_PCT",   "0.5")) # % zone around level to count as a touch
 
 
 

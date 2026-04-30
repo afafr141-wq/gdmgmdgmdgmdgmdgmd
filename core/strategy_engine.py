@@ -327,12 +327,26 @@ class StrategyEngine:
         Return the nearest resistance level strictly above support_price.
         Falls back to the lowest resistance if none is strictly above
         (e.g. price already above all resistances after a flip).
+
+        Note: resistances are already sorted ascending (nearest first) by
+        sr_engine, so min(above) always gives the closest one.
         """
         above = [r for r in state.levels.resistances if r > support_price]
         if above:
             return min(above)
-        # Fallback: lowest resistance available
         return min(state.levels.resistances)
+
+    def _resistance_for_support_index(self, state: StrategyState, support_index: int) -> float:
+        """
+        Pair each support with a distinct resistance by index:
+          S1 (index 0, nearest) → R1 (index 0, nearest)
+          S2 (index 1)          → R2 (index 1)
+          ...
+        If there are fewer resistances than supports, wrap around to the last one.
+        """
+        resistances = state.levels.resistances
+        idx = min(support_index, len(resistances) - 1)
+        return resistances[idx]
 
     # ── Order placement ────────────────────────────────────────────────────────
 
@@ -351,7 +365,8 @@ class StrategyEngine:
 
         for i, price in enumerate(lv.supports):
             level_name        = f"s{i + 1}"
-            target_resistance = self._nearest_resistance_above(state, price)
+            # Pair Si with Ri by index: S1→R1, S2→R2, etc.
+            target_resistance = self._resistance_for_support_index(state, i)
             qty               = self._client.round_amount(symbol, alloc / price)
             order             = await self._client.place_limit_buy(symbol, price, qty)
             if order:
@@ -710,10 +725,12 @@ class StrategyEngine:
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else fill_price
             state.buy_count    += 1
 
-            # Determine sell target: use the paired resistance from order meta,
-            # falling back to nearest resistance above fill price.
-            target_resistance = meta.get("target_resistance") or \
-                self._nearest_resistance_above(state, fill_price)
+            # Determine sell target: use the paired resistance stored in order meta.
+            # Fallback: nearest resistance above fill price (e.g. after a flip).
+            target_resistance = (
+                meta.get("target_resistance")
+                or self._nearest_resistance_above(state, fill_price)
+            )
 
             await _fire(_notify_buy_filled and _notify_buy_filled(
                 state.symbol, fill_price, qty, level,

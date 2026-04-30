@@ -596,13 +596,12 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def _fmt_sr_levels(supports: list, resistances: list) -> str:
     """
     Build a compact multi-line string showing all S/R levels.
-    Each support is paired with its nearest resistance target.
+    Supports are sorted nearest-first (descending), resistances nearest-first
+    (ascending). Si is paired with Ri by index: S1→R1, S2→R2, etc.
     """
     lines = []
     for i, s in enumerate(supports):
-        # Nearest resistance above this support
-        above = [r for r in resistances if r > s]
-        target = min(above) if above else (min(resistances) if resistances else None)
+        target = resistances[min(i, len(resistances) - 1)] if resistances else None
         target_str = f" → 🎯 `{target:.6f}`" if target else ""
         lines.append(f"  🟢 S{i+1}: `{s:.6f}`{target_str}")
     lines.append("")

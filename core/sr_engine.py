@@ -187,9 +187,17 @@ def compute_sr_levels(
         )
         return None
 
+    # 6. Sort by price proximity to current price:
+    #    supports    → descending (nearest first, i.e. highest price below current)
+    #    resistances → ascending  (nearest first, i.e. lowest price above current)
+    #    This ensures S1 is the nearest support and R1 is the nearest resistance,
+    #    so each Si is paired with a distinct Ri in order.
+    supports    = sorted(supports[:num_levels],    reverse=True)
+    resistances = sorted(resistances[:num_levels], reverse=False)
+
     return SRLevels(
-        supports      = [round(p, 8) for p in supports[:num_levels]],
-        resistances   = [round(p, 8) for p in resistances[:num_levels]],
+        supports      = [round(p, 8) for p in supports],
+        resistances   = [round(p, 8) for p in resistances],
         current_price = current_price,
         timeframe     = timeframe,
         symbol        = symbol,
