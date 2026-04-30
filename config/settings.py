@@ -42,6 +42,7 @@ SR_PIVOT_LEFT:       int    = int(os.getenv("SR_PIVOT_LEFT",  "20"))  # bars lef
 SR_PIVOT_RIGHT:      int    = int(os.getenv("SR_PIVOT_RIGHT", "20"))  # bars right of pivot
 SR_MERGE_THRESHOLD:  float  = float(os.getenv("SR_MERGE_THRESHOLD", "0.3"))  # % proximity merge
 SR_MIN_DISTANCE_PCT: float  = float(os.getenv("SR_MIN_DISTANCE_PCT", "0.5")) # min % distance from current price
+SR_TOUCH_ZONE_PCT:   float  = float(os.getenv("SR_TOUCH_ZONE_PCT",   "0.3")) # % zone around level to count as a touch
 
 
 
