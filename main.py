@@ -86,10 +86,15 @@ async def _on_startup(application) -> None:
     for row in snr_active:
         symbol = row["symbol"]
         try:
-            await snr_engine.start(
+            await snr_engine.restore(
                 symbol=symbol,
                 timeframe=row["timeframe"],
                 total_investment=float(row["total_investment"]),
+                held_qty=float(row.get("held_qty") or 0),
+                avg_buy_price=float(row.get("avg_buy_price") or 0),
+                realized_pnl=float(row.get("realized_pnl") or 0),
+                buy_count=int(row.get("buy_count") or 0),
+                sell_count=int(row.get("sell_count") or 0),
             )
             snr_recovered += 1
         except Exception as exc:

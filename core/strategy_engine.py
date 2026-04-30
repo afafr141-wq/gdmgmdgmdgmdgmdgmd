@@ -142,6 +142,80 @@ class StrategyEngine:
         )
         return state
 
+    async def restore(
+        self,
+        symbol: str,
+        timeframe: str,
+        total_investment: float,
+        held_qty: float = 0.0,
+        avg_buy_price: float = 0.0,
+        realized_pnl: float = 0.0,
+        buy_count: int = 0,
+        sell_count: int = 0,
+        num_levels: int = 2,
+    ) -> StrategyState:
+        """
+        Restore a strategy from DB after a bot restart.
+
+        Re-fetches S/R levels (market may have moved), restores position state
+        from DB, then re-places orders without resetting PnL or held qty.
+        """
+        if symbol in self._states and self._states[symbol].running:
+            raise ValueError(f"Strategy already running for {symbol}")
+
+        levels = await fetch_sr_levels(self._client, symbol, timeframe, num_levels=num_levels)
+        if not levels:
+            raise ValueError(
+                f"Could not compute S/R levels for {symbol} on {timeframe} during restore."
+            )
+
+        state = StrategyState(
+            symbol=symbol,
+            timeframe=timeframe,
+            total_investment=total_investment,
+            levels=levels,
+            num_levels=num_levels,
+            held_qty=held_qty,
+            avg_buy_price=avg_buy_price,
+            realized_pnl=realized_pnl,
+            buy_count=buy_count,
+            sell_count=sell_count,
+        )
+
+        strategy_id = await db.upsert_strategy({
+            "symbol":      symbol,
+            "timeframe":   timeframe,
+            "support1":    levels.supports[0],
+            "support2":    levels.supports[1],
+            "resistance1": levels.resistances[0],
+            "resistance2": levels.resistances[1],
+        })
+        state.strategy_id = strategy_id
+
+        self._states[symbol] = state
+
+        # Cancel any stale exchange orders from before the restart
+        await self._client.cancel_all_orders(symbol)
+
+        # Re-place buy orders at current S/R levels
+        await self._place_orders(state)
+
+        # If we were holding a position, re-place sell orders too
+        if state.held_qty > 0:
+            await self._place_sell_orders(state)
+
+        self._tasks[symbol] = asyncio.create_task(self._run_loop(state))
+
+        logger.info(
+            "Strategy restored: %s | tf=%s | S=[%.4f,%.4f] R=[%.4f,%.4f] "
+            "| held=%.6f avg=%.6f pnl=%.4f",
+            symbol, timeframe,
+            levels.supports[0], levels.supports[1],
+            levels.resistances[0], levels.resistances[1],
+            held_qty, avg_buy_price, realized_pnl,
+        )
+        return state
+
     async def stop(self, symbol: str, market_sell: bool = True) -> float:
         state = self._states.get(symbol)
         if not state:
@@ -308,38 +382,64 @@ class StrategyEngine:
         old_held      = state.held_qty
         old_avg_price = state.avg_buy_price
 
-        # Merge external balance into state
+        # Qty already locked in open sell orders is reported as "free" by the
+        # exchange only after the sell fills.  Subtract it to avoid counting
+        # the same coins twice when merging into held_qty.
+        locked_in_sells = sum(
+            m["qty"] for m in state.open_orders.values() if m["side"] == "sell"
+        )
+        already_tracked = max(0.0, state.held_qty - locked_in_sells)
+        external_qty    = max(0.0, free_qty - already_tracked)
+
+        if external_qty < min_amt:
+            return {
+                "symbol":       symbol,
+                "base":         base_currency,
+                "free_qty":     free_qty,
+                "old_held_qty": state.held_qty,
+                "new_held_qty": state.held_qty,
+                "synced":       False,
+                "reason":       f"لا يوجد رصيد خارجي إضافي لـ {base_currency} (الرصيد الحر مُحاسَب مسبقاً)",
+            }
+
+        # Merge external qty into state using weighted average price
         if state.held_qty > 0 and state.avg_buy_price > 0:
-            # Weighted average of existing + external qty
-            total_qty         = state.held_qty + free_qty
+            total_qty           = state.held_qty + external_qty
             state.avg_buy_price = (
-                (state.held_qty * state.avg_buy_price + free_qty * current_price)
+                (state.held_qty * state.avg_buy_price + external_qty * current_price)
                 / total_qty
             )
             state.held_qty = total_qty
         else:
-            # No existing position — treat current price as avg buy price
-            state.held_qty      = free_qty
+            state.held_qty      = external_qty
             state.avg_buy_price = current_price
 
-        # Cancel existing sell orders and re-place with updated qty
-        lv = state.levels
-        for oid, meta in list(state.open_orders.items()):
-            if meta["side"] == "sell":
-                await self._client.cancel_order(symbol, oid)
-                state.open_orders.pop(oid, None)
-
+        # Re-place sell orders with updated qty (_place_sell_orders cancels
+        # existing sells internally before placing new ones)
         await self._place_sell_orders(state)
 
+        # Persist updated position to DB
+        await db.update_strategy_state(
+            symbol,
+            held_qty      = state.held_qty,
+            avg_buy_price = state.avg_buy_price,
+            realized_pnl  = state.realized_pnl,
+            buy_count     = state.buy_count,
+            sell_count    = state.sell_count,
+        )
+
         logger.info(
-            "sync_balance %s: free=%.6f old_held=%.6f new_held=%.6f avg_price=%.6f",
-            symbol, free_qty, old_held, state.held_qty, state.avg_buy_price,
+            "sync_balance %s: free=%.6f external=%.6f old_held=%.6f "
+            "new_held=%.6f avg_price=%.6f",
+            symbol, free_qty, external_qty, old_held,
+            state.held_qty, state.avg_buy_price,
         )
 
         return {
             "symbol":         symbol,
             "base":           base_currency,
             "free_qty":       free_qty,
+            "external_qty":   external_qty,
             "old_held_qty":   old_held,
             "old_avg_price":  old_avg_price,
             "new_held_qty":   state.held_qty,
