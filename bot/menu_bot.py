@@ -82,54 +82,14 @@ def _main_menu_text(ctx=None) -> str:
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 شبكة جديدة",        callback_data="menu:grid"),
-         InlineKeyboardButton("📊 حالة الشبكات",      callback_data="menu:status")],
-        [InlineKeyboardButton("📋 قائمة الأزواج",     callback_data="menu_list"),
-         InlineKeyboardButton("📈 تقارير الأرباح",    callback_data="menu_reports")],
-        [InlineKeyboardButton("💼 الرصيد",            callback_data="menu_balance"),
-         InlineKeyboardButton("⚙️ الإعدادات",         callback_data="menu_settings")],
-        [InlineKeyboardButton("🛑 إيقاف شبكة",        callback_data="menu:grid_stop"),
-         InlineKeyboardButton("⛔ إيقاف الكل",        callback_data="menu_stopall")],
-        [InlineKeyboardButton("🔄 ترقية الشبكات",     callback_data="settings_upgradeall"),
-         InlineKeyboardButton("❓ مساعدة",            callback_data="menu_help")],
-        [InlineKeyboardButton("📈 استراتيجية S&R",    callback_data="snr:back")],
+        [InlineKeyboardButton("🚀 شبكة جديدة",     callback_data="menu:grid"),
+         InlineKeyboardButton("🛑 إيقاف شبكة",     callback_data="menu:grid_stop")],
+        [InlineKeyboardButton("🔄 ترقية الشبكات",  callback_data="settings_upgradeall"),
+         InlineKeyboardButton("📈 استراتيجية S&R", callback_data="snr:back")],
     ])
 
 
-def _kb_grid_menu(has_last: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("🚀 تشغيل شبكة جديدة", callback_data="grid:new")],
-    ]
-    if has_last:
-        rows.append([InlineKeyboardButton("⚡ تشغيل بآخر إعدادات", callback_data="grid:last")])
-    rows.append([InlineKeyboardButton("🛑 إيقاف شبكة",  callback_data="grid:stop_menu"),
-                 InlineKeyboardButton("📊 حالة الشبكات", callback_data="menu:status")])
-    rows.append([InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")])
-    return InlineKeyboardMarkup(rows)
 
-
-def _kb_grid_pairs() -> InlineKeyboardMarkup:
-    rows = []
-    for i in range(0, len(POPULAR_PAIRS), 2):
-        row = []
-        for pair in POPULAR_PAIRS[i:i+2]:
-            base = pair.replace("/USDT", "")
-            row.append(InlineKeyboardButton(base, callback_data=f"grid:{pair}"))
-        rows.append(row)
-    rows.append([InlineKeyboardButton("✏️ زوج مخصص", callback_data="grid:custom")])
-    rows.append([InlineKeyboardButton("🔙 رجوع",      callback_data="menu:grid")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _kb_grid_risk() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🟢 منخفض",  callback_data="gridrisk:low"),
-            InlineKeyboardButton("🟡 متوسط",  callback_data="gridrisk:medium"),
-            InlineKeyboardButton("🔴 مرتفع",  callback_data="gridrisk:high"),
-        ],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="menu:grid")],
-    ])
 
 
 
@@ -169,21 +129,12 @@ async def _cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
         return ConversationHandler.END
 
     if action == "grid":
-        has_last = bool(ctx.user_data.get("grid_last_pair"))
-        last_info = ""
-        if has_last:
-            lp = ctx.user_data.get("grid_last_pair", "")
-            la = ctx.user_data.get("grid_last_amount", 0)
-            lr = ctx.user_data.get("grid_last_risk", "medium")
-            lc  = ctx.user_data.get("grid_last_count", 3)
-            lup = ctx.user_data.get("grid_last_upper_pct", 3.0)
-            ldo = ctx.user_data.get("grid_last_lower_pct", 3.0)
-            last_info = f"\n⚡ آخر إعدادات: `{lp}` | `{la} USDT` | `{lc}×2` | `+{lup}%/-{ldo}%` | `{lr}`"
         await _edit(query,
-            f"🤖 *شبكة AI الذكية — Grid Bot*{last_info}\n\nاختر ما تريد:",
-            _kb_grid_menu(has_last=has_last),
+            "🚀 *شبكة جديدة*\n\nأرسل اسم العملة (مثال: `BTC` أو `SOLUSDT`):",
+            _kb_back(),
         )
-        return None
+        ctx.user_data["grid_step"] = "pair"
+        return AWAIT_GRID_PAIR
 
     if action == "status":
         await _show_status(query, ctx)
@@ -212,70 +163,14 @@ async def _cb_grid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[i
 
     if action == "new":
         await _edit(query,
-            "🤖 *شبكة جديدة — اختر الزوج*\n\nاضغط على زوج أو اختر 'مخصص':",
-            _kb_grid_pairs(),
-        )
-        return None
-
-    if action == "last":
-        pair      = ctx.user_data.get("grid_last_pair")
-        amount    = ctx.user_data.get("grid_last_amount")
-        risk      = ctx.user_data.get("grid_last_risk", "medium")
-        num_grids = ctx.user_data.get("grid_last_count", 3)
-        upper_pct = ctx.user_data.get("grid_last_upper_pct", 3.0)
-        lower_pct = ctx.user_data.get("grid_last_lower_pct", 3.0)
-        if not pair or not amount:
-            await query.answer("لا توجد إعدادات سابقة.", show_alert=True)
-            return None
-        await _launch_grid(query, ctx, pair, amount, risk, num_grids, upper_pct, lower_pct)
-        return None
-
-    if action == "custom":
-        await _edit(query,
-            "✏️ *زوج مخصص*\n\nأرسل رمز الزوج (مثال: `SOLUSDT` أو `SOL/USDT`):",
+            "🚀 *شبكة جديدة*\n\nأرسل اسم العملة (مثال: `BTC` أو `SOLUSDT`):",
             _kb_back(),
         )
         ctx.user_data["grid_step"] = "pair"
         return AWAIT_GRID_PAIR
 
-    if action == "stop_menu":
-        engine = ctx.bot_data.get("engine")
-        symbols = engine.active_symbols() if engine else []
-        if not symbols:
-            await query.answer("لا توجد شبكات نشطة.", show_alert=True)
-            return None
-        rows = [[InlineKeyboardButton(f"🛑 {s}", callback_data=f"gridstop:{s}")] for s in symbols]
-        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu:grid")])
-        await _edit(query, "🛑 *اختر الشبكة للإيقاف:*", InlineKeyboardMarkup(rows))
-        return None
-
-    # Pair selected from quick list
-    if "/" in action or action.endswith("USDT"):
-        pair = action if "/" in action else action.replace("USDT", "/USDT")
-        ctx.user_data["grid_pending_pair"] = pair
-        await _edit(query,
-            f"💵 *المبلغ — {pair}*\n\nأرسل مبلغ الاستثمار بـ USDT (مثال: `100`):",
-            _kb_back(),
-        )
-        ctx.user_data["grid_step"] = "amount"
-        return AWAIT_GRID_AMOUNT
-
     return None
 
-
-async def _cb_gridrisk(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    risk      = query.data.split(":")[1]
-    pair      = ctx.user_data.get("grid_pending_pair", "")
-    amount    = ctx.user_data.get("grid_pending_amount", 0)
-    num_grids  = ctx.user_data.get("grid_pending_count", 3)
-    upper_pct  = ctx.user_data.get("grid_pending_upper_pct", 3.0)
-    lower_pct  = ctx.user_data.get("grid_pending_lower_pct", 3.0)
-    if not pair or not amount:
-        await query.answer("بيانات ناقصة، ابدأ من جديد.", show_alert=True)
-        return
-    await _launch_grid(query, ctx, pair, amount, risk, num_grids, upper_pct, lower_pct)
 
 
 async def _cb_gridstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1212,6 +1107,7 @@ async def _cb_snrconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 def register_menu_handlers(app: Application) -> None:
     conv = ConversationHandler(
         entry_points=[
+            CallbackQueryHandler(_cb_menu, pattern=r"^menu:grid$"),
             CallbackQueryHandler(_cb_grid, pattern=r"^grid:(new|custom|[A-Z]+/USDT)$"),
         ],
         states={
@@ -1257,7 +1153,7 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(snr_conv)
     app.add_handler(CallbackQueryHandler(_cb_menu,              pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_cb_grid,              pattern=r"^grid:"))
-    app.add_handler(CallbackQueryHandler(_cb_gridrisk,          pattern=r"^gridrisk:"))
+
     app.add_handler(CallbackQueryHandler(_cb_snredittf,         pattern=r"^snredittf:[^:]+$"))
     app.add_handler(CallbackQueryHandler(_cb_snredittf_set,     pattern=r"^snredittf_set:"))
     app.add_handler(CallbackQueryHandler(_cb_snreditlevels,     pattern=r"^snreditlevels:[^:]+$"))
