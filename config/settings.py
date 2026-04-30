@@ -36,9 +36,13 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
-# ── S/R clustering ─────────────────────────────────────────────────────────────
-SR_LOOKBACK_CANDLES: int    = 200
-SR_CLUSTER_BANDWIDTH: float = 0.005
+# ── S/R detection (LuxAlgo pivot method) ──────────────────────────────────────
+SR_LOOKBACK_CANDLES: int    = 200   # candles fetched per S/R computation
+SR_PIVOT_LEFT:       int    = int(os.getenv("SR_PIVOT_LEFT",  "15"))  # bars left  of pivot
+SR_PIVOT_RIGHT:      int    = int(os.getenv("SR_PIVOT_RIGHT", "15"))  # bars right of pivot
+SR_MERGE_THRESHOLD:  float  = float(os.getenv("SR_MERGE_THRESHOLD", "0.5"))  # % proximity merge
+
+
 
 # ── Auto-Trade Mode defaults ───────────────────────────────────────────────────
 # All values are overridable at runtime via Telegram commands.

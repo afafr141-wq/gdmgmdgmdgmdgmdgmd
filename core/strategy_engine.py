@@ -3,12 +3,14 @@ Support & Resistance Strategy Engine.
 
 Logic per active strategy:
   - Compute 2 support levels (S1 < S2, both below price) and
-    2 resistance levels (R1 < R2, both above price) via KDE clustering.
-  - Place 4 limit orders:
-      BUY  @ S1  (25% of investment)
-      BUY  @ S2  (25% of investment)
-      SELL @ R1  (25% of investment qty)
-      SELL @ R2  (25% of investment qty)
+    2 resistance levels (R1 < R2, both above price) via pivot-based detection.
+  - Place 2 limit buy orders:
+      BUY  @ S1  (50% of investment)
+      BUY  @ S2  (50% of investment)
+  - On each BUY fill, place/update sell orders:
+      SELL @ R1  (50% of held qty)
+      SELL @ R2  (50% of held qty)
+  - When all sells fill and position is cleared, restart the cycle.
   - Poll fills every FILL_POLL_INTERVAL seconds.
   - On a BUY fill: record trade, update held_qty / avg_buy_price.
   - On a SELL fill: record trade, update realized_pnl.
@@ -67,8 +69,9 @@ class StrategyState:
     timeframe:        str
     total_investment: float
     levels:           SRLevels
+    num_levels:       int   = 2   # number of support/resistance levels per side
     strategy_id:      int   = 0
-    # order_id → {side, price, qty, level: "s1"|"s2"|"r1"|"r2"}
+    # order_id → {side, price, qty, level: "s1"|"s2"|...|"r1"|"r2"|...}
     open_orders:      dict  = field(default_factory=dict)
     held_qty:         float = 0.0
     avg_buy_price:    float = 0.0
@@ -94,11 +97,12 @@ class StrategyEngine:
         symbol: str,
         timeframe: str,
         total_investment: float,
+        num_levels: int = 2,
     ) -> StrategyState:
         if symbol in self._states and self._states[symbol].running:
             raise ValueError(f"Strategy already running for {symbol}")
 
-        levels = await fetch_sr_levels(self._client, symbol, timeframe)
+        levels = await fetch_sr_levels(self._client, symbol, timeframe, num_levels=num_levels)
         if not levels:
             raise ValueError(
                 f"Could not compute S/R levels for {symbol} on {timeframe}. "
@@ -110,6 +114,7 @@ class StrategyEngine:
             timeframe=timeframe,
             total_investment=total_investment,
             levels=levels,
+            num_levels=num_levels,
         )
         self._states[symbol] = state
 
@@ -175,14 +180,13 @@ class StrategyEngine:
         if not state:
             return None
         lv = state.levels
-        return {
+        report = {
             "symbol":           symbol,
             "timeframe":        state.timeframe,
             "total_investment": state.total_investment,
-            "support1":         lv.supports[0],
-            "support2":         lv.supports[1],
-            "resistance1":      lv.resistances[0],
-            "resistance2":      lv.resistances[1],
+            "num_levels":       state.num_levels,
+            "supports":         lv.supports,
+            "resistances":      lv.resistances,
             "current_price":    lv.current_price,
             "held_qty":         state.held_qty,
             "avg_buy_price":    state.avg_buy_price,
@@ -197,27 +201,35 @@ class StrategyEngine:
                 1 / 1440,
             ),
         }
+        # Keep legacy keys for backward compatibility with existing menu code
+        for i, p in enumerate(lv.supports):
+            report[f"support{i+1}"] = p
+        for i, p in enumerate(lv.resistances):
+            report[f"resistance{i+1}"] = p
+        return report
 
     # ── Order placement ────────────────────────────────────────────────────────
 
     async def _place_orders(self, state: StrategyState) -> None:
         """
-        Place buy orders at both supports (25% each).
+        Place buy orders at all support levels, split equally across them.
         Sell orders are placed only after a buy fills — see _place_sell_orders().
         """
         lv     = state.levels
         inv    = state.total_investment
         symbol = state.symbol
-        alloc  = inv * 0.25   # 25% per buy order
+        n      = len(lv.supports)
+        alloc  = inv / n   # equal split across all support levels
 
-        for level_name, price in [("s1", lv.supports[0]), ("s2", lv.supports[1])]:
+        for i, price in enumerate(lv.supports):
+            level_name = f"s{i + 1}"
             qty = self._client.round_amount(symbol, alloc / price)
             order = await self._client.place_limit_buy(symbol, price, qty)
             if order:
                 state.open_orders[order["id"]] = {
                     "side": "buy", "price": price, "qty": qty, "level": level_name,
                 }
-                logger.info("Placed BUY @ %.6f (%s) qty=%.6f", price, level_name, qty)
+                logger.info("Placed BUY @ %.6f (%s) qty=%.6f alloc=%.2f", price, level_name, qty, alloc)
 
     async def _place_sell_orders(self, state: StrategyState) -> None:
         """
@@ -228,38 +240,46 @@ class StrategyEngine:
         symbol = state.symbol
         lv     = state.levels
 
-        # Cancel any existing open sell orders before re-placing
+        # Cancel any existing open sell orders before re-placing.
+        # Remove from open_orders regardless of cancel result — if the order
+        # was already filled/cancelled on the exchange, cancel_order returns True.
         for oid, meta in list(state.open_orders.items()):
             if meta["side"] == "sell":
                 await self._client.cancel_order(symbol, oid)
-                del state.open_orders[oid]
+                state.open_orders.pop(oid, None)
 
         if state.held_qty <= 0:
             return
 
-        # Split held_qty equally between R1 and R2
-        sell_qty_each = self._client.round_amount(symbol, state.held_qty / 2)
+        # Split held_qty equally across all resistance levels
+        n             = len(lv.resistances)
+        sell_qty_each = self._client.round_amount(symbol, state.held_qty / n)
+        min_amt       = self._client.min_amount(symbol)
 
-        for level_name, price in [("r1", lv.resistances[0]), ("r2", lv.resistances[1])]:
-            if sell_qty_each < self._client.min_amount(symbol):
-                # Not enough qty for two orders — put everything at R1
-                if level_name == "r1":
-                    sell_qty_each = self._client.round_amount(symbol, state.held_qty)
+        for i, price in enumerate(lv.resistances):
+            level_name = f"r{i + 1}"
+            qty = sell_qty_each
+
+            # If qty too small for split, put everything on first resistance
+            if qty < min_amt:
+                if i == 0:
+                    qty = self._client.round_amount(symbol, state.held_qty)
                 else:
                     break
-            order = await self._client.place_limit_sell(symbol, price, sell_qty_each)
+
+            order = await self._client.place_limit_sell(symbol, price, qty)
             if order:
                 state.open_orders[order["id"]] = {
-                    "side": "sell", "price": price, "qty": sell_qty_each, "level": level_name,
+                    "side": "sell", "price": price, "qty": qty, "level": level_name,
                 }
-                logger.info("Placed SELL @ %.6f (%s) qty=%.6f", price, level_name, sell_qty_each)
+                logger.info("Placed SELL @ %.6f (%s) qty=%.6f", price, level_name, qty)
 
     async def _refresh_orders(self, state: StrategyState) -> None:
         """Cancel all open orders, re-compute S/R, re-place orders."""
         await self._client.cancel_all_orders(state.symbol)
         state.open_orders.clear()
 
-        new_levels = await fetch_sr_levels(self._client, state.symbol, state.timeframe)
+        new_levels = await fetch_sr_levels(self._client, state.symbol, state.timeframe, num_levels=state.num_levels)
         if not new_levels:
             logger.warning("S/R refresh failed for %s — keeping old levels", state.symbol)
             new_levels = state.levels
@@ -323,15 +343,22 @@ class StrategyEngine:
         if not state.open_orders:
             return
         for order_id, meta in list(state.open_orders.items()):
-            order = await self._client.fetch_order(state.symbol, order_id)
+            # Skip if already removed by a concurrent iteration
+            if order_id not in state.open_orders:
+                continue
+            try:
+                order = await self._client.fetch_order(state.symbol, order_id)
+            except Exception as exc:
+                logger.warning("fetch_order failed for %s id=%s: %s", state.symbol, order_id, exc)
+                continue
             if not order:
                 continue
             status = order.get("status", "")
             if status == "closed":
-                del state.open_orders[order_id]
+                state.open_orders.pop(order_id, None)
                 await self._handle_fill(state, meta, order)
             elif status == "canceled":
-                del state.open_orders[order_id]
+                state.open_orders.pop(order_id, None)
 
     async def _handle_fill(self, state: StrategyState, meta: dict, order: dict) -> None:
         side       = meta["side"]
@@ -369,6 +396,22 @@ class StrategyEngine:
                 "SELL filled %s @ %.6f qty=%.6f level=%s | pnl=%.4f realized=%.4f",
                 state.symbol, fill_price, qty, level, pnl, state.realized_pnl,
             )
+
+            # Cycle complete — re-enter with fresh buy orders when:
+            #   • no remaining position (within floating-point dust)
+            #   • no open sell orders still waiting
+            #   • no open buy orders already placed
+            # NOTE: the current order was already removed from open_orders before
+            # _handle_fill was called, so open_sells reflects the remaining sells.
+            dust_qty   = self._client.min_amount(state.symbol)
+            open_buys  = [m for m in state.open_orders.values() if m["side"] == "buy"]
+            open_sells = [m for m in state.open_orders.values() if m["side"] == "sell"]
+
+            if state.held_qty <= dust_qty and not open_sells and not open_buys:
+                state.held_qty      = 0.0   # clear floating-point dust
+                state.avg_buy_price = 0.0
+                logger.info("Cycle complete for %s — re-placing buy orders", state.symbol)
+                await self._place_orders(state)
 
         await db.record_snr_trade(
             state.symbol, side, fill_price, qty,

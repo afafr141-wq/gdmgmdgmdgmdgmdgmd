@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
     AWAIT_ADJUST_INV,      # adjust investment: new amount (free text)
     AWAIT_SNR_PAIR,        # S&R: trading pair
     AWAIT_SNR_AMOUNT,      # S&R: investment amount
-) = range(8)
+    AWAIT_SNR_EDIT_INV,    # S&R: edit investment
+    AWAIT_SNR_EDIT_LEVELS, # S&R: edit number of levels
+) = range(10)
 
 SNR_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
@@ -722,8 +724,11 @@ def _kb_snr_strategy(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 تفاصيل",           callback_data=f"snrdetail:{symbol}"),
          InlineKeyboardButton("🔄 تحديث المستويات",  callback_data=f"snrrefresh:{symbol}")],
-        [InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}"),
-         InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
+        [InlineKeyboardButton("⏱ تغيير التايم فريم", callback_data=f"snredittf:{symbol}"),
+         InlineKeyboardButton("💵 تغيير الرصيد",     callback_data=f"snreditinv:{symbol}")],
+        [InlineKeyboardButton("🔢 عدد المستويات",    callback_data=f"snreditlevels:{symbol}"),
+         InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}")],
+        [InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
     ])
 
 
@@ -926,6 +931,188 @@ async def _cb_snrrefresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await _edit(query, f"❌ فشل التحديث: `{exc}`", _kb_snr_strategy(symbol))
 
 
+async def _cb_snredittf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show timeframe selector to change the active strategy's timeframe."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+    ctx.user_data["snr_edit_symbol"] = symbol
+    ctx.user_data["snr_edit_action"] = "tf"
+
+    rows = []
+    row  = []
+    for tf in SNR_TIMEFRAMES:
+        row.append(InlineKeyboardButton(tf, callback_data=f"snredittf_set:{symbol}:{tf}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"snrdetail:{symbol}")])
+
+    await _edit(query,
+        f"⏱ *تغيير التايم فريم — `{symbol}`*\n\nاختر التايم فريم الجديد:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def _cb_snredittf_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply new timeframe — cancel orders, recompute S/R, re-place orders."""
+    query  = update.callback_query
+    await query.answer()
+    parts  = query.data.split(":", 2)   # snredittf_set : symbol : tf
+    symbol = parts[1]
+    new_tf = parts[2]
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    if not state:
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+
+    await _edit(query, f"⏳ جاري تغيير التايم فريم إلى `{new_tf}`...", _kb_back())
+    try:
+        state.timeframe = new_tf
+        await snr_engine._refresh_orders(state)
+        lv = state.levels
+        await _edit(query,
+            f"✅ *تم تغيير التايم فريم — `{symbol}`*\n\n"
+            f"⏱ التايم فريم الجديد: `{new_tf}`\n\n"
+            f"📉 S1: `{lv.supports[0]:.6f}`" +
+            (f" | S2: `{lv.supports[1]:.6f}`" if len(lv.supports) > 1 else "") + "\n"
+            f"📈 R1: `{lv.resistances[0]:.6f}`" +
+            (f" | R2: `{lv.resistances[1]:.6f}`" if len(lv.resistances) > 1 else ""),
+            _kb_snr_strategy(symbol),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل التغيير: `{exc}`", _kb_snr_strategy(symbol))
+
+
+async def _cb_snreditinv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask user for new investment amount."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+    ctx.user_data["snr_edit_symbol"] = symbol
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    current    = state.total_investment if state else 0
+
+    await _edit(query,
+        f"💵 *تغيير الرصيد — `{symbol}`*\n\n"
+        f"الرصيد الحالي: `{current:.2f}` USDT\n\n"
+        f"أرسل الرصيد الجديد (لا يقل عن 10 USDT):",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"snrdetail:{symbol}")]]),
+    )
+    return AWAIT_SNR_EDIT_INV
+
+
+async def _recv_snr_edit_inv(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Apply new investment amount and re-place orders."""
+    if not _authorized(update):
+        return ConversationHandler.END
+
+    text   = (update.message.text or "").strip()
+    symbol = ctx.user_data.get("snr_edit_symbol", "")
+
+    try:
+        new_inv = float(text)
+        assert new_inv >= 10
+    except (ValueError, AssertionError):
+        await update.message.reply_text(
+            "❌ أدخل رقماً لا يقل عن 10 USDT:", parse_mode=ParseMode.MARKDOWN
+        )
+        return AWAIT_SNR_EDIT_INV
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    if not state:
+        await update.message.reply_text("❌ الاستراتيجية غير نشطة.")
+        return ConversationHandler.END
+
+    old_inv = state.total_investment
+    state.total_investment = new_inv
+
+    # Cancel open buy orders and re-place with new allocation
+    client = ctx.bot_data.get("client")
+    for oid, meta in list(state.open_orders.items()):
+        if meta["side"] == "buy":
+            await client.cancel_order(symbol, oid)
+            state.open_orders.pop(oid, None)
+    await snr_engine._place_orders(state)
+
+    await update.message.reply_text(
+        f"✅ *تم تغيير الرصيد — `{symbol}`*\n\n"
+        f"الرصيد القديم: `{old_inv:.2f}` USDT\n"
+        f"الرصيد الجديد: `{new_inv:.2f}` USDT",
+        reply_markup=_kb_snr_strategy(symbol),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+
+async def _cb_snreditlevels(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show level count selector (1–5)."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    current    = state.num_levels if state else 2
+
+    buttons = [
+        InlineKeyboardButton(
+            f"{'✅ ' if n == current else ''}{n}",
+            callback_data=f"snreditlevels_set:{symbol}:{n}",
+        )
+        for n in range(1, 6)
+    ]
+    kb = InlineKeyboardMarkup([
+        buttons,
+        [InlineKeyboardButton("🔙 رجوع", callback_data=f"snrdetail:{symbol}")],
+    ])
+    await _edit(query,
+        f"🔢 *عدد المستويات — `{symbol}`*\n\n"
+        f"الحالي: `{current}` مستوى لكل جانب\n\n"
+        f"اختر العدد الجديد (1–5):",
+        kb,
+    )
+
+
+async def _cb_snreditlevels_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply new level count — recompute S/R and re-place all orders."""
+    query  = update.callback_query
+    await query.answer()
+    parts      = query.data.split(":", 2)
+    symbol     = parts[1]
+    new_levels = int(parts[2])
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    if not state:
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+
+    await _edit(query, f"⏳ جاري تغيير عدد المستويات إلى `{new_levels}`...", _kb_back())
+    try:
+        state.num_levels = new_levels
+        await snr_engine._refresh_orders(state)
+        lv  = state.levels
+        sup = " | ".join(f"S{i+1}: `{p:.6f}`" for i, p in enumerate(lv.supports))
+        res = " | ".join(f"R{i+1}: `{p:.6f}`" for i, p in enumerate(lv.resistances))
+        await _edit(query,
+            f"✅ *تم تغيير عدد المستويات — `{symbol}`*\n\n"
+            f"🔢 المستويات الجديدة: `{new_levels}` لكل جانب\n\n"
+            f"📉 {sup}\n"
+            f"📈 {res}",
+            _kb_snr_strategy(symbol),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل التغيير: `{exc}`", _kb_snr_strategy(symbol))
+
+
 async def _cb_snrstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -977,12 +1164,18 @@ def register_menu_handlers(app: Application) -> None:
 
     # ── S&R conversation ───────────────────────────────────────────────────────
     snr_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(_cb_snr, pattern=r"^snr:new$")],
+        entry_points=[
+            CallbackQueryHandler(_cb_snr,         pattern=r"^snr:new$"),
+            CallbackQueryHandler(_cb_snreditinv,  pattern=r"^snreditinv:"),
+        ],
         states={
             AWAIT_SNR_PAIR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_pair)],
             AWAIT_SNR_AMOUNT: [
-                CallbackQueryHandler(_cb_snrtf,       pattern=r"^snrtf:"),
+                CallbackQueryHandler(_cb_snrtf,   pattern=r"^snrtf:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_amount),
+            ],
+            AWAIT_SNR_EDIT_INV: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_edit_inv),
             ],
         },
         fallbacks=[
@@ -995,9 +1188,13 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(snr_conv)
-    app.add_handler(CallbackQueryHandler(_cb_menu,           pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(_cb_grid,           pattern=r"^grid:"))
-    app.add_handler(CallbackQueryHandler(_cb_gridrisk,       pattern=r"^gridrisk:"))
+    app.add_handler(CallbackQueryHandler(_cb_menu,              pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_cb_grid,              pattern=r"^grid:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridrisk,          pattern=r"^gridrisk:"))
+    app.add_handler(CallbackQueryHandler(_cb_snredittf,         pattern=r"^snredittf:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(_cb_snredittf_set,     pattern=r"^snredittf_set:"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditlevels,     pattern=r"^snreditlevels:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditlevels_set, pattern=r"^snreditlevels_set:"))
     app.add_handler(CallbackQueryHandler(_cb_gridstop,       pattern=r"^gridstop:"))
     app.add_handler(CallbackQueryHandler(_cb_adjinv,         pattern=r"^adjinv:"))
     app.add_handler(CallbackQueryHandler(
