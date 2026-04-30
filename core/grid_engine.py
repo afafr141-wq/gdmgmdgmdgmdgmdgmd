@@ -271,43 +271,69 @@ class GridEngine:
 
     async def _place_initial_orders(self, state: GridState, price: float) -> None:
         """
-        1. Market-buy half the total buy-side allocation immediately so the bot
-           holds a position from the start and profits if price rises right away.
-           initial_buy_qty = (MAX_ORDERS_PER_SIDE × qty_per_grid) / 2
+        1. Check existing free balance of the base currency.
+           - If the free balance covers ≥ half the investment, use it as the
+             initial position (no market buy needed).
+           - Otherwise market-buy the shortfall up to half the total investment.
 
-        2. Place MAX_ORDERS_PER_SIDE limit buys below the execution price.
-        3. Place MAX_ORDERS_PER_SIDE limit sells above the execution price.
-
-        The pending orders are centred on the actual market-fill price, not the
-        pre-fetch price, so slippage is absorbed correctly.
+        2. Place num_grids limit buys below the fill/current price.
+        3. Place num_grids limit sells above the fill/current price.
         """
-        p = state.params
+        p          = state.params
+        fill_price = price   # fallback
 
-        # ── Step 1: immediate market buy (half of total investment) ───────────
-        initial_buy_qty = self._client.round_amount(
+        # ── Step 1: use existing balance before buying ─────────────────────────
+        base_currency = state.symbol.split("/")[0]
+        try:
+            free_qty = await self._client.get_balance(base_currency)
+        except Exception as exc:
+            logger.warning("Could not fetch %s balance: %s — assuming 0", base_currency, exc)
+            free_qty = 0.0
+
+        target_qty = self._client.round_amount(
             state.symbol,
             (state.total_investment / 2) / price,
         )
-        fill_price = price   # fallback if order response lacks average
-        market_order = await self._client.market_buy(state.symbol, initial_buy_qty)
-        if market_order:
-            filled_qty  = float(market_order.get("filled") or initial_buy_qty)
-            fill_price  = float(market_order.get("average") or market_order.get("price") or price)
-            state.held_qty     += filled_qty
-            state.avg_buy_price = fill_price
+        min_amt = self._client.min_amount(state.symbol)
+
+        if free_qty >= target_qty - min_amt:
+            # Existing balance covers the target — no market buy needed
+            state.held_qty      = min(free_qty, target_qty)
+            state.avg_buy_price = price
             logger.info(
-                "Initial market buy %s: qty=%.6f @ %.6f",
-                state.symbol, filled_qty, fill_price,
-            )
-            await db.record_trade(
-                state.symbol, "buy", fill_price, filled_qty,
-                market_order.get("id", ""), state.grid_id, pnl=0.0,
+                "Initial position from existing balance %s: qty=%.6f @ %.6f (free=%.6f)",
+                state.symbol, state.held_qty, price, free_qty,
             )
         else:
-            logger.warning(
-                "Initial market buy skipped for %s — proceeding with limit orders only",
-                state.symbol,
+            # Buy only the shortfall
+            shortfall_qty = self._client.round_amount(
+                state.symbol, target_qty - max(0.0, free_qty),
             )
+            market_order = None
+            if shortfall_qty >= min_amt:
+                market_order = await self._client.market_buy(state.symbol, shortfall_qty)
+
+            if market_order:
+                filled_qty  = float(market_order.get("filled") or shortfall_qty)
+                fill_price  = float(market_order.get("average") or market_order.get("price") or price)
+                state.held_qty      = free_qty + filled_qty
+                state.avg_buy_price = fill_price
+                logger.info(
+                    "Initial market buy %s: shortfall=%.6f filled=%.6f @ %.6f (pre-existing=%.6f)",
+                    state.symbol, shortfall_qty, filled_qty, fill_price, free_qty,
+                )
+                await db.record_trade(
+                    state.symbol, "buy", fill_price, filled_qty,
+                    market_order.get("id", ""), state.grid_id, pnl=0.0,
+                )
+            else:
+                # Market buy failed or not needed — use whatever we have
+                state.held_qty      = free_qty
+                state.avg_buy_price = price
+                logger.warning(
+                    "Initial market buy skipped for %s — using existing balance %.6f",
+                    state.symbol, free_qty,
+                )
 
         # ── Step 2: limit buy orders below fill price ──────────────────────────
         n = p.grid_count // 2
