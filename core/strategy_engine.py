@@ -202,18 +202,14 @@ class StrategyEngine:
 
     async def _place_orders(self, state: StrategyState) -> None:
         """
-        Place 4 limit orders:
-          BUY  @ S1  25% of investment
-          BUY  @ S2  25% of investment
-          SELL @ R1  25% of held_qty (or estimated qty if nothing held yet)
-          SELL @ R2  25% of held_qty
+        Place buy orders at both supports (25% each).
+        Sell orders are placed only after a buy fills — see _place_sell_orders().
         """
-        lv      = state.levels
-        inv     = state.total_investment
-        symbol  = state.symbol
-        alloc   = inv * 0.25   # 25% per order
+        lv     = state.levels
+        inv    = state.total_investment
+        symbol = state.symbol
+        alloc  = inv * 0.25   # 25% per buy order
 
-        # ── Buy orders at supports ─────────────────────────────────────────────
         for level_name, price in [("s1", lv.supports[0]), ("s2", lv.supports[1])]:
             qty = self._client.round_amount(symbol, alloc / price)
             order = await self._client.place_limit_buy(symbol, price, qty)
@@ -223,15 +219,34 @@ class StrategyEngine:
                 }
                 logger.info("Placed BUY @ %.6f (%s) qty=%.6f", price, level_name, qty)
 
-        # ── Sell orders at resistances ─────────────────────────────────────────
-        # Estimate sell qty: assume full 50% of investment is bought at avg support
-        avg_support = (lv.supports[0] + lv.supports[1]) / 2
-        estimated_held = (inv * 0.50) / avg_support   # qty if both buys fill
-        sell_qty_each  = self._client.round_amount(symbol, estimated_held * 0.50)
+    async def _place_sell_orders(self, state: StrategyState) -> None:
+        """
+        Place sell orders at R1 and R2 based on actual held_qty.
+        Called after every buy fill. Cancels existing sell orders first
+        so qty stays accurate as more buys fill.
+        """
+        symbol = state.symbol
+        lv     = state.levels
+
+        # Cancel any existing open sell orders before re-placing
+        for oid, meta in list(state.open_orders.items()):
+            if meta["side"] == "sell":
+                await self._client.cancel_order(symbol, oid)
+                del state.open_orders[oid]
+
+        if state.held_qty <= 0:
+            return
+
+        # Split held_qty equally between R1 and R2
+        sell_qty_each = self._client.round_amount(symbol, state.held_qty / 2)
 
         for level_name, price in [("r1", lv.resistances[0]), ("r2", lv.resistances[1])]:
-            if sell_qty_each <= 0:
-                continue
+            if sell_qty_each < self._client.min_amount(symbol):
+                # Not enough qty for two orders — put everything at R1
+                if level_name == "r1":
+                    sell_qty_each = self._client.round_amount(symbol, state.held_qty)
+                else:
+                    break
             order = await self._client.place_limit_sell(symbol, price, sell_qty_each)
             if order:
                 state.open_orders[order["id"]] = {
@@ -261,6 +276,8 @@ class StrategyEngine:
         })
 
         await self._place_orders(state)
+        if state.held_qty > 0:
+            await self._place_sell_orders(state)
 
         await _fire(_notify_sr_refresh and _notify_sr_refresh(
             state.symbol, state.timeframe,
@@ -336,6 +353,8 @@ class StrategyEngine:
                 "BUY filled %s @ %.6f qty=%.6f level=%s | held=%.6f avg=%.6f",
                 state.symbol, fill_price, qty, level, state.held_qty, state.avg_buy_price,
             )
+            # Place/update sell orders based on actual held qty
+            await self._place_sell_orders(state)
 
         else:  # sell
             pnl                 = (fill_price - state.avg_buy_price) * qty
