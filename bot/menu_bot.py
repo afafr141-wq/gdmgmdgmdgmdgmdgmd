@@ -727,8 +727,9 @@ def _kb_snr_strategy(symbol: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⏱ تغيير التايم فريم", callback_data=f"snredittf:{symbol}"),
          InlineKeyboardButton("💵 تغيير الرصيد",     callback_data=f"snreditinv:{symbol}")],
         [InlineKeyboardButton("🔢 عدد المستويات",    callback_data=f"snreditlevels:{symbol}"),
-         InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}")],
-        [InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
+         InlineKeyboardButton("🔃 مزامنة الرصيد",   callback_data=f"snrsync:{symbol}")],
+        [InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}"),
+         InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
     ])
 
 
@@ -1113,6 +1114,51 @@ async def _cb_snreditlevels_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await _edit(query, f"❌ فشل التغيير: `{exc}`", _kb_snr_strategy(symbol))
 
 
+async def _cb_snrsync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Sync external balance: fetch free coin balance from exchange and
+    inject it into the active strategy as held position.
+    """
+    query  = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    if not snr_engine or not snr_engine.get_state(symbol):
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+
+    await _edit(query, f"⏳ جاري مزامنة رصيد `{symbol}`...", _kb_back())
+
+    try:
+        r = await snr_engine.sync_balance(symbol)
+    except Exception as exc:
+        await _edit(query, f"❌ فشلت المزامنة: `{exc}`", _kb_snr_strategy(symbol))
+        return
+
+    if not r["synced"]:
+        await _edit(query,
+            f"⚠️ *مزامنة الرصيد — `{symbol}`*\n\n"
+            f"لم يتم المزامنة:\n`{r['reason']}`",
+            _kb_snr_strategy(symbol),
+        )
+        return
+
+    pnl_pct = ((r["current_price"] - r["new_avg_price"]) / r["new_avg_price"] * 100) if r["new_avg_price"] else 0
+
+    await _edit(query,
+        f"✅ *تمت المزامنة — `{symbol}`*\n\n"
+        f"💰 رصيد {r['base']} المكتشف: `{r['free_qty']:.6f}`\n\n"
+        f"📦 الكمية قبل: `{r['old_held_qty']:.6f}`\n"
+        f"📦 الكمية بعد: `{r['new_held_qty']:.6f}`\n\n"
+        f"💲 متوسط سعر الشراء: `{r['new_avg_price']:.6f}`\n"
+        f"💲 السعر الحالي:      `{r['current_price']:.6f}`\n"
+        f"📊 الفرق: `{pnl_pct:+.2f}%`\n\n"
+        f"_تم وضع أوامر البيع عند مستويات المقاومة تلقائياً._",
+        _kb_snr_strategy(symbol),
+    )
+
+
 async def _cb_snrstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1195,6 +1241,7 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(_cb_snredittf_set,     pattern=r"^snredittf_set:"))
     app.add_handler(CallbackQueryHandler(_cb_snreditlevels,     pattern=r"^snreditlevels:[^:]+$"))
     app.add_handler(CallbackQueryHandler(_cb_snreditlevels_set, pattern=r"^snreditlevels_set:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrsync,           pattern=r"^snrsync:"))
     app.add_handler(CallbackQueryHandler(_cb_gridstop,       pattern=r"^gridstop:"))
     app.add_handler(CallbackQueryHandler(_cb_adjinv,         pattern=r"^adjinv:"))
     app.add_handler(CallbackQueryHandler(

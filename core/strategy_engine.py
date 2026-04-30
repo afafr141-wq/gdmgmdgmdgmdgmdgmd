@@ -274,6 +274,80 @@ class StrategyEngine:
                 }
                 logger.info("Placed SELL @ %.6f (%s) qty=%.6f", price, level_name, qty)
 
+    async def sync_balance(self, symbol: str) -> dict:
+        """
+        Fetch the actual free balance of the base currency from the exchange
+        and inject it into the strategy state as if the bot had bought it.
+
+        Use case: user bought the coin manually outside the bot and wants
+        the strategy to manage it.
+
+        Returns a dict with before/after values for display.
+        """
+        state = self._states.get(symbol)
+        if not state:
+            raise ValueError(f"No active strategy for {symbol}")
+
+        # symbol format: ACNUSDT → base = ACN
+        base_currency = symbol.replace("USDT", "").replace("BUSD", "").replace("USDC", "")
+        free_qty      = await self._client.get_balance(base_currency)
+        current_price = await self._client.get_current_price(symbol)
+        min_amt       = self._client.min_amount(symbol)
+
+        if free_qty < min_amt:
+            return {
+                "symbol":       symbol,
+                "base":         base_currency,
+                "free_qty":     free_qty,
+                "old_held_qty": state.held_qty,
+                "new_held_qty": state.held_qty,
+                "synced":       False,
+                "reason":       f"رصيد {base_currency} أقل من الحد الأدنى ({min_amt})",
+            }
+
+        old_held      = state.held_qty
+        old_avg_price = state.avg_buy_price
+
+        # Merge external balance into state
+        if state.held_qty > 0 and state.avg_buy_price > 0:
+            # Weighted average of existing + external qty
+            total_qty         = state.held_qty + free_qty
+            state.avg_buy_price = (
+                (state.held_qty * state.avg_buy_price + free_qty * current_price)
+                / total_qty
+            )
+            state.held_qty = total_qty
+        else:
+            # No existing position — treat current price as avg buy price
+            state.held_qty      = free_qty
+            state.avg_buy_price = current_price
+
+        # Cancel existing sell orders and re-place with updated qty
+        lv = state.levels
+        for oid, meta in list(state.open_orders.items()):
+            if meta["side"] == "sell":
+                await self._client.cancel_order(symbol, oid)
+                state.open_orders.pop(oid, None)
+
+        await self._place_sell_orders(state)
+
+        logger.info(
+            "sync_balance %s: free=%.6f old_held=%.6f new_held=%.6f avg_price=%.6f",
+            symbol, free_qty, old_held, state.held_qty, state.avg_buy_price,
+        )
+
+        return {
+            "symbol":         symbol,
+            "base":           base_currency,
+            "free_qty":       free_qty,
+            "old_held_qty":   old_held,
+            "old_avg_price":  old_avg_price,
+            "new_held_qty":   state.held_qty,
+            "new_avg_price":  state.avg_buy_price,
+            "current_price":  current_price,
+            "synced":         True,
+        }
+
     async def _refresh_orders(self, state: StrategyState) -> None:
         """Cancel all open orders, re-compute S/R, re-place orders."""
         await self._client.cancel_all_orders(state.symbol)
