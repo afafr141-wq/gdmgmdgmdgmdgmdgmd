@@ -34,7 +34,15 @@ logger = logging.getLogger(__name__)
     AWAIT_SNR_AMOUNT,      # S&R: investment amount
     AWAIT_SNR_EDIT_INV,    # S&R: edit investment
     AWAIT_SNR_EDIT_LEVELS, # S&R: edit number of levels
-) = range(10)
+    AWAIT_SNR_MODE,        # S&R: level mode (current/previous/both)
+) = range(11)
+
+# Mode labels for display
+_MODE_LABELS = {
+    "current":  "🟢 الحالية فقط (غير مكسورة)",
+    "previous": "🔵 السابقة فقط (مكسورة / retest)",
+    "both":     "⚪ الحالية + السابقة",
+}
 
 SNR_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 
@@ -594,11 +602,7 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── S&R helpers ────────────────────────────────────────────────────────────────
 
 def _fmt_sr_levels(supports: list, resistances: list) -> str:
-    """
-    Build a compact multi-line string showing all S/R levels.
-    Supports are sorted nearest-first (descending), resistances nearest-first
-    (ascending). Si is paired with Ri by index: S1→R1, S2→R2, etc.
-    """
+    """Plain price list — used when SRLevel objects are unavailable."""
     lines = []
     for i, s in enumerate(supports):
         target = resistances[min(i, len(resistances) - 1)] if resistances else None
@@ -610,11 +614,44 @@ def _fmt_sr_levels(supports: list, resistances: list) -> str:
     return "\n".join(lines)
 
 
+def _fmt_sr_levels_annotated(lv) -> str:
+    """
+    Annotated display using SRLevel objects — shows whether each level is
+    current (unbroken) or previous (broken / retest).
+    """
+    sup_lvls = getattr(lv, "support_levels", [])
+    res_lvls = getattr(lv, "resistance_levels", [])
+
+    # Fallback to plain display if annotation data is missing
+    if not sup_lvls or not res_lvls:
+        return _fmt_sr_levels(lv.supports, lv.resistances)
+
+    lines = []
+    for i, sl in enumerate(sup_lvls):
+        tag    = "🟢 حالي" if sl.is_current else "🔵 سابق"
+        target = res_lvls[min(i, len(res_lvls) - 1)].price if res_lvls else None
+        t_str  = f" → 🎯 `{target:.6f}`" if target else ""
+        lines.append(f"  {tag} S{i+1}: `{sl.price:.6f}`{t_str}")
+    lines.append("")
+    for i, rl in enumerate(res_lvls):
+        tag = "🔴 حالي" if rl.is_current else "🟠 سابق"
+        lines.append(f"  {tag} R{i+1}: `{rl.price:.6f}`")
+    return "\n".join(lines)
+
+
 def _fmt_sr_levels_from_report(report: dict) -> str:
     """Build S/R level text from a calc_report() dict."""
-    supports    = report.get("supports", [])
-    resistances = report.get("resistances", [])
-    return _fmt_sr_levels(supports, resistances)
+    sup_lvls = report.get("support_levels", [])
+    res_lvls = report.get("resistance_levels", [])
+    if sup_lvls and res_lvls:
+        # Build a minimal object to reuse _fmt_sr_levels_annotated
+        class _Lv:
+            support_levels    = sup_lvls
+            resistance_levels = res_lvls
+            supports          = report.get("supports", [])
+            resistances       = report.get("resistances", [])
+        return _fmt_sr_levels_annotated(_Lv())
+    return _fmt_sr_levels(report.get("supports", []), report.get("resistances", []))
 
 
 # ── S&R Menu ───────────────────────────────────────────────────────────────────
@@ -641,6 +678,16 @@ def _kb_snr_tf() -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")])
     return InlineKeyboardMarkup(rows)
 
+
+def _kb_snr_mode(pair: str, tf: str) -> InlineKeyboardMarkup:
+    """Keyboard to choose which level type to trade."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 الحالية فقط",        callback_data=f"snrmode:{pair}:{tf}:current")],
+        [InlineKeyboardButton("🔵 السابقة فقط (retest)", callback_data=f"snrmode:{pair}:{tf}:previous")],
+        [InlineKeyboardButton("⚪ الحالية + السابقة",   callback_data=f"snrmode:{pair}:{tf}:both")],
+        [InlineKeyboardButton("🔙 رجوع",               callback_data="snr:back")],
+    ])
+
 def _kb_snr_strategy(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 تفاصيل",           callback_data=f"snrdetail:{symbol}"),
@@ -648,9 +695,10 @@ def _kb_snr_strategy(symbol: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⏱ تغيير التايم فريم", callback_data=f"snredittf:{symbol}"),
          InlineKeyboardButton("💵 تغيير الرصيد",     callback_data=f"snreditinv:{symbol}")],
         [InlineKeyboardButton("🔢 عدد المستويات",    callback_data=f"snreditlevels:{symbol}"),
-         InlineKeyboardButton("🔃 مزامنة الرصيد",   callback_data=f"snrsync:{symbol}")],
-        [InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}"),
-         InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
+         InlineKeyboardButton("📊 نوع المستويات",    callback_data=f"snreditmode:{symbol}")],
+        [InlineKeyboardButton("🔃 مزامنة الرصيد",   callback_data=f"snrsync:{symbol}"),
+         InlineKeyboardButton("⛔ إيقاف وبيع",       callback_data=f"snrstop:{symbol}")],
+        [InlineKeyboardButton("🔙 رجوع",             callback_data="snr:list")],
     ])
 
 
@@ -730,10 +778,14 @@ async def _cb_snrtf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     pair = ctx.user_data.get("snr_pair", "")
     ctx.user_data["snr_tf"] = tf
     await _edit(query,
-        f"💵 *المبلغ — {pair} | {tf}*\n\nأرسل مبلغ الاستثمار بـ USDT (مثال: `200`):",
-        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")]]),
+        f"📊 *نوع المستويات — `{pair}` | `{tf}`*\n\n"
+        "اختر أي مستويات تريد التداول عليها:\n\n"
+        "🟢 *الحالية* — مستويات لم يكسرها السعر بعد\n"
+        "🔵 *السابقة* — مستويات كسرها السعر (retest)\n"
+        "⚪ *الكل* — الحالية أولاً ثم السابقة",
+        _kb_snr_mode(pair, tf),
     )
-    return AWAIT_SNR_AMOUNT
+    return AWAIT_SNR_MODE
 
 
 async def _recv_snr_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -746,7 +798,27 @@ async def _recv_snr_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         f"⏱ *التايم فريم — {pair}*\n\nاختر التايم فريم لحساب الدعم والمقاومة:",
         reply_markup=_kb_snr_tf(), parse_mode=ParseMode.MARKDOWN,
     )
-    return AWAIT_SNR_AMOUNT  # wait for tf button then amount
+    return AWAIT_SNR_MODE  # wait for tf → mode → amount
+
+
+async def _cb_snrmode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle level-mode selection (current / previous / both)."""
+    query = update.callback_query
+    await query.answer()
+    # callback_data = "snrmode:{pair}:{tf}:{mode}"
+    parts = query.data.split(":", 3)
+    pair, tf, mode = parts[1], parts[2], parts[3]
+    ctx.user_data["snr_pair"] = pair
+    ctx.user_data["snr_tf"]   = tf
+    ctx.user_data["snr_mode"] = mode
+    mode_label = _MODE_LABELS.get(mode, mode)
+    await _edit(query,
+        f"💵 *المبلغ — `{pair}` | `{tf}`*\n"
+        f"📊 النوع: {mode_label}\n\n"
+        f"أرسل مبلغ الاستثمار بـ USDT (مثال: `200`):",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="snr:back")]]),
+    )
+    return AWAIT_SNR_AMOUNT
 
 
 async def _recv_snr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
@@ -764,6 +836,7 @@ async def _recv_snr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
 
     pair = ctx.user_data.get("snr_pair", "")
     tf   = ctx.user_data.get("snr_tf", "1h")
+    mode = ctx.user_data.get("snr_mode", "both")
     snr_engine = ctx.bot_data.get("snr_engine")
     if not snr_engine:
         await update.message.reply_text("❌ محرك S&R غير متاح.")
@@ -774,16 +847,19 @@ async def _recv_snr_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
         parse_mode=ParseMode.MARKDOWN,
     )
     try:
-        state = await snr_engine.start(symbol=pair, timeframe=tf, total_investment=amount)
-        lv    = state.levels
+        state = await snr_engine.start(
+            symbol=pair, timeframe=tf, total_investment=amount, mode=mode
+        )
+        lv = state.levels
         await update.message.reply_text(
             f"✅ *استراتيجية S&R مُشغَّلة*\n\n"
             f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
             f"💵 الاستثمار: `{amount:.0f}` USDT | 🔢 مستويات: `{state.num_levels}`\n"
+            f"📊 النوع: {_MODE_LABELS.get(mode, mode)}\n"
             f"💵 السعر الحالي: `{lv.current_price:.6f}`\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"📉 *دعوم (شراء) → 🎯 هدف بيع:*\n"
-            f"{_fmt_sr_levels(lv.supports, lv.resistances)}",
+            f"{_fmt_sr_levels_annotated(lv)}",
             reply_markup=_kb_snr_strategy(pair),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -808,11 +884,13 @@ async def _cb_snrdetail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         price, upnl = report["current_price"], 0.0
     total    = report["realized_pnl"] + upnl
-    sr_lines = _fmt_sr_levels_from_report(report)
+    sr_lines   = _fmt_sr_levels_from_report(report)
+    mode_label = _MODE_LABELS.get(report.get("mode", "both"), "⚪ الكل")
     await _edit(query,
         f"📊 *تفاصيل S&R — `{symbol}`*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"⏱ التايم فريم: `{report['timeframe']}` | 🔢 مستويات: `{report['num_levels']}`\n"
+        f"📊 النوع: {mode_label}\n"
         f"💵 الاستثمار: `{report['total_investment']:.2f}` USDT\n"
         f"💵 السعر الحالي: `{price:.6f}`\n\n"
         f"📉 *دعوم → 🎯 هدف بيع:*\n"
@@ -1029,6 +1107,68 @@ async def _cb_snreditlevels_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) 
         await _edit(query, f"❌ فشل التغيير: `{exc}`", _kb_snr_strategy(symbol))
 
 
+async def _cb_snreditmode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show mode selector for an active strategy."""
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    current    = state.mode if state else "both"
+
+    rows = []
+    for mode_key, mode_label in _MODE_LABELS.items():
+        tick = "✅ " if mode_key == current else ""
+        rows.append([InlineKeyboardButton(
+            f"{tick}{mode_label}",
+            callback_data=f"snreditmode_set:{symbol}:{mode_key}",
+        )])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"snrdetail:{symbol}")])
+    await _edit(query,
+        f"📊 *نوع المستويات — `{symbol}`*\n\n"
+        f"الحالي: {_MODE_LABELS.get(current, current)}\n\n"
+        "🟢 *الحالية* — مستويات لم يكسرها السعر بعد\n"
+        "🔵 *السابقة* — مستويات كسرها السعر (retest)\n"
+        "⚪ *الكل* — الحالية أولاً ثم السابقة\n\n"
+        "اختر النوع الجديد:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def _cb_snreditmode_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply new mode — recompute S/R with the chosen level type."""
+    query  = update.callback_query
+    await query.answer()
+    parts    = query.data.split(":", 2)
+    symbol   = parts[1]
+    new_mode = parts[2]
+
+    snr_engine = ctx.bot_data.get("snr_engine")
+    state      = snr_engine.get_state(symbol) if snr_engine else None
+    if not state:
+        await query.answer("الاستراتيجية غير نشطة.", show_alert=True)
+        return
+
+    await _edit(query,
+        f"⏳ جاري تغيير نوع المستويات إلى {_MODE_LABELS.get(new_mode, new_mode)}...",
+        _kb_back(),
+    )
+    try:
+        state.mode = new_mode
+        await snr_engine._refresh_orders(state)
+        lv = state.levels
+        await _edit(query,
+            f"✅ *تم تغيير نوع المستويات — `{symbol}`*\n\n"
+            f"📊 النوع الجديد: {_MODE_LABELS.get(new_mode, new_mode)}\n\n"
+            f"📉 *دعوم → 🎯 هدف بيع:*\n"
+            f"{_fmt_sr_levels_annotated(lv)}",
+            _kb_snr_strategy(symbol),
+        )
+    except Exception as exc:
+        await _edit(query, f"❌ فشل التغيير: `{exc}`", _kb_snr_strategy(symbol))
+
+
 async def _cb_snrsync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Sync external balance: fetch free coin balance from exchange and
@@ -1131,9 +1271,17 @@ def register_menu_handlers(app: Application) -> None:
             CallbackQueryHandler(_cb_snreditinv,  pattern=r"^snreditinv:"),
         ],
         states={
-            AWAIT_SNR_PAIR:   [MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_pair)],
+            AWAIT_SNR_PAIR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_pair),
+            ],
+            AWAIT_SNR_MODE: [
+                # tf selection leads here → mode selection
+                CallbackQueryHandler(_cb_snrtf,    pattern=r"^snrtf:"),
+                CallbackQueryHandler(_cb_snrmode,  pattern=r"^snrmode:"),
+            ],
             AWAIT_SNR_AMOUNT: [
-                CallbackQueryHandler(_cb_snrtf,   pattern=r"^snrtf:"),
+                # mode selection leads here → amount text
+                CallbackQueryHandler(_cb_snrmode,  pattern=r"^snrmode:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_snr_amount),
             ],
             AWAIT_SNR_EDIT_INV: [
@@ -1150,21 +1298,23 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(snr_conv)
-    app.add_handler(CallbackQueryHandler(_cb_menu,              pattern=r"^menu:"))
-    app.add_handler(CallbackQueryHandler(_cb_grid,              pattern=r"^grid:"))
+    app.add_handler(CallbackQueryHandler(_cb_menu,  pattern=r"^menu:"))
+    app.add_handler(CallbackQueryHandler(_cb_grid,  pattern=r"^grid:"))
 
-    app.add_handler(CallbackQueryHandler(_cb_snredittf,         pattern=r"^snredittf:[^:]+$"))
-    app.add_handler(CallbackQueryHandler(_cb_snredittf_set,     pattern=r"^snredittf_set:"))
-    app.add_handler(CallbackQueryHandler(_cb_snreditlevels,     pattern=r"^snreditlevels:[^:]+$"))
-    app.add_handler(CallbackQueryHandler(_cb_snreditlevels_set, pattern=r"^snreditlevels_set:"))
-    app.add_handler(CallbackQueryHandler(_cb_snrsync,           pattern=r"^snrsync:"))
-    app.add_handler(CallbackQueryHandler(_cb_gridstop,       pattern=r"^gridstop:"))
-    app.add_handler(CallbackQueryHandler(_cb_adjinv,         pattern=r"^adjinv:"))
+    app.add_handler(CallbackQueryHandler(_cb_snredittf,          pattern=r"^snredittf:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(_cb_snredittf_set,      pattern=r"^snredittf_set:"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditlevels,      pattern=r"^snreditlevels:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditlevels_set,  pattern=r"^snreditlevels_set:"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditmode,        pattern=r"^snreditmode:[^:]+$"))
+    app.add_handler(CallbackQueryHandler(_cb_snreditmode_set,    pattern=r"^snreditmode_set:"))
+    app.add_handler(CallbackQueryHandler(_cb_snrsync,            pattern=r"^snrsync:"))
+    app.add_handler(CallbackQueryHandler(_cb_gridstop,           pattern=r"^gridstop:"))
+    app.add_handler(CallbackQueryHandler(_cb_adjinv,             pattern=r"^adjinv:"))
     app.add_handler(CallbackQueryHandler(
         lambda u, c: _show_adjust_inv(u.callback_query, c, u.callback_query.data.split(":", 1)[1]),
         pattern=r"^adjinv_show:",
     ))
-    # S&R callbacks
+    # S&R callbacks (broad patterns last)
     app.add_handler(CallbackQueryHandler(_cb_snr,            pattern=r"^snr:"))
     app.add_handler(CallbackQueryHandler(_cb_snrdetail,      pattern=r"^snrdetail:"))
     app.add_handler(CallbackQueryHandler(_cb_snrrefresh,     pattern=r"^snrrefresh:"))

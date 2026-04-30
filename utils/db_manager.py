@@ -113,6 +113,7 @@ async def _create_tables() -> None:
                 support2         NUMERIC NOT NULL,
                 resistance1      NUMERIC NOT NULL,
                 resistance2      NUMERIC NOT NULL,
+                level_mode       TEXT NOT NULL DEFAULT 'both',
                 held_qty         NUMERIC DEFAULT 0,
                 avg_buy_price    NUMERIC DEFAULT 0,
                 realized_pnl     NUMERIC DEFAULT 0,
@@ -135,6 +136,12 @@ async def _create_tables() -> None:
                 level       TEXT DEFAULT '',
                 executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+        """)
+    # Migrate existing databases: add level_mode column if absent
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            ALTER TABLE active_strategies
+                ADD COLUMN IF NOT EXISTS level_mode TEXT NOT NULL DEFAULT 'both';
         """)
     logger.debug("Tables verified / created")
 
@@ -338,6 +345,7 @@ async def upsert_strategy(data: dict) -> int:
         "support2":         float(data.get("support2", 0)),
         "resistance1":      float(data.get("resistance1", 0)),
         "resistance2":      float(data.get("resistance2", 0)),
+        "level_mode":       str(data.get("level_mode", "both")),
         "is_active":        bool(data.get("is_active", True)),
     }
     async with pool.acquire() as conn:
@@ -345,22 +353,34 @@ async def upsert_strategy(data: dict) -> int:
             """
             INSERT INTO active_strategies
                 (symbol, timeframe, total_investment,
-                 support1, support2, resistance1, resistance2, is_active)
-            VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, $6::numeric, $7::numeric, $8)
+                 support1, support2, resistance1, resistance2, level_mode, is_active)
+            VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric,
+                    $6::numeric, $7::numeric, $8, $9)
             ON CONFLICT (symbol) DO UPDATE SET
-                timeframe        = COALESCE(EXCLUDED.timeframe, active_strategies.timeframe),
-                total_investment = CASE WHEN $3::numeric > 0 THEN $3::numeric ELSE active_strategies.total_investment END,
-                support1         = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE active_strategies.support1 END,
-                support2         = CASE WHEN $5::numeric > 0 THEN $5::numeric ELSE active_strategies.support2 END,
-                resistance1      = CASE WHEN $6::numeric > 0 THEN $6::numeric ELSE active_strategies.resistance1 END,
-                resistance2      = CASE WHEN $7::numeric > 0 THEN $7::numeric ELSE active_strategies.resistance2 END,
+                timeframe        = COALESCE(EXCLUDED.timeframe,        active_strategies.timeframe),
+                total_investment = CASE WHEN $3::numeric > 0
+                                        THEN $3::numeric
+                                        ELSE active_strategies.total_investment END,
+                support1         = CASE WHEN $4::numeric > 0
+                                        THEN $4::numeric
+                                        ELSE active_strategies.support1 END,
+                support2         = CASE WHEN $5::numeric > 0
+                                        THEN $5::numeric
+                                        ELSE active_strategies.support2 END,
+                resistance1      = CASE WHEN $6::numeric > 0
+                                        THEN $6::numeric
+                                        ELSE active_strategies.resistance1 END,
+                resistance2      = CASE WHEN $7::numeric > 0
+                                        THEN $7::numeric
+                                        ELSE active_strategies.resistance2 END,
+                level_mode       = COALESCE(EXCLUDED.level_mode, active_strategies.level_mode),
                 is_active        = EXCLUDED.is_active,
                 updated_at       = NOW()
             RETURNING id
             """,
             row["symbol"], row["timeframe"], row["total_investment"],
             row["support1"], row["support2"], row["resistance1"], row["resistance2"],
-            row["is_active"],
+            row["level_mode"], row["is_active"],
         )
     return sid
 

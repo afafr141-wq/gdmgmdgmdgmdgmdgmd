@@ -29,7 +29,7 @@ from typing import Callable, Coroutine, Optional
 
 from config.settings import FILL_POLL_INTERVAL
 from core.mexc_client import MexcClient
-from core.sr_engine import SRLevels, fetch_sr_levels
+from core.sr_engine import LevelMode, SRLevels, fetch_sr_levels
 from utils import db_manager as db
 
 # S&R-specific DB calls are prefixed snr_ in db_manager
@@ -70,7 +70,8 @@ class StrategyState:
     timeframe:        str
     total_investment: float
     levels:           SRLevels
-    num_levels:       int   = 2   # number of support/resistance levels per side
+    num_levels:       int       = 2       # levels per side
+    mode:             LevelMode = "both"  # "current" | "previous" | "both"
     strategy_id:      int   = 0
     # order_id → {side, price, qty, level: "s1"|"s2"|..., target_resistance: float|None}
     open_orders:      dict  = field(default_factory=dict)
@@ -82,7 +83,6 @@ class StrategyState:
     started_at:       datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     running:          bool  = True
     # qty held per resistance target: resistance_price → qty waiting to sell there
-    # used to track partial positions when multiple buys target the same resistance
     _sell_qty_map:    dict  = field(default_factory=dict)
 
 
@@ -102,11 +102,14 @@ class StrategyEngine:
         timeframe: str,
         total_investment: float,
         num_levels: int = 2,
+        mode: LevelMode = "both",
     ) -> StrategyState:
         if symbol in self._states and self._states[symbol].running:
             raise ValueError(f"Strategy already running for {symbol}")
 
-        levels = await fetch_sr_levels(self._client, symbol, timeframe, num_levels=num_levels)
+        levels = await fetch_sr_levels(
+            self._client, symbol, timeframe, num_levels=num_levels, mode=mode
+        )
         if not levels:
             raise ValueError(
                 f"Could not compute S/R levels for {symbol} on {timeframe}. "
@@ -119,6 +122,7 @@ class StrategyEngine:
             total_investment=total_investment,
             levels=levels,
             num_levels=num_levels,
+            mode=mode,
         )
         self._states[symbol] = state
 
@@ -127,9 +131,10 @@ class StrategyEngine:
             "timeframe":        timeframe,
             "total_investment": total_investment,
             "support1":         levels.supports[0],
-            "support2":         levels.supports[1],
+            "support2":         levels.supports[1] if len(levels.supports) > 1 else levels.supports[0],
             "resistance1":      levels.resistances[0],
-            "resistance2":      levels.resistances[1],
+            "resistance2":      levels.resistances[1] if len(levels.resistances) > 1 else levels.resistances[0],
+            "level_mode":       mode,
             "is_active":        True,
         })
         state.strategy_id = strategy_id
@@ -191,6 +196,7 @@ class StrategyEngine:
         buy_count: int = 0,
         sell_count: int = 0,
         num_levels: int = 2,
+        mode: LevelMode = "both",
     ) -> StrategyState:
         """
         Restore a strategy from DB after a bot restart.
@@ -201,7 +207,9 @@ class StrategyEngine:
         if symbol in self._states and self._states[symbol].running:
             raise ValueError(f"Strategy already running for {symbol}")
 
-        levels = await fetch_sr_levels(self._client, symbol, timeframe, num_levels=num_levels)
+        levels = await fetch_sr_levels(
+            self._client, symbol, timeframe, num_levels=num_levels, mode=mode
+        )
         if not levels:
             raise ValueError(
                 f"Could not compute S/R levels for {symbol} on {timeframe} during restore."
@@ -213,6 +221,7 @@ class StrategyEngine:
             total_investment=total_investment,
             levels=levels,
             num_levels=num_levels,
+            mode=mode,
             held_qty=held_qty,
             avg_buy_price=avg_buy_price,
             realized_pnl=realized_pnl,
@@ -224,9 +233,10 @@ class StrategyEngine:
             "symbol":      symbol,
             "timeframe":   timeframe,
             "support1":    levels.supports[0],
-            "support2":    levels.supports[1],
+            "support2":    levels.supports[1] if len(levels.supports) > 1 else levels.supports[0],
             "resistance1": levels.resistances[0],
-            "resistance2": levels.resistances[1],
+            "resistance2": levels.resistances[1] if len(levels.resistances) > 1 else levels.resistances[0],
+            "level_mode":  mode,
         })
         state.strategy_id = strategy_id
 
@@ -313,8 +323,12 @@ class StrategyEngine:
             "timeframe":        state.timeframe,
             "total_investment": state.total_investment,
             "num_levels":       state.num_levels,
+            "mode":             state.mode,
             "supports":         lv.supports,
             "resistances":      lv.resistances,
+            # Annotated level objects for display (is_current flag)
+            "support_levels":    lv.support_levels,
+            "resistance_levels": lv.resistance_levels,
             "current_price":    lv.current_price,
             "held_qty":         state.held_qty,
             "avg_buy_price":    state.avg_buy_price,
@@ -329,7 +343,6 @@ class StrategyEngine:
                 1 / 1440,
             ),
         }
-        # Keep legacy keys for backward compatibility with existing menu code
         for i, p in enumerate(lv.supports):
             report[f"support{i+1}"] = p
         for i, p in enumerate(lv.resistances):
@@ -596,7 +609,10 @@ class StrategyEngine:
         await self._client.cancel_all_orders(state.symbol)
         state.open_orders.clear()
 
-        new_levels = await fetch_sr_levels(self._client, state.symbol, state.timeframe, num_levels=state.num_levels)
+        new_levels = await fetch_sr_levels(
+            self._client, state.symbol, state.timeframe,
+            num_levels=state.num_levels, mode=state.mode,
+        )
         if not new_levels:
             logger.warning("S/R refresh failed for %s — keeping old levels", state.symbol)
             new_levels = state.levels
@@ -604,7 +620,7 @@ class StrategyEngine:
         old_levels = state.levels
         state.levels = new_levels
 
-        upsert_data = {"symbol": state.symbol}
+        upsert_data = {"symbol": state.symbol, "level_mode": state.mode}
         for i, p in enumerate(new_levels.supports):
             upsert_data[f"support{i + 1}"] = p
         for i, p in enumerate(new_levels.resistances):

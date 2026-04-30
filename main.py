@@ -95,6 +95,7 @@ async def _on_startup(application) -> None:
                 realized_pnl=float(row.get("realized_pnl") or 0),
                 buy_count=int(row.get("buy_count") or 0),
                 sell_count=int(row.get("sell_count") or 0),
+                mode=row.get("level_mode") or "both",
             )
             snr_recovered += 1
         except Exception as exc:
