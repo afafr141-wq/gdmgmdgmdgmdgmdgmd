@@ -165,7 +165,7 @@ def _fmt_report(r: dict) -> str:
         f"⚖️ مخاطرة: {risk_icons.get(r['risk'], r['risk'])}\n\n"
         f"⚙️ *إعدادات الشبكة*\n"
         f"شبكات: `{n}` شراء + `{n}` بيع\n"
-        f"نطاق:  `{r['lower']:.4f}` ← `{r['upper']:.4f}`\n"
+        f"نطاق:  ▲ `{r.get('upper_pct', 3):.1f}%` فوق | ▼ `{r.get('lower_pct', 3):.1f}%` تحت\n"
         f"فارق:  `{r['grid_spacing']:.4f}` | لكل شبكة: `${r.get('qty_per_grid_usdt', 0):.2f}`\n\n"
         f"💹 *السعر الحالي:* `{r['current_price']:.4f}`\n"
         f"🟢 أوامر شراء: `{r.get('active_buys', 0)}` | 🔴 بيع: `{r.get('active_sells', 0)}`\n"

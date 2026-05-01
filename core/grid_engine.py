@@ -852,6 +852,8 @@ class GridEngine:
             "total_investment":    state.total_investment,
             "lower":               p.lower,
             "upper":               p.upper,
+            "upper_pct":           state.upper_pct,
+            "lower_pct":           state.lower_pct,
             "grid_count":          p.grid_count,
             "grid_spacing":        p.grid_spacing,
             "atr":                 p.atr,
