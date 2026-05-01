@@ -828,11 +828,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         )
         try:
             price = await _client.get_current_price(symbol)
-            # Update grid_count via rebuild with new num_grids
             from core.grid_engine import derive_grid_params
             await _engine._client.cancel_all_orders(symbol)
             state.open_orders.clear()
-            params = derive_grid_params(price, state.total_investment, _engine._client, symbol, num_grids=new_n)
+            params = derive_grid_params(
+                price, state.total_investment, _engine._client, symbol,
+                num_grids=new_n,
+                upper_pct=state.upper_pct,
+                lower_pct=state.lower_pct,
+            )
             state.params = params
             from utils import db_manager as db
             await db.upsert_grid({
@@ -852,8 +856,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 f"✅ *تم تعديل الشبكات — {_fmt_symbol(symbol)}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔢 الشبكات الجديدة: `{new_n}` شراء + `{new_n}` بيع = `{new_n*2}` أمر\n"
-                f"📐 النطاق: `{params.lower:.4f}` ↔ `{params.upper:.4f}`\n"
-                f"📏 الفارق: `{params.grid_spacing:.4f}`",
+                f"▲ `{state.upper_pct:.1f}%` فوق | ▼ `{state.lower_pct:.1f}%` تحت",
                 parse_mode="Markdown",
                 reply_markup=kb,
             )
@@ -1016,7 +1019,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             from core.grid_engine import derive_grid_params
             await _engine._client.cancel_all_orders(symbol)
             state.open_orders.clear()
-            params = derive_grid_params(price, state.total_investment, _engine._client, symbol, num_grids=new_n)
+            params = derive_grid_params(
+                price, state.total_investment, _engine._client, symbol,
+                num_grids=new_n,
+                upper_pct=state.upper_pct,
+                lower_pct=state.lower_pct,
+            )
             state.params = params
             from utils import db_manager as db
             await db.upsert_grid({
@@ -1036,8 +1044,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                 f"✅ *تم تعديل الشبكات — {_fmt_symbol(symbol)}*\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔢 الشبكات الجديدة: `{new_n}` شراء + `{new_n}` بيع = `{new_n*2}` أمر\n"
-                f"📐 النطاق: `{params.lower:.4f}` ↔ `{params.upper:.4f}`\n"
-                f"📏 الفارق: `{params.grid_spacing:.4f}`",
+                f"▲ `{state.upper_pct:.1f}%` فوق | ▼ `{state.lower_pct:.1f}%` تحت",
                 parse_mode="Markdown",
                 reply_markup=kb,
             )
