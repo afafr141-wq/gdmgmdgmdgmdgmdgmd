@@ -690,8 +690,6 @@ async def _cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register_menu_handlers(app: Application) -> None:
-
-def register_menu_handlers(app: Application) -> None:
     conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(_cb_menu, pattern=r"^menu:grid$"),
