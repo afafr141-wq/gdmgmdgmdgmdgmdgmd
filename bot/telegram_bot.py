@@ -815,19 +815,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             await query.answer("الشبكة غير نشطة.", show_alert=True)
             return
         n = state.params.grid_count // 2
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ +1 شبكة",  callback_data=f"gridcount:{symbol}:{n+1}"),
-             InlineKeyboardButton("➖ -1 شبكة",  callback_data=f"gridcount:{symbol}:{max(1,n-1)}")],
-            [InlineKeyboardButton("2 شبكات",  callback_data=f"gridcount:{symbol}:2"),
-             InlineKeyboardButton("3 شبكات",  callback_data=f"gridcount:{symbol}:3"),
-             InlineKeyboardButton("5 شبكات",  callback_data=f"gridcount:{symbol}:5")],
-            [InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")],
-        ])
+        ctx.user_data["awaiting"]        = "gridcount"
+        ctx.user_data["pending_symbol"]  = symbol
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")]])
         await query.edit_message_text(
             f"⚙️ *تعديل شبكات — {_fmt_symbol(symbol)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🔢 الشبكات الحالية: `{n}` شراء + `{n}` بيع = `{n*2}` أمر\n\n"
-            f"اختر العدد الجديد لكل جانب:",
+            f"أرسل العدد الجديد لكل جانب (مثال: `4`):",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -885,86 +880,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         if not state:
             await query.answer("الشبكة غير نشطة.", show_alert=True)
             return
-        up  = state.upper_pct
-        dn  = state.lower_pct
-        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
-        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
-        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
-        kb = InlineKeyboardMarkup([
-            up_row[:3], up_row[3:],
-            dn_row[:3], dn_row[3:],
-            [InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")],
-        ])
+        ctx.user_data["awaiting"]       = "upper_pct"
+        ctx.user_data["pending_symbol"] = symbol
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")]])
         await query.edit_message_text(
             f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 النسبة العلوية الحالية: `{up:.1f}%`\n"
-            f"📉 النسبة السفلية الحالية: `{dn:.1f}%`\n\n"
-            f"▲ اختر النسبة العلوية (فوق الحد الأعلى للشبكة):\n"
-            f"▼ اختر النسبة السفلية (تحت الحد الأدنى للشبكة):",
-            parse_mode="Markdown",
-            reply_markup=kb,
-        )
-
-    elif data.startswith("setuppct:"):
-        parts  = data.split(":")
-        symbol = parts[1]
-        new_up = float(parts[2])
-        state  = _engine.get_state(symbol) if _engine else None
-        if not state:
-            await query.answer("الشبكة غير نشطة.", show_alert=True)
-            return
-        state.upper_pct = new_up
-        await query.answer(f"✅ النسبة العلوية: {new_up}%", show_alert=False)
-        # إعادة عرض صفحة التعديل بالقيم الجديدة
-        up  = state.upper_pct
-        dn  = state.lower_pct
-        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
-        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
-        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
-        kb = InlineKeyboardMarkup([
-            up_row[:3], up_row[3:],
-            dn_row[:3], dn_row[3:],
-            [InlineKeyboardButton("✅ تم — رجوع للتفاصيل", callback_data=f"detail_{symbol}")],
-        ])
-        await query.edit_message_text(
-            f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 النسبة العلوية: `{up:.1f}%` ✅\n"
-            f"📉 النسبة السفلية: `{dn:.1f}%`\n\n"
-            f"▲ اختر النسبة العلوية:\n"
-            f"▼ اختر النسبة السفلية:",
-            parse_mode="Markdown",
-            reply_markup=kb,
-        )
-
-    elif data.startswith("setdnpct:"):
-        parts  = data.split(":")
-        symbol = parts[1]
-        new_dn = float(parts[2])
-        state  = _engine.get_state(symbol) if _engine else None
-        if not state:
-            await query.answer("الشبكة غير نشطة.", show_alert=True)
-            return
-        state.lower_pct = new_dn
-        await query.answer(f"✅ النسبة السفلية: {new_dn}%", show_alert=False)
-        up  = state.upper_pct
-        dn  = state.lower_pct
-        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
-        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
-        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
-        kb = InlineKeyboardMarkup([
-            up_row[:3], up_row[3:],
-            dn_row[:3], dn_row[3:],
-            [InlineKeyboardButton("✅ تم — رجوع للتفاصيل", callback_data=f"detail_{symbol}")],
-        ])
-        await query.edit_message_text(
-            f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 النسبة العلوية: `{up:.1f}%`\n"
-            f"📉 النسبة السفلية: `{dn:.1f}%` ✅\n\n"
-            f"▲ اختر النسبة العلوية:\n"
-            f"▼ اختر النسبة السفلية:",
+            f"📈 النسبة العلوية الحالية: `{state.upper_pct:.1f}%`\n"
+            f"📉 النسبة السفلية الحالية: `{state.lower_pct:.1f}%`\n\n"
+            f"أرسل النسبة العلوية الجديدة (مثال: `3.5`):",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -1076,6 +1000,115 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع للإعدادات", callback_data="menu_settings")]])
         await update.message.reply_text(
             f"✅ تمت إضافة `{symbol}` للقائمة السريعة.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Grid count input ───────────────────────────────────────────────────────
+    if awaiting == "gridcount":
+        symbol = ctx.user_data.get("pending_symbol", "")
+        try:
+            new_n = int(update.message.text.strip())
+            if new_n < 1:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ أرسل رقماً صحيحاً أكبر من صفر.")
+            return
+        ctx.user_data["awaiting"] = None
+        state = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await update.message.reply_text(f"❌ الشبكة {symbol} غير نشطة.")
+            return
+        await update.message.reply_text(
+            f"⏳ جاري إعادة بناء شبكة `{_fmt_symbol(symbol)}` بـ `{new_n}×2` أوامر…",
+            parse_mode="Markdown",
+        )
+        try:
+            price = await _client.get_current_price(symbol)
+            from core.grid_engine import derive_grid_params
+            await _engine._client.cancel_all_orders(symbol)
+            state.open_orders.clear()
+            params = derive_grid_params(price, state.total_investment, _engine._client, symbol, num_grids=new_n)
+            state.params = params
+            from utils import db_manager as db
+            await db.upsert_grid({
+                "symbol":       symbol,
+                "lower_price":  params.lower,
+                "upper_price":  params.upper,
+                "grid_count":   params.grid_count,
+                "grid_spacing": params.grid_spacing,
+                "current_atr":  0.0,
+            })
+            await _engine._place_initial_orders(state, price)
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📊 تفاصيل", callback_data=f"detail_{symbol}"),
+                InlineKeyboardButton("🏠 القائمة", callback_data="menu_main"),
+            ]])
+            await update.message.reply_text(
+                f"✅ *تم تعديل الشبكات — {_fmt_symbol(symbol)}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔢 الشبكات الجديدة: `{new_n}` شراء + `{new_n}` بيع = `{new_n*2}` أمر\n"
+                f"📐 النطاق: `{params.lower:.4f}` ↔ `{params.upper:.4f}`\n"
+                f"📏 الفارق: `{params.grid_spacing:.4f}`",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception as exc:
+            await update.message.reply_text(f"❌ فشل التعديل: `{exc}`", parse_mode="Markdown")
+        return
+
+    # ── Upper pct input ────────────────────────────────────────────────────────
+    if awaiting == "upper_pct":
+        symbol = ctx.user_data.get("pending_symbol", "")
+        try:
+            new_up = float(update.message.text.strip())
+            if new_up <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ أرسل رقماً موجباً (مثال: `3.5`).", parse_mode="Markdown")
+            return
+        state = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await update.message.reply_text(f"❌ الشبكة {symbol} غير نشطة.")
+            return
+        state.upper_pct = new_up
+        ctx.user_data["awaiting"] = "lower_pct"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")]])
+        await update.message.reply_text(
+            f"✅ النسبة العلوية: `{new_up:.1f}%`\n\n"
+            f"📉 النسبة السفلية الحالية: `{state.lower_pct:.1f}%`\n"
+            f"أرسل النسبة السفلية الجديدة (مثال: `3.5`):",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    # ── Lower pct input ────────────────────────────────────────────────────────
+    if awaiting == "lower_pct":
+        symbol = ctx.user_data.get("pending_symbol", "")
+        try:
+            new_dn = float(update.message.text.strip())
+            if new_dn <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ أرسل رقماً موجباً (مثال: `3.5`).", parse_mode="Markdown")
+            return
+        state = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await update.message.reply_text(f"❌ الشبكة {symbol} غير نشطة.")
+            return
+        state.lower_pct = new_dn
+        ctx.user_data["awaiting"] = None
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📊 تفاصيل", callback_data=f"detail_{symbol}"),
+            InlineKeyboardButton("🏠 القائمة", callback_data="menu_main"),
+        ]])
+        await update.message.reply_text(
+            f"✅ *تم تعديل النسب — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 النسبة العلوية: `{state.upper_pct:.1f}%`\n"
+            f"📉 النسبة السفلية: `{new_dn:.1f}%`",
             parse_mode="Markdown",
             reply_markup=kb,
         )
