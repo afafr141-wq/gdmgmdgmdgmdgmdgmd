@@ -1536,6 +1536,149 @@ async def cmd_pa_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def cmd_explain_pa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/explain_pa — إرسال شرح استراتيجية Price Action كاملاً."""
+    if not _is_allowed(update):
+        return await _deny(update)
+
+    parts = [
+        (
+            "🎯 *Price Action Strategy — شرح كامل*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📌 *الفكرة الأساسية*\n\n"
+            "المؤسسات والصناديق الكبيرة تحتاج سيولة لتنفيذ أوردراتها الضخمة.\n"
+            "هذه السيولة موجودة *فوق القمم وتحت القيعان* — حيث يضع صغار المتداولين أوامر الـ Stop Loss.\n\n"
+            "البوت يتبع المؤسسات:\n"
+            "ينتظر حتى تُصطاد هذه السيولة، ثم يدخل في نفس اتجاهها."
+        ),
+        (
+            "🔍 *المرحلة 1 — تحديد الاتجاه*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "البوت يحلل آخر 200 شمعة ويحدد الاتجاه:\n\n"
+            "↗️ *Uptrend* — كل قمة أعلى من السابقة + كل قاع أعلى من السابق\n"
+            "↘️ *Downtrend* — كل قمة أقل من السابقة + كل قاع أقل من السابق\n"
+            "↔️ *Sideways* — لا نمط واضح\n\n"
+            "القاعدة:\n"
+            "• Uptrend → شراء فقط\n"
+            "• Downtrend → بيع فقط\n"
+            "• Sideways → الاتجاهين مقبولين"
+        ),
+        (
+            "💧 *المرحلة 2 — رسم مناطق السيولة*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "البوت يبحث عن *Equal Highs* و *Equal Lows*\n"
+            "وهي قمم أو قيعان متقاربة جداً (ضمن 0.3% من بعضها)\n\n"
+            "📈 *Equal Highs*\n"
+            "قمتان أو أكثر عند نفس المستوى\n"
+            "↑ فوقها Stop Loss للبائعين = سيولة شراء\n\n"
+            "📉 *Equal Lows*\n"
+            "قاعان أو أكثر عند نفس المستوى\n"
+            "↓ تحتها Stop Loss للمشترين = سيولة بيع\n\n"
+            "هذه المناطق هي *هدف المؤسسات* قبل الحركة الحقيقية."
+        ),
+        (
+            "🌊 *المرحلة 3 — كشف الـ Sweep*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "الـ Sweep = السعر يخترق مستوى السيولة ثم يرجع بسرعة\n\n"
+            "🟢 *Bullish Sweep (إشارة شراء):*\n"
+            "السعر ينزل تحت Equal Low\n"
+            "← يصطاد الـ Stop Loss\n"
+            "← يغلق الشمعة فوق المستوى ✅\n\n"
+            "🔴 *Bearish Sweep (إشارة بيع):*\n"
+            "السعر يصعد فوق Equal High\n"
+            "← يصطاد الـ Stop Loss\n"
+            "← يغلق الشمعة تحت المستوى ✅\n\n"
+            "الشرط: *الذيل يخترق — الجسم يغلق على الجانب الآخر*"
+        ),
+        (
+            "🕯 *المرحلة 4 — تأكيد الشمعة*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "بعد الـ Sweep مباشرة، يجب شمعة تأكيد:\n\n"
+            "🟢 *إشارات الشراء:*\n"
+            "• Bullish Engulfing — شمعة خضراء تبتلع الحمراء قبلها\n"
+            "• Hammer — ذيل طويل تحت، جسم صغير فوق 🔨\n\n"
+            "🔴 *إشارات البيع:*\n"
+            "• Bearish Engulfing — شمعة حمراء تبتلع الخضراء قبلها\n"
+            "• Shooting Star — ذيل طويل فوق، جسم صغير تحت ⭐\n\n"
+            "*بدون تأكيد = لا دخول*"
+        ),
+        (
+            "💰 *الدخول والخروج*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📥 *الدخول:*\n"
+            "Market Order فوري بعد اكتمال Sweep + تأكيد\n"
+            "الكمية = نسبة تختارها من رصيد USDT الحر\n\n"
+            "🎯 *الهدف (TP):*\n"
+            "• شراء → أقرب Equal High فوق سعر الدخول\n"
+            "• بيع → أقرب Equal Low تحت سعر الدخول\n\n"
+            "📤 *الخروج:*\n"
+            "Limit order يُوضع تلقائياً عند الـ TP\n"
+            "عند الإغلاق: يُحسب الربح والبوت يعود للمراقبة\n\n"
+            "مثال:\n"
+            "`Equal High @ 1.050 ← TP`\n"
+            "`السعر الحالي: 1.020`\n"
+            "`Equal Low @ 1.000 ← Sweep`\n"
+            "`BUY @ 1.000 | TP @ 1.050`"
+        ),
+        (
+            "🛡 *الحماية من الإشارات الكاذبة*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "3 فلاتر متتالية قبل أي دخول:\n\n"
+            "1️⃣ *فلتر الاتجاه*\n"
+            "لا شراء في Downtrend — لا بيع في Uptrend\n\n"
+            "2️⃣ *فلتر الـ Sweep*\n"
+            "الاختراق يجب أن يتجاوز المستوى بـ 0.3% على الأقل\n\n"
+            "3️⃣ *فلتر الشمعة*\n"
+            "شمعة التأكيد يجب أن تستوفي نسبة ذيل/جسم محددة"
+        ),
+        (
+            "⏱ *التايم فريم*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "5m  — إشارات أكثر، noise أعلى\n"
+            "15m — توازن بين السرعة والدقة\n"
+            "1h  — إشارات أنظف، سيولة حقيقية ✅\n"
+            "4h  — أفضل جودة، صفقات أقل\n\n"
+            "✅ *نقاط القوة:*\n"
+            "• يتبع المؤسسات لا يتعارض معها\n"
+            "• TP مبني على السيولة لا على نسبة عشوائية\n"
+            "• يعمل على أي عملة على MEXC\n"
+            "• يستعيد حالته تلقائياً بعد restart\n\n"
+            "⚠️ *القيود:*\n"
+            "• لا Stop Loss — MEXC Spot لا يدعمه\n"
+            "• يحتاج 200 شمعة كحد أدنى\n"
+            "• Market Order قد يكون فيه slippage في العملات قليلة السيولة"
+        ),
+        (
+            "📊 *مثال عملي — BTC/USDT 1h*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "الاتجاه: Uptrend ↗️\n"
+            "Equal Lows عند: `65,200 USDT`\n\n"
+            "الشمعة -2 (Sweep):\n"
+            "`Low: 65,050` ← اخترق تحت 65,200\n"
+            "`Close: 65,280` ← أغلق فوق المستوى ✅\n\n"
+            "الشمعة -1 (التأكيد):\n"
+            "`Close: 65,520` ← Bullish Engulfing ✅\n\n"
+            "الفلاتر:\n"
+            "✅ Uptrend → شراء مقبول\n"
+            "✅ Sweep تحت Equal Low\n"
+            "✅ Bullish Engulfing تأكيد\n\n"
+            "النتيجة:\n"
+            "`BUY @ 65,520`\n"
+            "`TP  @ 66,800` (أقرب Equal High)\n"
+            "`رأس المال: 20% من رصيد USDT`"
+        ),
+    ]
+
+    for part in parts:
+        await update.message.reply_text(part, parse_mode="Markdown")
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "لتشغيل الاستراتيجية: /menu ← 🎯 Price Action",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_pa_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/pa_list — list all active PA strategies."""
     if not _is_allowed(update):
@@ -1635,10 +1778,11 @@ def build_application(engine, client, pa_engine=None) -> Application:
     app.add_handler(CommandHandler("balance", cmd_balance))
 
     # ── Price Action strategy handlers ────────────────────────────────────────
-    app.add_handler(CommandHandler("pa_start",  cmd_pa_start))
-    app.add_handler(CommandHandler("pa_stop",   cmd_pa_stop))
-    app.add_handler(CommandHandler("pa_status", cmd_pa_status))
-    app.add_handler(CommandHandler("pa_list",   cmd_pa_list))
+    app.add_handler(CommandHandler("pa_start",   cmd_pa_start))
+    app.add_handler(CommandHandler("pa_stop",    cmd_pa_stop))
+    app.add_handler(CommandHandler("pa_status",  cmd_pa_status))
+    app.add_handler(CommandHandler("pa_list",    cmd_pa_list))
+    app.add_handler(CommandHandler("explain_pa", cmd_explain_pa))
 
     # ── Interactive menu handlers ──────────────────────────────────────────────
     from bot.menu_bot import register_menu_handlers

@@ -1251,7 +1251,8 @@ def _kb_pa_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 استراتيجية جديدة", callback_data="pa:new"),
          InlineKeyboardButton("📋 الاستراتيجيات",    callback_data="pa:list")],
-        [InlineKeyboardButton("⛔ إيقاف استراتيجية", callback_data="pa:stop_menu")],
+        [InlineKeyboardButton("⛔ إيقاف استراتيجية", callback_data="pa:stop_menu"),
+         InlineKeyboardButton("📖 شرح الاستراتيجية", callback_data="pa:explain")],
         [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu:back")],
     ])
 
@@ -1356,6 +1357,13 @@ async def _cb_pa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int
         rows = [[InlineKeyboardButton(f"⛔ {s}", callback_data=f"pastop:{s}")] for s in symbols]
         rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="pa:back")])
         await _edit(query, "⛔ *اختر الاستراتيجية للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "explain":
+        from bot.telegram_bot import cmd_explain_pa
+        # إرسال الشرح كرسائل منفصلة
+        await query.answer("جاري إرسال الشرح…")
+        await cmd_explain_pa(update, ctx)
         return None
 
     return None
