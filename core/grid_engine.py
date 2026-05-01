@@ -482,20 +482,24 @@ class GridEngine:
         if not state.running or not state._pending_rebuild:
             return  # grid was stopped or breakout cancelled while waiting
 
-        # Re-check on the candle close price
+        # Re-check on the closed candle's close price (index -2 = last completed candle)
         try:
-            candles = await self._client.fetch_ohlcv(state.symbol, timeframe="1m", limit=2)
-            close_price = float(candles[-1][4]) if candles else await self._client.get_current_price(state.symbol)
+            candles = await self._client.fetch_ohlcv(state.symbol, timeframe="1m", limit=3)
+            if candles and len(candles) >= 2:
+                close_price = float(candles[-2][4])  # last *closed* candle
+            else:
+                close_price = await self._client.get_current_price(state.symbol)
         except Exception:
             close_price = await self._client.get_current_price(state.symbol)
 
-        still_upper = close_price > state.params.upper * (1 + state.upper_pct / 100)
-        still_lower = close_price < state.params.lower * (1 - state.lower_pct / 100)
+        # Only cancel if price returned fully inside the original grid range
+        still_upper = close_price > state.params.upper
+        still_lower = close_price < state.params.lower
 
         if not still_upper and not still_lower:
             logger.info(
-                "Breakout cancelled for %s: close_price=%.4f returned inside threshold",
-                state.symbol, close_price,
+                "Breakout cancelled for %s: close_price=%.4f returned inside grid range [%.4f, %.4f]",
+                state.symbol, close_price, state.params.lower, state.params.upper,
             )
             state._pending_rebuild = False
             return
