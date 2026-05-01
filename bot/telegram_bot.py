@@ -694,13 +694,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             state = await _engine.start(symbol, amount, risk)
             p = state.params
+            n = p.grid_count // 2
+            risk_icons = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
             await query.edit_message_text(
-                f"✅ *شبكة {symbol} تعمل الآن!*\n"
-                f"📐 النطاق: `{p.lower:.4f}` — `{p.upper:.4f}`\n"
-                f"🔢 عدد الشبكات: `{p.grid_count}`\n"
-                f"📏 فارق الشبكة: `{p.grid_spacing:.4f}`\n"
-                f"📡 ATR: `{p.atr:.4f}`\n"
-                f"⚠️ المخاطرة: `{risk}`",
+                f"✅ *شبكة {_fmt_symbol(symbol)} تعمل الآن!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"💵 رصيد مستثمر: `${amount:.2f}` USDT\n"
+                f"⚖️ مخاطرة: {risk_icons.get(risk, risk)}\n"
+                f"🔢 شبكات: `{n}` شراء + `{n}` بيع\n"
+                f"▲ `{state.upper_pct:.1f}%` فوق | ▼ `{state.lower_pct:.1f}%` تحت",
                 parse_mode="Markdown",
                 reply_markup=_active_grid_kb(symbol),
             )
@@ -731,10 +733,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             price = await _client.get_current_price(symbol)
             await _engine._rebuild(state, price)
             p = state.params
+            n = p.grid_count // 2
             await query.edit_message_text(
-                f"✅ *{symbol}* — تمت إعادة التشكيل!\n"
-                f"📐 النطاق الجديد: `{p.lower:.4f}` — `{p.upper:.4f}`\n"
-                f"🔢 عدد الأوامر: `{p.grid_count}` ({p.grid_count // 2} شراء + {p.grid_count // 2} بيع)",
+                f"✅ *{_fmt_symbol(symbol)}* — تمت إعادة التشكيل!\n"
+                f"🔢 شبكات: `{n}` شراء + `{n}` بيع\n"
+                f"▲ `{state.upper_pct:.1f}%` فوق | ▼ `{state.lower_pct:.1f}%` تحت",
                 parse_mode="Markdown",
                 reply_markup=_active_grid_kb(symbol),
             )
