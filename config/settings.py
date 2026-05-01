@@ -36,6 +36,12 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
+# ── Price Action strategy ──────────────────────────────────────────────────────
+PA_LOOKBACK_CANDLES: int   = int(os.getenv("PA_LOOKBACK_CANDLES", "200"))
+PA_PIVOT_LEFT:       int   = int(os.getenv("PA_PIVOT_LEFT",       "3"))
+PA_PIVOT_RIGHT:      int   = int(os.getenv("PA_PIVOT_RIGHT",      "3"))
+PA_EQUAL_TOLERANCE:  float = float(os.getenv("PA_EQUAL_TOLERANCE", "0.3"))  # % band for equal H/L
+
 # ── S/R detection (swing high/low — matches LuxAlgo S&R Channels) ─────────────
 SR_LOOKBACK_CANDLES: int   = 300
 SR_PIVOT_LEFT:       int   = int(os.getenv("SR_PIVOT_LEFT",       "5"))   # bars left  of swing point

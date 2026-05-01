@@ -453,3 +453,142 @@ async def get_snr_trade_history(symbol: str, days: int = 30) -> list[dict]:
             symbol, days,
         )
     return [dict(r) for r in rows]
+
+
+# ── active_pa_strategies (Price Action) ───────────────────────────────────────
+
+async def _create_pa_tables(conn) -> None:
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_pa_strategies (
+            id               SERIAL PRIMARY KEY,
+            symbol           TEXT NOT NULL UNIQUE,
+            timeframe        TEXT NOT NULL DEFAULT '1h',
+            capital_pct      NUMERIC NOT NULL DEFAULT 10,
+            held_qty         NUMERIC DEFAULT 0,
+            avg_entry_price  NUMERIC DEFAULT 0,
+            direction        TEXT DEFAULT '',
+            tp_price         NUMERIC DEFAULT 0,
+            realized_pnl     NUMERIC DEFAULT 0,
+            trade_count      INTEGER DEFAULT 0,
+            win_count        INTEGER DEFAULT 0,
+            started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_active        BOOLEAN NOT NULL DEFAULT TRUE
+        );
+
+        CREATE TABLE IF NOT EXISTS pa_trade_history (
+            id          SERIAL PRIMARY KEY,
+            symbol      TEXT NOT NULL,
+            side        TEXT NOT NULL,
+            price       NUMERIC NOT NULL,
+            qty         NUMERIC NOT NULL,
+            order_id    TEXT DEFAULT '',
+            strategy_id INTEGER REFERENCES active_pa_strategies(id),
+            pnl         NUMERIC DEFAULT 0,
+            pattern     TEXT DEFAULT '',
+            trend       TEXT DEFAULT '',
+            executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+
+
+async def upsert_pa_strategy(data: dict) -> int:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await _create_pa_tables(conn)
+        sid = await conn.fetchval(
+            """
+            INSERT INTO active_pa_strategies
+                (symbol, timeframe, capital_pct, is_active)
+            VALUES ($1, $2, $3::numeric, $4)
+            ON CONFLICT (symbol) DO UPDATE SET
+                timeframe   = COALESCE(EXCLUDED.timeframe,   active_pa_strategies.timeframe),
+                capital_pct = CASE WHEN $3::numeric > 0
+                                   THEN $3::numeric
+                                   ELSE active_pa_strategies.capital_pct END,
+                is_active   = EXCLUDED.is_active,
+                updated_at  = NOW()
+            RETURNING id
+            """,
+            data.get("symbol", ""),
+            data.get("timeframe", "1h"),
+            float(data.get("capital_pct", 10)),
+            bool(data.get("is_active", True)),
+        )
+    return sid
+
+
+async def get_all_active_pa_strategies() -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await _create_pa_tables(conn)
+        rows = await conn.fetch(
+            "SELECT * FROM active_pa_strategies WHERE is_active = TRUE ORDER BY started_at"
+        )
+    return [dict(r) for r in rows]
+
+
+async def deactivate_pa_strategy(symbol: str) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE active_pa_strategies SET is_active = FALSE, updated_at = NOW() WHERE symbol = $1",
+            symbol,
+        )
+
+
+async def update_pa_strategy_state(
+    symbol:          str,
+    held_qty:        float,
+    avg_entry_price: float,
+    direction:       str,
+    tp_price:        float,
+    realized_pnl:    float,
+    trade_count:     int,
+    win_count:       int,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE active_pa_strategies
+               SET held_qty = $2, avg_entry_price = $3, direction = $4,
+                   tp_price = $5, realized_pnl = $6,
+                   trade_count = $7, win_count = $8, updated_at = NOW()
+               WHERE symbol = $1""",
+            symbol, held_qty, avg_entry_price, direction,
+            tp_price, realized_pnl, trade_count, win_count,
+        )
+
+
+async def record_pa_trade(
+    symbol:      str,
+    side:        str,
+    price:       float,
+    qty:         float,
+    order_id:    str = "",
+    strategy_id: Optional[int] = None,
+    pnl:         float = 0.0,
+    pattern:     str = "",
+    trend:       str = "",
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO pa_trade_history
+               (symbol, side, price, qty, order_id, strategy_id, pnl, pattern, trend)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            symbol, side, price, qty, order_id, strategy_id, pnl, pattern, trend,
+        )
+
+
+async def get_pa_trade_history(symbol: str, days: int = 30) -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM pa_trade_history
+               WHERE symbol = $1
+                 AND executed_at >= NOW() - ($2 * INTERVAL '1 day')
+               ORDER BY executed_at DESC""",
+            symbol, days,
+        )
+    return [dict(r) for r in rows]

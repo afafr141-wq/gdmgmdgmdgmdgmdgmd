@@ -8,6 +8,7 @@ from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
 from core.grid_engine import GridEngine, set_notifiers as grid_set_notifiers
 from core.strategy_engine import StrategyEngine, set_notifiers as snr_set_notifiers
+from core.pa_strategy_engine import PAStrategyEngine, set_notifiers as pa_set_notifiers
 from bot.telegram_bot import (
     build_application,
     send_notification,
@@ -20,8 +21,15 @@ from bot.telegram_bot import (
     notify_snr_buy_filled,
     notify_snr_sell_filled,
     notify_snr_refresh,
+    notify_pa_entry,
+    notify_pa_tp_hit,
 )
-from utils.db_manager import init_db, close_db, get_all_active_grids, get_all_active_strategies
+from utils.db_manager import (
+    init_db, close_db,
+    get_all_active_grids,
+    get_all_active_strategies,
+    get_all_active_pa_strategies,
+)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -102,21 +110,48 @@ async def _on_startup(application) -> None:
             logger.error("Failed to recover S&R strategy %s: %s", symbol, exc)
             snr_failed += 1
 
+    # ── Recover PA strategies ──────────────────────────────────────────────────
+    pa_engine: PAStrategyEngine = application.bot_data["pa_engine"]
+    pa_active = await get_all_active_pa_strategies()
+    pa_recovered, pa_failed = 0, 0
+
+    for row in pa_active:
+        symbol = row["symbol"]
+        try:
+            await pa_engine.restore(
+                symbol          = symbol,
+                timeframe       = row["timeframe"],
+                capital_pct     = float(row.get("capital_pct") or 10),
+                held_qty        = float(row.get("held_qty") or 0),
+                avg_entry_price = float(row.get("avg_entry_price") or 0),
+                direction       = row.get("direction") or "",
+                tp_price        = float(row.get("tp_price") or 0),
+                realized_pnl    = float(row.get("realized_pnl") or 0),
+                trade_count     = int(row.get("trade_count") or 0),
+                win_count       = int(row.get("win_count") or 0),
+            )
+            pa_recovered += 1
+        except Exception as exc:
+            logger.error("Failed to recover PA strategy %s: %s", symbol, exc)
+            pa_failed += 1
+
     await send_notification(
         "🤖 *AI Grid Bot* — تم التشغيل بنجاح!\n"
         f"📊 شبكات Grid مستردة: `{recovered}` | مُرقَّاة: `{upgraded}` | فشلت: `{failed}`\n"
         f"📈 استراتيجيات S&R مستردة: `{snr_recovered}` | فشلت: `{snr_failed}`\n"
+        f"🎯 استراتيجيات PA مستردة: `{pa_recovered}` | فشلت: `{pa_failed}`\n"
         "اكتب /menu للقائمة التفاعلية.",
         application=application,
     )
-    logger.info("Startup complete. Grids=%d S&R=%d", recovered, snr_recovered)
+    logger.info("Startup complete. Grids=%d S&R=%d PA=%d", recovered, snr_recovered, pa_recovered)
 
 
 async def _on_shutdown(application) -> None:
     logger.info("Shutting down…")
-    engine:     GridEngine     = application.bot_data["engine"]
-    snr_engine: StrategyEngine = application.bot_data["snr_engine"]
-    client:     MexcClient     = application.bot_data["client"]
+    engine:     GridEngine      = application.bot_data["engine"]
+    snr_engine: StrategyEngine  = application.bot_data["snr_engine"]
+    pa_engine:  PAStrategyEngine = application.bot_data["pa_engine"]
+    client:     MexcClient      = application.bot_data["client"]
 
     for symbol in list(engine.active_symbols()):
         try:
@@ -126,11 +161,15 @@ async def _on_shutdown(application) -> None:
 
     for symbol in list(snr_engine.active_symbols()):
         try:
-            # persist=False keeps is_active=TRUE in DB so the strategy
-            # is restored automatically on the next startup.
             await snr_engine.stop(symbol, market_sell=False, persist=False)
         except Exception as exc:
             logger.error("Error stopping S&R %s: %s", symbol, exc)
+
+    for symbol in list(pa_engine.active_symbols()):
+        try:
+            await pa_engine.stop(symbol, market_sell=False, persist=False)
+        except Exception as exc:
+            logger.error("Error stopping PA %s: %s", symbol, exc)
 
     await client.close()
     await close_db()
@@ -149,8 +188,9 @@ def main() -> None:
 
     engine     = GridEngine(client=client, notify=notify)
     snr_engine = StrategyEngine(client=client)
+    pa_engine  = PAStrategyEngine(client=client)
 
-    app = build_application(engine, client)
+    app = build_application(engine, client, pa_engine=pa_engine)
     _notify_ref["app"] = app
 
     # Grid notifiers
@@ -171,9 +211,17 @@ def main() -> None:
         error       = notify_error,
     )
 
+    # PA notifiers
+    pa_set_notifiers(
+        entry   = notify_pa_entry,
+        tp_hit  = notify_pa_tp_hit,
+        error   = notify_error,
+    )
+
     app.bot_data["client"]     = client
     app.bot_data["engine"]     = engine
     app.bot_data["snr_engine"] = snr_engine
+    app.bot_data["pa_engine"]  = pa_engine
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
 

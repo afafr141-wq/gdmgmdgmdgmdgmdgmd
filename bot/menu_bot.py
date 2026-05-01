@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
     AWAIT_SNR_EDIT_INV,    # S&R: edit investment
     AWAIT_SNR_EDIT_LEVELS, # S&R: edit number of levels
     AWAIT_SNR_MODE,        # S&R: level mode (current/previous/both)
-) = range(11)
+    AWAIT_PA_PAIR,         # PA: trading pair
+    AWAIT_PA_CAPITAL,      # PA: capital % per trade
+) = range(13)
 
 # Mode labels for display
 _MODE_LABELS = {
@@ -45,6 +47,7 @@ _MODE_LABELS = {
 }
 
 SNR_TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+PA_TIMEFRAMES  = ["5m", "15m", "30m", "1h", "4h", "1d"]
 
 POPULAR_PAIRS = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
@@ -94,6 +97,7 @@ def _kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🛑 إيقاف شبكة",     callback_data="menu:grid_stop")],
         [InlineKeyboardButton("🔄 ترقية الشبكات",  callback_data="settings_upgradeall"),
          InlineKeyboardButton("📈 استراتيجية S&R", callback_data="snr:back")],
+        [InlineKeyboardButton("🎯 Price Action",   callback_data="pa:back")],
     ])
 
 
@@ -1241,6 +1245,245 @@ async def _cb_snrconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await _edit(query, f"❌ خطأ: `{exc}`", _kb_back())
 
 
+# ── PA Menu ────────────────────────────────────────────────────────────────────
+
+def _kb_pa_main() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 استراتيجية جديدة", callback_data="pa:new"),
+         InlineKeyboardButton("📋 الاستراتيجيات",    callback_data="pa:list")],
+        [InlineKeyboardButton("⛔ إيقاف استراتيجية", callback_data="pa:stop_menu")],
+        [InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="menu:back")],
+    ])
+
+
+def _kb_pa_tf() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for tf in PA_TIMEFRAMES:
+        row.append(InlineKeyboardButton(tf, callback_data=f"patf:{tf}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="pa:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_pa_strategy(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 تفاصيل",          callback_data=f"padetail:{symbol}"),
+         InlineKeyboardButton("⛔ إيقاف وبيع",      callback_data=f"pastop:{symbol}")],
+        [InlineKeyboardButton("🔙 رجوع للقائمة",    callback_data="pa:list")],
+    ])
+
+
+def _fmt_pa_report(r: dict) -> str:
+    direction_ar = {"buy": "شراء 📥", "sell": "بيع 📤", "": "يراقب 🔍"}.get(r.get("direction", ""), "—")
+    pnl_sign     = "+" if r.get("realized_pnl", 0) >= 0 else ""
+    win_rate     = r.get("win_rate", 0)
+
+    pos_lines = ""
+    if r.get("held_qty", 0) > 0:
+        pos_lines = (
+            f"📌 الاتجاه: {direction_ar}\n"
+            f"🪙 الكمية: `{r['held_qty']:.6f}`\n"
+            f"💵 سعر الدخول: `{r['avg_entry_price']:.6f}`\n"
+            f"🎯 الهدف (TP): `{r['tp_price']:.6f}`\n"
+        )
+    else:
+        pos_lines = f"📌 الوضع: {direction_ar}\n"
+
+    return (
+        f"🎯 *PA Strategy — `{r['symbol']}`*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ التايم فريم: `{r['timeframe']}`\n"
+        f"💰 رأس المال/صفقة: `{r['capital_pct']:.0f}%`\n"
+        f"{pos_lines}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 الصفقات: `{r['trade_count']}` | الرابحة: `{r['win_count']}` ({win_rate:.0f}%)\n"
+        f"💹 الربح المحقق: `{pnl_sign}{r['realized_pnl']:.4f}` USDT\n"
+        f"⏳ أيام التشغيل: `{r['days_running']:.1f}`"
+    )
+
+
+async def _cb_pa(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":")[1]
+
+    if action == "back":
+        await _edit(query,
+            "🎯 *Price Action Strategy*\n\n"
+            "يصطاد السيولة عبر:\n"
+            "• تحديد Equal Highs / Equal Lows\n"
+            "• كشف Liquidity Sweep\n"
+            "• تأكيد الشمعة (Engulfing / Hammer)\n"
+            "• دخول Market Order + TP تلقائي",
+            _kb_pa_main(),
+        )
+        return None
+
+    if action == "new":
+        await _edit(query,
+            "🚀 *استراتيجية PA جديدة*\n\nأرسل اسم العملة (مثال: `BTC` أو `SOLUSDT`):",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="pa:back")]]),
+        )
+        return AWAIT_PA_PAIR
+
+    if action == "list":
+        pa_engine = ctx.bot_data.get("pa_engine")
+        symbols   = pa_engine.active_symbols() if pa_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات PA نشطة.", show_alert=True)
+            return None
+        rows = []
+        for sym in symbols:
+            r = pa_engine.calc_report(sym)
+            status = "🔄" if r and r.get("held_qty", 0) > 0 else "🔍"
+            rows.append([InlineKeyboardButton(
+                f"{status} {sym}", callback_data=f"padetail:{sym}"
+            )])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="pa:back")])
+        await _edit(query, "📋 *استراتيجيات PA النشطة:*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "stop_menu":
+        pa_engine = ctx.bot_data.get("pa_engine")
+        symbols   = pa_engine.active_symbols() if pa_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات PA نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"⛔ {s}", callback_data=f"pastop:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="pa:back")])
+        await _edit(query, "⛔ *اختر الاستراتيجية للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    return None
+
+
+async def _recv_pa_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    raw  = (update.message.text or "").strip().upper()
+    pair = raw if "/" in raw else (raw.replace("USDT", "/USDT") if raw.endswith("USDT") else raw + "/USDT")
+    ctx.user_data["pa_pair"] = pair
+    await update.message.reply_text(
+        f"⏱ *التايم فريم — {pair}*\n\nاختر التايم فريم:",
+        reply_markup=_kb_pa_tf(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return AWAIT_PA_CAPITAL
+
+
+async def _cb_patf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    tf   = query.data.split(":")[1]
+    pair = ctx.user_data.get("pa_pair", "")
+    ctx.user_data["pa_tf"] = tf
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("10%",  callback_data=f"pacap:{pair}:{tf}:10"),
+         InlineKeyboardButton("20%",  callback_data=f"pacap:{pair}:{tf}:20"),
+         InlineKeyboardButton("25%",  callback_data=f"pacap:{pair}:{tf}:25")],
+        [InlineKeyboardButton("30%",  callback_data=f"pacap:{pair}:{tf}:30"),
+         InlineKeyboardButton("50%",  callback_data=f"pacap:{pair}:{tf}:50")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="pa:new")],
+    ])
+    await _edit(query,
+        f"💰 *رأس المال لكل صفقة — `{pair}` | `{tf}`*\n\n"
+        f"اختر النسبة من رصيد USDT الحر لكل صفقة:",
+        kb,
+    )
+    return AWAIT_PA_CAPITAL
+
+
+async def _cb_pacap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    # callback_data = "pacap:{pair}:{tf}:{pct}"
+    parts       = query.data.split(":")
+    pair        = parts[1]
+    tf          = parts[2]
+    capital_pct = float(parts[3])
+
+    pa_engine = ctx.bot_data.get("pa_engine")
+    if not pa_engine:
+        await query.answer("❌ PA engine غير متاح.", show_alert=True)
+        return ConversationHandler.END
+
+    await _edit(query,
+        f"⏳ جاري تشغيل استراتيجية PA لـ `{pair}` على `{tf}`…",
+        InlineKeyboardMarkup([]),
+    )
+    try:
+        await pa_engine.start(pair, tf, capital_pct)
+        await query.edit_message_text(
+            f"✅ *PA Strategy مُشغَّلة*\n\n"
+            f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
+            f"💰 رأس المال/صفقة: `{capital_pct:.0f}%` من الرصيد الحر\n\n"
+            f"🔍 البوت يراقب الآن إشارات السيولة…\n"
+            f"سيُرسل إشعار فور اكتشاف إشارة.",
+            reply_markup=_kb_pa_strategy(pair),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await query.edit_message_text(
+            f"❌ فشل التشغيل:\n`{exc}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    return ConversationHandler.END
+
+
+async def _cb_padetail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol    = query.data.split(":", 1)[1]
+    pa_engine = ctx.bot_data.get("pa_engine")
+    if not pa_engine:
+        await query.answer("❌ PA engine غير متاح.", show_alert=True)
+        return
+    report = pa_engine.calc_report(symbol)
+    if not report:
+        await query.answer("لا توجد بيانات لهذه الاستراتيجية.", show_alert=True)
+        return
+    await _edit(query, _fmt_pa_report(report), _kb_pa_strategy(symbol))
+
+
+async def _cb_pastop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol = query.data.split(":", 1)[1]
+    # Confirm first
+    await _edit(query,
+        f"⚠️ *تأكيد الإيقاف*\n\n"
+        f"هل تريد إيقاف PA Strategy لـ `{symbol}`\nوبيع الرصيد فوراً؟",
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ نعم، إيقاف وبيع", callback_data=f"paconfirmstop:{symbol}"),
+             InlineKeyboardButton("❌ إلغاء",           callback_data=f"padetail:{symbol}")],
+        ]),
+    )
+
+
+async def _cb_paconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol    = query.data.split(":", 1)[1]
+    pa_engine = ctx.bot_data.get("pa_engine")
+    if not pa_engine:
+        await query.answer("❌ PA engine غير متاح.", show_alert=True)
+        return
+    try:
+        sell_value = await pa_engine.stop(symbol, market_sell=True)
+        await _edit(query,
+            f"⛔ *PA Strategy متوقفة — `{symbol}`*\n"
+            f"💵 قيمة البيع: `{sell_value:.2f}` USDT",
+            _kb_pa_main(),
+        )
+    except Exception as exc:
+        await query.edit_message_text(f"❌ خطأ:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register_menu_handlers(app: Application) -> None:
@@ -1295,9 +1538,32 @@ def register_menu_handlers(app: Application) -> None:
         per_message=False,
     )
 
+    # ── PA conversation ────────────────────────────────────────────────────────
+    pa_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(_cb_pa,    pattern=r"^pa:new$"),
+        ],
+        states={
+            AWAIT_PA_PAIR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_pa_pair),
+            ],
+            AWAIT_PA_CAPITAL: [
+                CallbackQueryHandler(_cb_patf,   pattern=r"^patf:"),
+                CallbackQueryHandler(_cb_pacap,  pattern=r"^pacap:"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(_cb_menu, pattern=r"^menu:"),
+            CallbackQueryHandler(_cb_pa,   pattern=r"^pa:"),
+        ],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(snr_conv)
+    app.add_handler(pa_conv)
     app.add_handler(CallbackQueryHandler(_cb_menu,  pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_cb_grid,  pattern=r"^grid:"))
 
@@ -1320,5 +1586,10 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(_cb_snrrefresh,     pattern=r"^snrrefresh:"))
     app.add_handler(CallbackQueryHandler(_cb_snrstop,        pattern=r"^snrstop:"))
     app.add_handler(CallbackQueryHandler(_cb_snrconfirmstop, pattern=r"^snrconfirmstop:"))
+    # PA callbacks
+    app.add_handler(CallbackQueryHandler(_cb_pa,            pattern=r"^pa:"))
+    app.add_handler(CallbackQueryHandler(_cb_padetail,      pattern=r"^padetail:"))
+    app.add_handler(CallbackQueryHandler(_cb_pastop,        pattern=r"^pastop:"))
+    app.add_handler(CallbackQueryHandler(_cb_paconfirmstop, pattern=r"^paconfirmstop:"))
 
-    logger.info("Grid + S&R menu handlers registered")
+    logger.info("Grid + S&R + PA menu handlers registered")

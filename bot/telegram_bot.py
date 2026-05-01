@@ -55,14 +55,16 @@ def _normalize_symbol(symbol: str) -> str:
     return symbol
 RISK_LEVELS = ["low", "medium", "high"]
 
-_engine = None
-_client = None
+_engine    = None
+_client    = None
+_pa_engine = None
 
 
-def set_engine(engine, client) -> None:
-    global _engine, _client
-    _engine = engine
-    _client = client
+def set_engine(engine, client, pa_engine=None) -> None:
+    global _engine, _client, _pa_engine
+    _engine    = engine
+    _client    = client
+    _pa_engine = pa_engine
 
 
 def _is_allowed(update: Update) -> bool:
@@ -1407,9 +1409,213 @@ async def cmd_upgrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
-def build_application(engine, client) -> Application:
+# ── PA Strategy commands ───────────────────────────────────────────────────────
+
+async def cmd_pa_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pa_start SYMBOL TIMEFRAME CAPITAL_PCT — start a Price Action strategy.
+    Example: /pa_start BTC/USDT 15m 20
+    """
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not _pa_engine:
+        await update.message.reply_text("❌ PA engine غير مفعّل.")
+        return
+    if len(ctx.args) < 3:
+        await update.message.reply_text(
+            "الاستخدام: `/pa_start SYMBOL TIMEFRAME CAPITAL_PCT`\n"
+            "مثال: `/pa_start BTC/USDT 15m 20`",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol      = _normalize_symbol(ctx.args[0])
+    timeframe   = ctx.args[1].lower()
+    try:
+        capital_pct = float(ctx.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ النسبة يجب أن تكون رقماً. مثال: `20`", parse_mode="Markdown")
+        return
+
+    if not (1 <= capital_pct <= 100):
+        await update.message.reply_text("❌ النسبة يجب أن تكون بين 1 و 100.")
+        return
+
+    await update.message.reply_text(
+        f"⏳ جاري تشغيل استراتيجية PA لـ `{_fmt_symbol(symbol)}`…",
+        parse_mode="Markdown",
+    )
+    try:
+        state = await _pa_engine.start(symbol, timeframe, capital_pct)
+        await update.message.reply_text(
+            f"✅ *PA Strategy — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏱ التايم فريم: `{timeframe}`\n"
+            f"💰 رأس المال لكل صفقة: `{capital_pct:.0f}%` من الرصيد الحر\n"
+            f"🔍 البوت يراقب الآن إشارات السيولة…\n"
+            f"📌 الأوامر:\n"
+            f"  • `/pa_status {symbol}` — حالة الاستراتيجية\n"
+            f"  • `/pa_stop {symbol}` — إيقاف",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("pa_start failed for %s: %s", symbol, exc)
+        await update.message.reply_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode="Markdown")
+
+
+async def cmd_pa_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pa_stop SYMBOL — stop a running PA strategy."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not _pa_engine:
+        await update.message.reply_text("❌ PA engine غير مفعّل.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("الاستخدام: `/pa_stop SYMBOL`", parse_mode="Markdown")
+        return
+
+    symbol = _normalize_symbol(ctx.args[0])
+    try:
+        sell_value = await _pa_engine.stop(symbol, market_sell=True)
+        await update.message.reply_text(
+            f"⛔ *PA Strategy متوقفة — {_fmt_symbol(symbol)}*\n"
+            f"💵 قيمة البيع: `{sell_value:.2f}` USDT",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ خطأ:\n`{exc}`", parse_mode="Markdown")
+
+
+async def cmd_pa_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pa_status [SYMBOL] — show PA strategy status."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not _pa_engine:
+        await update.message.reply_text("❌ PA engine غير مفعّل.")
+        return
+
+    symbols = (
+        [_normalize_symbol(ctx.args[0])] if ctx.args
+        else _pa_engine.active_symbols()
+    )
+
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد استراتيجيات PA نشطة حالياً.")
+        return
+
+    for sym in symbols:
+        report = _pa_engine.calc_report(sym)
+        if not report:
+            await update.message.reply_text(f"❌ لا توجد استراتيجية PA لـ `{_fmt_symbol(sym)}`", parse_mode="Markdown")
+            continue
+
+        direction_ar = {"buy": "شراء 📥", "sell": "بيع 📤", "": "لا يوجد ⏳"}.get(report["direction"], "—")
+        pnl_sign     = "+" if report["realized_pnl"] >= 0 else ""
+
+        pos_lines = ""
+        if report["held_qty"] > 0:
+            pos_lines = (
+                f"📌 الاتجاه: {direction_ar}\n"
+                f"🪙 الكمية: `{report['held_qty']:.6f}`\n"
+                f"💵 سعر الدخول: `{report['avg_entry_price']:.6f}`\n"
+                f"🎯 الهدف (TP): `{report['tp_price']:.6f}`\n"
+            )
+        else:
+            pos_lines = f"📌 الوضع: {direction_ar}\n"
+
+        await update.message.reply_text(
+            f"📊 *PA Strategy — {_fmt_symbol(sym)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏱ التايم فريم: `{report['timeframe']}`\n"
+            f"💰 رأس المال/صفقة: `{report['capital_pct']:.0f}%`\n"
+            f"{pos_lines}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 الصفقات: `{report['trade_count']}` | الرابحة: `{report['win_count']}` ({report['win_rate']:.0f}%)\n"
+            f"💹 الربح المحقق: `{pnl_sign}{report['realized_pnl']:.4f}` USDT\n"
+            f"⏳ أيام التشغيل: `{report['days_running']:.1f}`",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_pa_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pa_list — list all active PA strategies."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    if not _pa_engine:
+        await update.message.reply_text("❌ PA engine غير مفعّل.")
+        return
+
+    symbols = _pa_engine.active_symbols()
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد استراتيجيات PA نشطة.")
+        return
+
+    lines = ["📋 *استراتيجيات Price Action النشطة:*\n━━━━━━━━━━━━━━━━━━━━"]
+    for sym in symbols:
+        r = _pa_engine.calc_report(sym)
+        if not r:
+            continue
+        status = "🔄 في صفقة" if r["held_qty"] > 0 else "🔍 يراقب"
+        pnl_sign = "+" if r["realized_pnl"] >= 0 else ""
+        lines.append(
+            f"• `{_fmt_symbol(sym)}` | {r['timeframe']} | {status}\n"
+            f"  💹 PnL: `{pnl_sign}{r['realized_pnl']:.4f}` | صفقات: `{r['trade_count']}`"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ── PA Notifications ───────────────────────────────────────────────────────────
+
+async def notify_pa_entry(
+    symbol: str, direction: str, price: float, qty: float,
+    pattern: str, trend: str, tp: float,
+) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "pa_entry", f"{price:.6f}"):
+        return
+    dir_ar   = "شراء 📥" if direction == "buy" else "بيع 📤"
+    trend_ar = {"up": "صاعد ↗️", "down": "هابط ↘️", "sideways": "جانبي ↔️"}.get(trend, trend)
+    pattern_ar = {
+        "bullish_engulfing": "ابتلاع صاعد 🟢",
+        "bearish_engulfing": "ابتلاع هابط 🔴",
+        "hammer":            "مطرقة 🔨",
+        "shooting_star":     "نجمة ساقطة ⭐",
+    }.get(pattern, pattern)
+    await _send(
+        f"🎯 *إشارة PA — {dir_ar}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"📊 الاتجاه: {trend_ar}\n"
+        f"🕯 النمط: {pattern_ar}\n"
+        f"💵 سعر الدخول: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"🎯 الهدف (TP): `{tp:.6f}`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_pa_tp_hit(
+    symbol: str, price: float, qty: float, pnl: float,
+    trade_count: int, win_count: int,
+) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "pa_tp", f"{price:.6f}"):
+        return
+    pnl_sign = "+" if pnl >= 0 else ""
+    win_rate = round(win_count / trade_count * 100) if trade_count else 0
+    await _send(
+        f"✅ *TP محقق — PA Strategy*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"💵 سعر الإغلاق: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💹 الربح: `{pnl_sign}{pnl:.4f}` USDT\n"
+        f"📈 الصفقات: `{trade_count}` | نسبة الفوز: `{win_rate}%`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+def build_application(engine, client, pa_engine=None) -> Application:
     global _application
-    set_engine(engine, client)
+    set_engine(engine, client, pa_engine)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     _application = app
 
@@ -1427,6 +1633,12 @@ def build_application(engine, client) -> Application:
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("upgrade", cmd_upgrade))
     app.add_handler(CommandHandler("balance", cmd_balance))
+
+    # ── Price Action strategy handlers ────────────────────────────────────────
+    app.add_handler(CommandHandler("pa_start",  cmd_pa_start))
+    app.add_handler(CommandHandler("pa_stop",   cmd_pa_stop))
+    app.add_handler(CommandHandler("pa_status", cmd_pa_status))
+    app.add_handler(CommandHandler("pa_list",   cmd_pa_list))
 
     # ── Interactive menu handlers ──────────────────────────────────────────────
     from bot.menu_bot import register_menu_handlers
