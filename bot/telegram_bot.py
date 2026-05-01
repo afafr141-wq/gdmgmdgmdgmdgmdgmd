@@ -127,10 +127,11 @@ def _active_grid_kb(symbol: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💰 تعديل الرصيد",  callback_data=f"adjinv_show:{symbol}"),
          InlineKeyboardButton("📈 تقارير الفترة", callback_data=f"reports_{symbol}")],
         [InlineKeyboardButton("⚙️ تعديل شبكات",   callback_data=f"editgrid_{symbol}"),
-         InlineKeyboardButton("🔄 مزامنة رصيد",   callback_data=f"syncbal_prompt:{symbol}")],
-        [InlineKeyboardButton(mute_label,          callback_data=mute_cb),
-         InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}")],
-        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")],
+         InlineKeyboardButton("📐 نسبة فوق/تحت",  callback_data=f"editpct_{symbol}")],
+        [InlineKeyboardButton("🔄 مزامنة رصيد",   callback_data=f"syncbal_prompt:{symbol}"),
+         InlineKeyboardButton(mute_label,          callback_data=mute_cb)],
+        [InlineKeyboardButton("⛔ إيقاف وبيع",    callback_data=f"stop_{symbol}"),
+         InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu_main")],
     ])
 
 
@@ -877,6 +878,96 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as exc:
             await query.edit_message_text(f"❌ فشل التعديل: `{exc}`", parse_mode="Markdown",
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")]]))
+
+    elif data.startswith("editpct_"):
+        symbol = data[8:]
+        state  = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        up  = state.upper_pct
+        dn  = state.lower_pct
+        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
+        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
+        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
+        kb = InlineKeyboardMarkup([
+            up_row[:3], up_row[3:],
+            dn_row[:3], dn_row[3:],
+            [InlineKeyboardButton("🔙 رجوع", callback_data=f"detail_{symbol}")],
+        ])
+        await query.edit_message_text(
+            f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 النسبة العلوية الحالية: `{up:.1f}%`\n"
+            f"📉 النسبة السفلية الحالية: `{dn:.1f}%`\n\n"
+            f"▲ اختر النسبة العلوية (فوق الحد الأعلى للشبكة):\n"
+            f"▼ اختر النسبة السفلية (تحت الحد الأدنى للشبكة):",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("setuppct:"):
+        parts  = data.split(":")
+        symbol = parts[1]
+        new_up = float(parts[2])
+        state  = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        state.upper_pct = new_up
+        await query.answer(f"✅ النسبة العلوية: {new_up}%", show_alert=False)
+        # إعادة عرض صفحة التعديل بالقيم الجديدة
+        up  = state.upper_pct
+        dn  = state.lower_pct
+        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
+        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
+        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
+        kb = InlineKeyboardMarkup([
+            up_row[:3], up_row[3:],
+            dn_row[:3], dn_row[3:],
+            [InlineKeyboardButton("✅ تم — رجوع للتفاصيل", callback_data=f"detail_{symbol}")],
+        ])
+        await query.edit_message_text(
+            f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 النسبة العلوية: `{up:.1f}%` ✅\n"
+            f"📉 النسبة السفلية: `{dn:.1f}%`\n\n"
+            f"▲ اختر النسبة العلوية:\n"
+            f"▼ اختر النسبة السفلية:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+
+    elif data.startswith("setdnpct:"):
+        parts  = data.split(":")
+        symbol = parts[1]
+        new_dn = float(parts[2])
+        state  = _engine.get_state(symbol) if _engine else None
+        if not state:
+            await query.answer("الشبكة غير نشطة.", show_alert=True)
+            return
+        state.lower_pct = new_dn
+        await query.answer(f"✅ النسبة السفلية: {new_dn}%", show_alert=False)
+        up  = state.upper_pct
+        dn  = state.lower_pct
+        pcts = [1.0, 2.0, 3.0, 5.0, 7.0, 10.0]
+        up_row = [InlineKeyboardButton(f"▲ {p}%", callback_data=f"setuppct:{symbol}:{p}") for p in pcts]
+        dn_row = [InlineKeyboardButton(f"▼ {p}%", callback_data=f"setdnpct:{symbol}:{p}") for p in pcts]
+        kb = InlineKeyboardMarkup([
+            up_row[:3], up_row[3:],
+            dn_row[:3], dn_row[3:],
+            [InlineKeyboardButton("✅ تم — رجوع للتفاصيل", callback_data=f"detail_{symbol}")],
+        ])
+        await query.edit_message_text(
+            f"📐 *تعديل نسبة الخروج — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 النسبة العلوية: `{up:.1f}%`\n"
+            f"📉 النسبة السفلية: `{dn:.1f}%` ✅\n\n"
+            f"▲ اختر النسبة العلوية:\n"
+            f"▼ اختر النسبة السفلية:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
 
     elif data.startswith("syncbal_yes:"):
         symbol = data[12:]
