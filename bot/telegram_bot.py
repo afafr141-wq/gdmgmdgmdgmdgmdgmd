@@ -1827,11 +1827,250 @@ async def notify_pa_tp_hit(
     )
 
 
-def build_application(engine, client, pa_engine=None) -> Application:
+# ── Liquidity Swings notifiers ─────────────────────────────────────────────────
+
+async def notify_ls_entry(
+    symbol: str, price: float, qty: float,
+    tp: float, sl: float, touch_count: int, zone,
+) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "ls_entry", f"{price:.6f}"):
+        return
+    await _send(
+        f"🎯 *إشارة Liquidity Swings — شراء 📥*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"🔢 عدد اللمسات: `{touch_count}`\n"
+        f"📦 منطقة السيولة: `{zone.zone_bottom:.6f}` — `{zone.zone_top:.6f}`\n"
+        f"💵 سعر الدخول: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"🎯 الهدف (TP): `{tp:.6f}`\n"
+        f"🛡 وقف الخسارة (SL): `{sl:.6f}`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_ls_tp_hit(
+    symbol: str, price: float, qty: float, pnl: float,
+    trade_count: int, win_count: int,
+) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "ls_tp", f"{price:.6f}"):
+        return
+    pnl_sign = "+" if pnl >= 0 else ""
+    win_rate = round(win_count / trade_count * 100) if trade_count else 0
+    await _send(
+        f"✅ *TP محقق — Liquidity Swings*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"💵 سعر الإغلاق: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💹 الربح: `{pnl_sign}{pnl:.4f}` USDT\n"
+        f"📈 الصفقات: `{trade_count}` | نسبة الفوز: `{win_rate}%`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+async def notify_ls_sl_hit(
+    symbol: str, price: float, qty: float, pnl: float,
+    trade_count: int, win_count: int,
+) -> None:
+    if _is_muted(symbol) or _dedup_key(symbol, "ls_sl", f"{price:.6f}"):
+        return
+    pnl_sign = "+" if pnl >= 0 else ""
+    win_rate = round(win_count / trade_count * 100) if trade_count else 0
+    await _send(
+        f"🛡 *SL مُفعَّل — Liquidity Swings*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
+        f"💵 سعر الإغلاق: `{price:.6f}`\n"
+        f"🪙 الكمية: `{qty:.6f}`\n"
+        f"💹 الخسارة: `{pnl_sign}{pnl:.4f}` USDT\n"
+        f"📈 الصفقات: `{trade_count}` | نسبة الفوز: `{win_rate}%`\n"
+        f"🕐 الوقت: `{_now_str()}`"
+    )
+
+
+# ── Liquidity Swings commands ──────────────────────────────────────────────────
+
+async def cmd_ls_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ls_start SYMBOL TIMEFRAME CAPITAL_PCT [MIN_TOUCHES]
+    Example: /ls_start BTC/USDT 1h 20
+             /ls_start BTC/USDT 1h 20 3
+    """
+    if not _is_allowed(update):
+        return await _deny(update)
+    ls_engine = ctx.bot_data.get("ls_engine") if ctx.bot_data else None
+    if not ls_engine:
+        await update.message.reply_text("❌ Liquidity Swings engine غير مفعّل.")
+        return
+    if len(ctx.args) < 3:
+        await update.message.reply_text(
+            "الاستخدام: `/ls_start SYMBOL TIMEFRAME CAPITAL_PCT [MIN_TOUCHES]`\n"
+            "مثال: `/ls_start BTC/USDT 1h 20`\n"
+            "أو مع تحديد عدد اللمسات: `/ls_start BTC/USDT 1h 20 3`",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol    = _normalize_symbol(ctx.args[0])
+    timeframe = ctx.args[1].lower()
+    try:
+        capital_pct = float(ctx.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ النسبة يجب أن تكون رقماً.", parse_mode="Markdown")
+        return
+
+    if not (1 <= capital_pct <= 100):
+        await update.message.reply_text("❌ النسبة يجب أن تكون بين 1 و 100.")
+        return
+
+    min_touches = 2
+    if len(ctx.args) >= 4:
+        try:
+            min_touches = max(1, int(ctx.args[3]))
+        except ValueError:
+            pass
+
+    from core.liquidity_swings_strategy_engine import LSParams
+    params = LSParams(min_touches=min_touches)
+
+    await update.message.reply_text(
+        f"⏳ جاري تشغيل Liquidity Swings لـ `{_fmt_symbol(symbol)}`…",
+        parse_mode="Markdown",
+    )
+    try:
+        await ls_engine.start(symbol, timeframe, capital_pct, params)
+        await update.message.reply_text(
+            f"✅ *Liquidity Swings — {_fmt_symbol(symbol)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏱ التايم فريم: `{timeframe}`\n"
+            f"💰 رأس المال/صفقة: `{capital_pct:.0f}%`\n"
+            f"🔢 الحد الأدنى للمسات: `{min_touches}`\n"
+            f"🔍 البوت يراقب مناطق السيولة…\n"
+            f"📌 الأوامر:\n"
+            f"  • `/ls_status {symbol}` — الحالة\n"
+            f"  • `/ls_stop {symbol}` — إيقاف",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        logger.error("ls_start failed for %s: %s", symbol, exc)
+        await update.message.reply_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode="Markdown")
+
+
+async def cmd_ls_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ls_stop SYMBOL"""
+    if not _is_allowed(update):
+        return await _deny(update)
+    ls_engine = ctx.bot_data.get("ls_engine") if ctx.bot_data else None
+    if not ls_engine:
+        await update.message.reply_text("❌ Liquidity Swings engine غير مفعّل.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("الاستخدام: `/ls_stop SYMBOL`", parse_mode="Markdown")
+        return
+
+    symbol = _normalize_symbol(ctx.args[0])
+    try:
+        sell_value = await ls_engine.stop(symbol, market_sell=True)
+        await update.message.reply_text(
+            f"⛔ *Liquidity Swings متوقفة — {_fmt_symbol(symbol)}*\n"
+            f"💵 قيمة البيع: `{sell_value:.2f}` USDT",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ خطأ:\n`{exc}`", parse_mode="Markdown")
+
+
+async def cmd_ls_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ls_status [SYMBOL]"""
+    if not _is_allowed(update):
+        return await _deny(update)
+    ls_engine = ctx.bot_data.get("ls_engine") if ctx.bot_data else None
+    if not ls_engine:
+        await update.message.reply_text("❌ Liquidity Swings engine غير مفعّل.")
+        return
+
+    symbols = (
+        [_normalize_symbol(ctx.args[0])] if ctx.args
+        else ls_engine.active_symbols()
+    )
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد استراتيجيات Liquidity Swings نشطة.")
+        return
+
+    for sym in symbols:
+        r = ls_engine.calc_report(sym)
+        if not r:
+            await update.message.reply_text(
+                f"❌ لا توجد استراتيجية LS لـ `{_fmt_symbol(sym)}`",
+                parse_mode="Markdown",
+            )
+            continue
+
+        pnl_sign = "+" if r["realized_pnl"] >= 0 else ""
+        pos_lines = ""
+        if r["held_qty"] > 0:
+            pos_lines = (
+                f"📌 الوضع: في صفقة شراء\n"
+                f"🪙 الكمية: `{r['held_qty']:.6f}`\n"
+                f"💵 سعر الدخول: `{r['avg_entry_price']:.6f}`\n"
+                f"🎯 الهدف (TP): `{r['tp_price']:.6f}`\n"
+                f"🛡 وقف الخسارة: `{r['sl_price']:.6f}`\n"
+            )
+        else:
+            pos_lines = "📌 الوضع: يراقب مناطق السيولة ⏳\n"
+
+        await update.message.reply_text(
+            f"📊 *Liquidity Swings — {_fmt_symbol(sym)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏱ التايم فريم: `{r['timeframe']}`\n"
+            f"💰 رأس المال/صفقة: `{r['capital_pct']:.0f}%`\n"
+            f"🔢 الحد الأدنى للمسات: `{r['min_touches']}`\n"
+            f"📐 نوع المنطقة: `{r['swing_area']}`\n"
+            f"{pos_lines}"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📈 الصفقات: `{r['trade_count']}` | الرابحة: `{r['win_count']}` ({r['win_rate']:.0f}%)\n"
+            f"💹 الربح المحقق: `{pnl_sign}{r['realized_pnl']:.4f}` USDT\n"
+            f"⏳ أيام التشغيل: `{r['days_running']:.1f}`",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_ls_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ls_list — list all active Liquidity Swings strategies."""
+    if not _is_allowed(update):
+        return await _deny(update)
+    ls_engine = ctx.bot_data.get("ls_engine") if ctx.bot_data else None
+    if not ls_engine:
+        await update.message.reply_text("❌ Liquidity Swings engine غير مفعّل.")
+        return
+
+    symbols = ls_engine.active_symbols()
+    if not symbols:
+        await update.message.reply_text("📭 لا توجد استراتيجيات Liquidity Swings نشطة.")
+        return
+
+    lines = ["📋 *استراتيجيات Liquidity Swings النشطة:*\n━━━━━━━━━━━━━━━━━━━━"]
+    for sym in symbols:
+        r = ls_engine.calc_report(sym)
+        if r:
+            pnl_sign = "+" if r["realized_pnl"] >= 0 else ""
+            in_pos   = "🟢 في صفقة" if r["held_qty"] > 0 else "⚪ يراقب"
+            lines.append(
+                f"• `{_fmt_symbol(sym)}` | {r['timeframe']} | {in_pos}\n"
+                f"  PnL: `{pnl_sign}{r['realized_pnl']:.4f}` | "
+                f"صفقات: `{r['trade_count']}` | فوز: `{r['win_rate']:.0f}%`"
+            )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+def build_application(engine, client, pa_engine=None, ls_engine=None) -> Application:
     global _application
     set_engine(engine, client, pa_engine)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     _application = app
+
+    if ls_engine is not None:
+        app.bot_data["ls_engine"] = ls_engine
 
     # ── Grid bot handlers ──────────────────────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1854,6 +2093,12 @@ def build_application(engine, client, pa_engine=None) -> Application:
     app.add_handler(CommandHandler("pa_status",  cmd_pa_status))
     app.add_handler(CommandHandler("pa_list",    cmd_pa_list))
     app.add_handler(CommandHandler("explain_pa", cmd_explain_pa))
+
+    # ── Liquidity Swings strategy handlers ────────────────────────────────────
+    app.add_handler(CommandHandler("ls_start",  cmd_ls_start))
+    app.add_handler(CommandHandler("ls_stop",   cmd_ls_stop))
+    app.add_handler(CommandHandler("ls_status", cmd_ls_status))
+    app.add_handler(CommandHandler("ls_list",   cmd_ls_list))
 
     # ── Interactive menu handlers ──────────────────────────────────────────────
     from bot.menu_bot import register_menu_handlers

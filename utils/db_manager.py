@@ -447,3 +447,156 @@ async def get_pa_trade_history(symbol: str, days: int = 30) -> list[dict]:
             symbol, days,
         )
     return [dict(r) for r in rows]
+
+
+# ── active_ls_strategies (Liquidity Swings) ────────────────────────────────────
+
+async def _create_ls_tables(conn) -> None:
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS active_ls_strategies (
+            id               SERIAL PRIMARY KEY,
+            symbol           TEXT NOT NULL UNIQUE,
+            timeframe        TEXT NOT NULL DEFAULT '1h',
+            capital_pct      NUMERIC NOT NULL DEFAULT 10,
+            pivot_left       INTEGER NOT NULL DEFAULT 14,
+            pivot_right      INTEGER NOT NULL DEFAULT 14,
+            swing_area       TEXT NOT NULL DEFAULT 'Wick Extremity',
+            min_touches      INTEGER NOT NULL DEFAULT 2,
+            sl_buffer_pct    NUMERIC NOT NULL DEFAULT 0.3,
+            held_qty         NUMERIC DEFAULT 0,
+            avg_entry_price  NUMERIC DEFAULT 0,
+            tp_price         NUMERIC DEFAULT 0,
+            sl_price         NUMERIC DEFAULT 0,
+            realized_pnl     NUMERIC DEFAULT 0,
+            trade_count      INTEGER DEFAULT 0,
+            win_count        INTEGER DEFAULT 0,
+            started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            is_active        BOOLEAN NOT NULL DEFAULT TRUE
+        );
+
+        CREATE TABLE IF NOT EXISTS ls_trade_history (
+            id          SERIAL PRIMARY KEY,
+            symbol      TEXT NOT NULL,
+            side        TEXT NOT NULL,
+            price       NUMERIC NOT NULL,
+            qty         NUMERIC NOT NULL,
+            order_id    TEXT DEFAULT '',
+            strategy_id INTEGER REFERENCES active_ls_strategies(id),
+            pnl         NUMERIC DEFAULT 0,
+            reason      TEXT DEFAULT '',
+            executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+
+
+async def upsert_ls_strategy(data: dict) -> int:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await _create_ls_tables(conn)
+        sid = await conn.fetchval(
+            """
+            INSERT INTO active_ls_strategies
+                (symbol, timeframe, capital_pct, pivot_left, pivot_right,
+                 swing_area, min_touches, sl_buffer_pct, is_active)
+            VALUES ($1, $2, $3::numeric, $4::integer, $5::integer,
+                    $6, $7::integer, $8::numeric, $9::boolean)
+            ON CONFLICT (symbol) DO UPDATE SET
+                timeframe     = COALESCE(EXCLUDED.timeframe,    active_ls_strategies.timeframe),
+                capital_pct   = CASE WHEN $3::numeric > 0
+                                     THEN $3::numeric
+                                     ELSE active_ls_strategies.capital_pct END,
+                pivot_left    = CASE WHEN $4::integer > 0
+                                     THEN $4::integer
+                                     ELSE active_ls_strategies.pivot_left END,
+                pivot_right   = CASE WHEN $5::integer > 0
+                                     THEN $5::integer
+                                     ELSE active_ls_strategies.pivot_right END,
+                swing_area    = COALESCE(EXCLUDED.swing_area,   active_ls_strategies.swing_area),
+                min_touches   = CASE WHEN $7::integer > 0
+                                     THEN $7::integer
+                                     ELSE active_ls_strategies.min_touches END,
+                sl_buffer_pct = CASE WHEN $8::numeric > 0
+                                     THEN $8::numeric
+                                     ELSE active_ls_strategies.sl_buffer_pct END,
+                is_active     = EXCLUDED.is_active,
+                updated_at    = NOW()
+            RETURNING id
+            """,
+            data.get("symbol", ""),
+            data.get("timeframe", "1h"),
+            float(data.get("capital_pct", 10)),
+            int(data.get("pivot_left", 14)),
+            int(data.get("pivot_right", 14)),
+            data.get("swing_area", "Wick Extremity"),
+            int(data.get("min_touches", 2)),
+            float(data.get("sl_buffer_pct", 0.3)),
+            bool(data.get("is_active", True)),
+        )
+    return sid
+
+
+async def get_all_active_ls_strategies() -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await _create_ls_tables(conn)
+        rows = await conn.fetch(
+            "SELECT * FROM active_ls_strategies WHERE is_active = TRUE ORDER BY started_at"
+        )
+    return [dict(r) for r in rows]
+
+
+async def deactivate_ls_strategy(symbol: str) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE active_ls_strategies SET is_active = FALSE, updated_at = NOW() WHERE symbol = $1",
+            symbol,
+        )
+
+
+async def update_ls_strategy_state(
+    symbol: str, held_qty: float, avg_entry_price: float,
+    tp_price: float, sl_price: float, realized_pnl: float,
+    trade_count: int, win_count: int,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE active_ls_strategies
+               SET held_qty = $2, avg_entry_price = $3,
+                   tp_price = $4, sl_price = $5,
+                   realized_pnl = $6, trade_count = $7,
+                   win_count = $8, updated_at = NOW()
+               WHERE symbol = $1""",
+            symbol, held_qty, avg_entry_price,
+            tp_price, sl_price, realized_pnl, trade_count, win_count,
+        )
+
+
+async def record_ls_trade(
+    symbol: str, side: str, price: float, qty: float,
+    order_id: str = "", strategy_id: Optional[int] = None,
+    pnl: float = 0.0, reason: str = "",
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO ls_trade_history
+               (symbol, side, price, qty, order_id, strategy_id, pnl, reason)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
+            symbol, side, price, qty, order_id, strategy_id, pnl, reason,
+        )
+
+
+async def get_ls_trade_history(symbol: str, days: int = 30) -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM ls_trade_history
+               WHERE symbol = $1
+                 AND executed_at >= NOW() - ($2 * INTERVAL '1 day')
+               ORDER BY executed_at DESC""",
+            symbol, days,
+        )
+    return [dict(r) for r in rows]

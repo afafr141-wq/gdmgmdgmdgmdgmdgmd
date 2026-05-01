@@ -42,6 +42,14 @@ PA_PIVOT_LEFT:       int   = int(os.getenv("PA_PIVOT_LEFT",       "3"))
 PA_PIVOT_RIGHT:      int   = int(os.getenv("PA_PIVOT_RIGHT",      "3"))
 PA_EQUAL_TOLERANCE:  float = float(os.getenv("PA_EQUAL_TOLERANCE", "0.3"))  # % band for equal H/L
 
+# ── Liquidity Swings strategy (matches LuxAlgo Liquidity Swings) ───────────────
+LS_LOOKBACK_CANDLES: int   = int(os.getenv("LS_LOOKBACK_CANDLES", "300"))
+LS_PIVOT_LEFT:       int   = int(os.getenv("LS_PIVOT_LEFT",       "14"))  # bars left  of pivot
+LS_PIVOT_RIGHT:      int   = int(os.getenv("LS_PIVOT_RIGHT",      "14"))  # bars right of pivot
+LS_MIN_TOUCHES:      int   = int(os.getenv("LS_MIN_TOUCHES",      "2"))   # min zone touches before entry
+LS_SL_BUFFER_PCT:    float = float(os.getenv("LS_SL_BUFFER_PCT",  "0.3")) # % beyond pivot extreme for SL
+LS_SWING_AREA:       str   = os.getenv("LS_SWING_AREA", "Wick Extremity") # "Wick Extremity" | "Full Range"
+
 # ── S/R detection (swing high/low — matches LuxAlgo S&R Channels) ─────────────
 SR_LOOKBACK_CANDLES: int   = 300
 SR_PIVOT_LEFT:       int   = int(os.getenv("SR_PIVOT_LEFT",       "5"))   # bars left  of swing point
