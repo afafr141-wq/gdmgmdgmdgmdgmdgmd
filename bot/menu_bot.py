@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
     AWAIT_ADJUST_INV,      # adjust investment: new amount (free text)
     AWAIT_PA_PAIR,         # PA: trading pair
     AWAIT_PA_CAPITAL,      # PA: capital % per trade
-) = range(8)
+    AWAIT_LS_PAIR,         # LS: trading pair
+    AWAIT_LS_CAPITAL,      # LS: capital % per trade
+) = range(10)
 
 PA_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
 
@@ -80,11 +82,12 @@ def _main_menu_text(ctx=None) -> str:
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 شبكة جديدة",         callback_data="menu:grid"),
+        [InlineKeyboardButton("🚀 شبكة جديدة",           callback_data="menu:grid"),
          InlineKeyboardButton("📊 متابعة وإدارة الشبكات", callback_data="menu:manage")],
-        [InlineKeyboardButton("🔄 ترقية الشبكات",      callback_data="settings_upgradeall"),
-         InlineKeyboardButton("🎯 Price Action",       callback_data="pa:back")],
-        [InlineKeyboardButton("❓ مساعدة",              callback_data="help:main")],
+        [InlineKeyboardButton("🔄 ترقية الشبكات",        callback_data="settings_upgradeall"),
+         InlineKeyboardButton("🎯 Price Action",         callback_data="pa:back")],
+        [InlineKeyboardButton("💧 Liquidity Swings",     callback_data="ls:back")],
+        [InlineKeyboardButton("❓ مساعدة",                callback_data="help:main")],
     ])
 
 
@@ -848,6 +851,223 @@ async def _cb_paconfirmstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text(f"❌ خطأ:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
 
 
+# ── Liquidity Swings Menu ──────────────────────────────────────────────────────
+
+LS_TIMEFRAMES = ["15m", "30m", "1h", "4h", "1d"]
+
+
+def _kb_ls_main(ctx=None) -> InlineKeyboardMarkup:
+    ls_engine = ctx.bot_data.get("ls_engine") if ctx and hasattr(ctx, "bot_data") else None
+    symbols   = ls_engine.active_symbols() if ls_engine else []
+    rows = [
+        [InlineKeyboardButton("➕ استراتيجية جديدة", callback_data="ls:new")],
+    ]
+    if symbols:
+        rows.append([InlineKeyboardButton("📋 الاستراتيجيات النشطة", callback_data="ls:list")])
+        rows.append([InlineKeyboardButton("⛔ إيقاف استراتيجية",     callback_data="ls:stop_menu")])
+    rows.append([InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_ls_tf() -> InlineKeyboardMarkup:
+    row1 = [InlineKeyboardButton(tf, callback_data=f"lstf:{tf}") for tf in LS_TIMEFRAMES[:3]]
+    row2 = [InlineKeyboardButton(tf, callback_data=f"lstf:{tf}") for tf in LS_TIMEFRAMES[3:]]
+    return InlineKeyboardMarkup([row1, row2, [InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")]])
+
+
+def _kb_ls_strategy(symbol: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ إيقاف وبيع", callback_data=f"lsstop:{symbol}")],
+        [InlineKeyboardButton("🔙 رجوع",       callback_data="ls:list")],
+    ])
+
+
+def _fmt_ls_report(r: dict) -> str:
+    pnl_sign = "+" if r["realized_pnl"] >= 0 else ""
+    pos = (
+        f"📌 في صفقة شراء\n"
+        f"🪙 الكمية: `{r['held_qty']:.6f}`\n"
+        f"💵 سعر الدخول: `{r['avg_entry_price']:.6f}`\n"
+        f"🎯 TP: `{r['tp_price']:.6f}`\n"
+        f"🛡 SL: `{r['sl_price']:.6f}`\n"
+    ) if r["held_qty"] > 0 else "📌 يراقب مناطق السيولة ⏳\n"
+    return (
+        f"💧 *Liquidity Swings — `{r['symbol']}`*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ التايم فريم: `{r['timeframe']}`\n"
+        f"💰 رأس المال/صفقة: `{r['capital_pct']:.0f}%`\n"
+        f"🔢 الحد الأدنى للمسات: `{r['min_touches']}`\n"
+        f"📐 نوع المنطقة: `{r['swing_area']}`\n"
+        f"{pos}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 الصفقات: `{r['trade_count']}` | الرابحة: `{r['win_count']}` ({r['win_rate']:.0f}%)\n"
+        f"💹 الربح المحقق: `{pnl_sign}{r['realized_pnl']:.4f}` USDT\n"
+        f"⏳ أيام التشغيل: `{r['days_running']:.1f}`"
+    )
+
+
+async def _cb_ls(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+
+    if action == "back":
+        ls_engine = ctx.bot_data.get("ls_engine")
+        symbols   = ls_engine.active_symbols() if ls_engine else []
+        count     = len(symbols)
+        status    = "🟢 يعمل" if count else "⚪ لا توجد استراتيجيات"
+        await _edit(query,
+            f"💧 *Liquidity Swings*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 الحالة: {status}\n"
+            f"📊 استراتيجيات نشطة: `{count}`\n\n"
+            f"اختر من القائمة أدناه:",
+            _kb_ls_main(ctx),
+        )
+        return None
+
+    if action == "new":
+        await _edit(query,
+            "💧 *Liquidity Swings — استراتيجية جديدة*\n\n"
+            "أرسل اسم العملة (مثال: `BTC` أو `SOLUSDT`):",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")]]),
+        )
+        return AWAIT_LS_PAIR
+
+    if action == "list":
+        ls_engine = ctx.bot_data.get("ls_engine")
+        symbols   = ls_engine.active_symbols() if ls_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات نشطة.", show_alert=True)
+            return None
+        rows = []
+        for sym in symbols:
+            r      = ls_engine.calc_report(sym)
+            status = "🟢" if r and r["held_qty"] > 0 else "⚪"
+            rows.append([InlineKeyboardButton(f"{status} {sym}", callback_data=f"lsdetail:{sym}")])
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")])
+        await _edit(query, "📋 *استراتيجيات Liquidity Swings النشطة:*", InlineKeyboardMarkup(rows))
+        return None
+
+    if action == "stop_menu":
+        ls_engine = ctx.bot_data.get("ls_engine")
+        symbols   = ls_engine.active_symbols() if ls_engine else []
+        if not symbols:
+            await query.answer("لا توجد استراتيجيات نشطة.", show_alert=True)
+            return None
+        rows = [[InlineKeyboardButton(f"⛔ {s}", callback_data=f"lsstop:{s}")] for s in symbols]
+        rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="ls:back")])
+        await _edit(query, "⛔ *اختر الاستراتيجية للإيقاف:*", InlineKeyboardMarkup(rows))
+        return None
+
+    return None
+
+
+async def _recv_ls_pair(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _authorized(update):
+        return ConversationHandler.END
+    raw  = (update.message.text or "").strip().upper()
+    pair = raw if "/" in raw else (raw.replace("USDT", "/USDT") if raw.endswith("USDT") else raw + "/USDT")
+    ctx.user_data["ls_pair"] = pair
+    await update.message.reply_text(
+        f"⏱ *التايم فريم — {pair}*\n\nاختر التايم فريم:",
+        reply_markup=_kb_ls_tf(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return AWAIT_LS_CAPITAL
+
+
+async def _cb_lstf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    tf   = query.data.split(":")[1]
+    pair = ctx.user_data.get("ls_pair", "")
+    ctx.user_data["ls_tf"] = tf
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("10%", callback_data=f"lscap:{pair}:{tf}:10"),
+         InlineKeyboardButton("20%", callback_data=f"lscap:{pair}:{tf}:20"),
+         InlineKeyboardButton("25%", callback_data=f"lscap:{pair}:{tf}:25")],
+        [InlineKeyboardButton("30%", callback_data=f"lscap:{pair}:{tf}:30"),
+         InlineKeyboardButton("50%", callback_data=f"lscap:{pair}:{tf}:50")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="ls:new")],
+    ])
+    await _edit(query,
+        f"💰 *رأس المال لكل صفقة — `{pair}` | `{tf}`*\n\n"
+        f"اختر النسبة من رصيد USDT الحر لكل صفقة:",
+        kb,
+    )
+    return AWAIT_LS_CAPITAL
+
+
+async def _cb_lscap(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    parts       = query.data.split(":")
+    pair        = parts[1]
+    tf          = parts[2]
+    capital_pct = float(parts[3])
+
+    ls_engine = ctx.bot_data.get("ls_engine")
+    if not ls_engine:
+        await query.answer("❌ LS engine غير متاح.", show_alert=True)
+        return ConversationHandler.END
+
+    await _edit(query,
+        f"⏳ جاري تشغيل Liquidity Swings لـ `{pair}` على `{tf}`…",
+        InlineKeyboardMarkup([]),
+    )
+    try:
+        from core.liquidity_swings_strategy_engine import LSParams
+        await ls_engine.start(pair, tf, capital_pct, LSParams())
+        await query.edit_message_text(
+            f"✅ *Liquidity Swings مُشغَّلة*\n\n"
+            f"🪙 الزوج: `{pair}` | ⏱ `{tf}`\n"
+            f"💰 رأس المال/صفقة: `{capital_pct:.0f}%` من الرصيد الحر\n\n"
+            f"🔍 البوت يراقب الآن مناطق السيولة…\n"
+            f"سيُرسل إشعار فور اكتشاف إشارة.",
+            reply_markup=_kb_ls_strategy(pair),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as exc:
+        await query.edit_message_text(f"❌ فشل التشغيل:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+
+async def _cb_lsdetail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol    = query.data.split(":", 1)[1]
+    ls_engine = ctx.bot_data.get("ls_engine")
+    if not ls_engine:
+        await query.answer("❌ LS engine غير متاح.", show_alert=True)
+        return
+    report = ls_engine.calc_report(symbol)
+    if not report:
+        await query.answer("لا توجد بيانات.", show_alert=True)
+        return
+    await _edit(query, _fmt_ls_report(report), _kb_ls_strategy(symbol))
+
+
+async def _cb_lsstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    symbol    = query.data.split(":", 1)[1]
+    ls_engine = ctx.bot_data.get("ls_engine")
+    if not ls_engine:
+        await query.answer("❌ LS engine غير متاح.", show_alert=True)
+        return
+    try:
+        sell_value = await ls_engine.stop(symbol, market_sell=True)
+        await _edit(query,
+            f"⛔ *Liquidity Swings متوقفة — `{symbol}`*\n"
+            f"💵 قيمة البيع: `{sell_value:.2f}` USDT",
+            _kb_ls_main(ctx),
+        )
+    except Exception as exc:
+        await query.edit_message_text(f"❌ خطأ:\n`{exc}`", parse_mode=ParseMode.MARKDOWN)
+
+
 # ── Help Menu ──────────────────────────────────────────────────────────────────
 
 _HELP_TOPICS = {
@@ -912,9 +1132,25 @@ _HELP_TOPICS = {
         "`/status BTCUSDT` — تفاصيل شبكة محددة\n"
         "`/stop BTCUSDT` — إيقاف شبكة\n"
         "`/upgrade` — ترقية جميع الشبكات\n"
-        "`/upgrade BTCUSDT` — ترقية شبكة محددة\n"
         "`/start_ai BTCUSDT 500 medium` — تشغيل شبكة سريع\n"
+        "`/pa_start BTC/USDT 1h 20` — تشغيل Price Action\n"
+        "`/ls_start BTC/USDT 1h 20` — تشغيل Liquidity Swings\n"
         "`/help` — هذه المساعدة"
+    ),
+    "ls": (
+        "💧 *Liquidity Swings — كيف تشتغل؟*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "الاستراتيجية تحدد مناطق السيولة وتدخل عند لمسها.\n\n"
+        "📌 *آلية العمل:*\n"
+        "• يرصد البوت *Swing Highs / Swing Lows* البارزة\n"
+        "• يبني منطقة سيولة حول كل قمة أو قاع\n"
+        "• يعدّ كم مرة لمس السعر المنطقة\n"
+        "• عند لمس منطقة *Swing Low* بعدد لمسات كافٍ → شراء\n"
+        "• الهدف (TP) = أقرب *Swing High* نشطة فوق السعر\n"
+        "• وقف الخسارة (SL) = أسفل القاع بهامش صغير\n\n"
+        "📌 *الإعداد:*\n"
+        "1️⃣ اضغط *Liquidity Swings* ← *استراتيجية جديدة*\n"
+        "2️⃣ اختر العملة والتايم فريم ونسبة رأس المال"
     ),
 }
 
@@ -922,10 +1158,11 @@ def _kb_help_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 شبكة Grid",        callback_data="help:grid"),
          InlineKeyboardButton("🎯 Price Action",     callback_data="help:pa")],
-        [InlineKeyboardButton("📊 فهم الأرقام",      callback_data="help:status"),
-         InlineKeyboardButton("🔄 الترقية",          callback_data="help:upgrade")],
-        [InlineKeyboardButton("⚖️ مستويات المخاطرة", callback_data="help:risk"),
-         InlineKeyboardButton("⌨️ الأوامر",          callback_data="help:commands")],
+        [InlineKeyboardButton("💧 Liquidity Swings", callback_data="help:ls"),
+         InlineKeyboardButton("📊 فهم الأرقام",      callback_data="help:status")],
+        [InlineKeyboardButton("🔄 الترقية",          callback_data="help:upgrade"),
+         InlineKeyboardButton("⚖️ مستويات المخاطرة", callback_data="help:risk")],
+        [InlineKeyboardButton("⌨️ الأوامر",          callback_data="help:commands")],
         [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
     ])
 
@@ -999,9 +1236,32 @@ def register_menu_handlers(app: Application) -> None:
         per_message=False,
     )
 
+    # ── LS conversation ────────────────────────────────────────────────────────
+    ls_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(_cb_ls, pattern=r"^ls:new$"),
+        ],
+        states={
+            AWAIT_LS_PAIR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _recv_ls_pair),
+            ],
+            AWAIT_LS_CAPITAL: [
+                CallbackQueryHandler(_cb_lstf,  pattern=r"^lstf:"),
+                CallbackQueryHandler(_cb_lscap, pattern=r"^lscap:"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("menu", cmd_menu),
+            CallbackQueryHandler(_cb_menu, pattern=r"^menu:"),
+            CallbackQueryHandler(_cb_ls,   pattern=r"^ls:"),
+        ],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(conv)
     app.add_handler(pa_conv)
+    app.add_handler(ls_conv)
     app.add_handler(CallbackQueryHandler(_cb_menu,  pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(_cb_grid,  pattern=r"^grid:"))
 
@@ -1016,7 +1276,11 @@ def register_menu_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(_cb_padetail,      pattern=r"^padetail:"))
     app.add_handler(CallbackQueryHandler(_cb_pastop,        pattern=r"^pastop:"))
     app.add_handler(CallbackQueryHandler(_cb_paconfirmstop, pattern=r"^paconfirmstop:"))
+    # Liquidity Swings callbacks
+    app.add_handler(CallbackQueryHandler(_cb_ls,       pattern=r"^ls:"))
+    app.add_handler(CallbackQueryHandler(_cb_lsdetail, pattern=r"^lsdetail:"))
+    app.add_handler(CallbackQueryHandler(_cb_lsstop,   pattern=r"^lsstop:"))
     # Help
     app.add_handler(CallbackQueryHandler(_cb_help, pattern=r"^help:"))
 
-    logger.info("Grid + S&R + PA + Help menu handlers registered")
+    logger.info("Grid + S&R + PA + LS + Help menu handlers registered")
