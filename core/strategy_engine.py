@@ -254,13 +254,11 @@ class StrategyEngine:
 
         self._tasks[symbol] = asyncio.create_task(self._run_loop(state))
 
+        sup_str = ", ".join(f"{p:.4f}" for p in levels.supports)
+        res_str = ", ".join(f"{p:.4f}" for p in levels.resistances)
         logger.info(
-            "Strategy restored: %s | tf=%s | S=[%.4f,%.4f] R=[%.4f,%.4f] "
-            "| held=%.6f avg=%.6f pnl=%.4f",
-            symbol, timeframe,
-            levels.supports[0], levels.supports[1],
-            levels.resistances[0], levels.resistances[1],
-            held_qty, avg_buy_price, realized_pnl,
+            "Strategy restored: %s | tf=%s | S=[%s] R=[%s] | held=%.6f avg=%.6f pnl=%.4f",
+            symbol, timeframe, sup_str, res_str, held_qty, avg_buy_price, realized_pnl,
         )
         return state
 
@@ -354,16 +352,17 @@ class StrategyEngine:
     def _nearest_resistance_above(self, state: StrategyState, support_price: float) -> float:
         """
         Return the nearest resistance level strictly above support_price.
-        Falls back to the lowest resistance if none is strictly above
-        (e.g. price already above all resistances after a flip).
-
-        Note: resistances are already sorted ascending (nearest first) by
-        sr_engine, so min(above) always gives the closest one.
+        Falls back to the lowest resistance if none is strictly above.
+        Falls back to support_price * 1.01 if resistances list is empty.
         """
-        above = [r for r in state.levels.resistances if r > support_price]
-        if above:
-            return min(above)
-        return min(state.levels.resistances)
+        resistances = state.levels.resistances
+        if not resistances:
+            logger.warning(
+                "No resistances for %s — using +1%% fallback target", state.symbol
+            )
+            return support_price * 1.01
+        above = [r for r in resistances if r > support_price]
+        return min(above) if above else min(resistances)
 
     def _resistance_for_support_index(self, state: StrategyState, support_index: int) -> float:
         """
@@ -372,8 +371,16 @@ class StrategyEngine:
           S2 (index 1)          → R2 (index 1)
           ...
         If there are fewer resistances than supports, wrap around to the last one.
+        Falls back to support_price * 1.01 if resistances list is empty.
         """
         resistances = state.levels.resistances
+        if not resistances:
+            logger.warning(
+                "No resistances for %s index %d — using fallback", state.symbol, support_index
+            )
+            supports = state.levels.supports
+            base = supports[support_index] if support_index < len(supports) else supports[-1]
+            return base * 1.01
         idx = min(support_index, len(resistances) - 1)
         return resistances[idx]
 
@@ -389,6 +396,14 @@ class StrategyEngine:
         lv     = state.levels
         inv    = state.total_investment
         symbol = state.symbol
+
+        if not lv.supports:
+            logger.warning("No support levels for %s — skipping order placement", symbol)
+            return
+        if not lv.resistances:
+            logger.warning("No resistance levels for %s — skipping order placement", symbol)
+            return
+
         n      = len(lv.supports)
         alloc  = inv / n
 
