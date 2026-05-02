@@ -289,13 +289,12 @@ class CopyTradeEngine:
 
     async def _subscribe_mempool(self) -> None:
         """Connect via WebSocket and subscribe to pending transactions."""
-        ws_url = self.ws_rpc_url.replace("https://", "wss://").replace("http://", "ws://")
-        logger.info("Connecting to mempool WebSocket: %s", ws_url[:50])
+        import websockets as _ws
 
-        self._w3ws = AsyncWeb3(AsyncWeb3.AsyncWebSocketProvider(ws_url))
-        self._w3ws.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+        ws_url = self.ws_rpc_url
+        logger.info("Connecting to mempool WebSocket: %s", ws_url[:60])
 
-        async with self._w3ws.socket as ws:
+        async with _ws.connect(ws_url, ping_interval=20, ping_timeout=30) as ws:
             # Subscribe to pending transactions
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
@@ -315,8 +314,11 @@ class CopyTradeEngine:
                     if tx_hash:
                         asyncio.create_task(self._process_tx(tx_hash))
                 except asyncio.TimeoutError:
-                    # Send ping to keep connection alive
-                    await ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "eth_blockNumber", "params": []}))
+                    # keepalive ping
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0", "id": 2,
+                        "method": "eth_blockNumber", "params": []
+                    }))
                 except Exception as exc:
                     logger.debug("WS recv error: %s", exc)
                     raise

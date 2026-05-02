@@ -80,6 +80,7 @@ def _kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 متابعة وإدارة الشبكات", callback_data="menu:manage")],
         [InlineKeyboardButton("🔄 ترقية الشبكات",        callback_data="settings_upgradeall"),
          InlineKeyboardButton("❓ مساعدة",                callback_data="help:main")],
+        [InlineKeyboardButton("🔁 نسخ التجارة (BSC)",    callback_data="copy_status_cb")],
     ])
 
 
