@@ -449,6 +449,30 @@ class CopyTradeEngine:
             logger.warning("BNB price fetch failed: %s — using fallback 600", exc)
             return Decimal("600")
 
+    async def _check_bnb_balance(self, required_wei: int) -> bool:
+        """Return True if wallet has enough BNB. Notify and return False if not."""
+        balance = await self._w3h.eth.get_balance(self.my_address)
+        # Keep 0.005 BNB reserve for gas
+        gas_reserve = int(0.005 * 10**18)
+        if balance < required_wei + gas_reserve:
+            bnb_balance = balance / 10**18
+            required_bnb = required_wei / 10**18
+            await _fire(
+                _notify_copy_err,
+                f"⚠️ *رصيد غير كافٍ*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"الرصيد الحالي: `{bnb_balance:.4f} BNB`\n"
+                f"المطلوب للصفقة: `{required_bnb:.4f} BNB` (~${float(self.trade_usdt):.2f} USDT)\n"
+                f"احتياطي الـ gas: `0.005 BNB`\n\n"
+                f"💡 أضف BNB لمحفظتك لتنفيذ الصفقة القادمة.",
+            )
+            logger.warning(
+                "Insufficient BNB: have %.4f, need %.4f",
+                bnb_balance, required_bnb + 0.005,
+            )
+            return False
+        return True
+
     async def _execute_buy(self, path: list[str], original_tx: dict) -> None:
         """
         Buy `trade_usdt` worth of the target token.
@@ -456,6 +480,10 @@ class CopyTradeEngine:
         """
         bnb_price = await self._bnb_price_in_usdt()
         bnb_amount_wei = int(self.trade_usdt / bnb_price * Decimal(10**18))
+
+        # Check balance before attempting swap
+        if not await self._check_bnb_balance(bnb_amount_wei):
+            return
 
         # Get expected output via getAmountsOut
         try:
