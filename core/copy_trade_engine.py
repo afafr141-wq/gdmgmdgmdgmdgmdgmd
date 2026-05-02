@@ -54,6 +54,10 @@ TRADE_USDT = Decimal("3")
 # Reconnect delay on WebSocket drop
 WS_RECONNECT_DELAY = 5
 
+# BSCScan polling interval (seconds) — fallback when WSS unavailable
+BSCSCAN_POLL_INTERVAL = 3
+BSCSCAN_API_URL = "https://api.bscscan.com/api"
+
 # PancakeSwap V2 Router ABI — only swap functions needed for decoding
 PANCAKE_ROUTER_ABI = json.loads("""[
   {"name":"swapExactETHForTokens","type":"function","inputs":[
@@ -232,6 +236,9 @@ class CopyTradeEngine:
         # Token decimals cache
         self._decimals_cache: dict[str, int] = {}
 
+        # BSCScan API key (optional — increases rate limit from 5 to 10 req/s)
+        self.bscscan_api_key: str = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
+
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -276,88 +283,63 @@ class CopyTradeEngine:
 
     async def _run_loop(self) -> None:
         await self._init_http()
+        logger.info("Starting BSCScan polling for %s", self.target_wallet)
+        await _fire(_notify_copy_err,
+                    "🔍 *نسخ التجارة يعمل*\nمراقبة المحفظة عبر BSCScan كل 3 ثوانٍ...")
         while self._running:
             try:
-                await self._subscribe_mempool()
+                await self._poll_bscscan()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                err_str = str(exc)
-                # 1001 = server closing normally (QuickNode keepalive reset)
-                # reconnect silently without spamming Telegram
-                is_normal_close = "1001" in err_str or "going away" in err_str.lower()
-                if is_normal_close:
-                    logger.info("WS closed normally (1001) — reconnecting silently")
-                else:
-                    logger.error("Mempool subscription error: %s — reconnecting in %ds",
-                                 exc, WS_RECONNECT_DELAY)
-                    await _fire(_notify_copy_err,
-                                f"⚠️ انقطع الاتصال بـ mempool: {exc}\nإعادة الاتصال...")
-                await asyncio.sleep(WS_RECONNECT_DELAY)
+                logger.error("BSCScan poll error: %s", exc)
+            await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
 
-    async def _subscribe_mempool(self) -> None:
-        """Connect via WebSocket and subscribe to pending transactions."""
-        import websockets as _ws
+    async def _poll_bscscan(self) -> None:
+        """Fetch latest transactions from BSCScan and process new ones."""
+        import aiohttp
+        params = {
+            "module":     "account",
+            "action":     "txlist",
+            "address":    self.target_wallet,
+            "startblock": 0,
+            "endblock":   99999999,
+            "page":       1,
+            "offset":     10,          # last 10 txs
+            "sort":       "desc",
+            "apikey":     self.bscscan_api_key,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(BSCSCAN_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                data = await resp.json()
 
-        ws_url = self.ws_rpc_url
-        logger.info("Connecting to mempool WebSocket: %s", ws_url[:60])
-
-        async with _ws.connect(ws_url, ping_interval=10, ping_timeout=20, close_timeout=5) as ws:
-            # Subscribe to pending transactions
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "eth_subscribe",
-                "params": ["newPendingTransactions"]
-            }))
-            sub_response = json.loads(await ws.recv())
-            sub_id = sub_response.get("result")
-            logger.info("Subscribed to pending txs — subscription id: %s", sub_id)
-
-            while self._running:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    msg = json.loads(raw)
-                    tx_hash = msg.get("params", {}).get("result")
-                    if tx_hash:
-                        asyncio.create_task(self._process_tx(tx_hash))
-                except asyncio.TimeoutError:
-                    # keepalive ping
-                    await ws.send(json.dumps({
-                        "jsonrpc": "2.0", "id": 2,
-                        "method": "eth_blockNumber", "params": []
-                    }))
-                except Exception as exc:
-                    logger.debug("WS recv error: %s", exc)
-                    raise
-
-    async def _process_tx(self, tx_hash: str) -> None:
-        """Fetch and evaluate a pending transaction."""
-        if not self.enabled:
+        if data.get("status") != "1":
             return
-        if tx_hash in self._seen:
-            return
-        self._seen.add(tx_hash)
-        # Trim seen set to avoid unbounded growth
+
+        for tx in data.get("result", []):
+            tx_hash = tx.get("hash", "")
+            if not tx_hash or tx_hash in self._seen:
+                continue
+            # Only process txs to PancakeSwap V2 Router
+            if tx.get("to", "").lower() != PANCAKE_V2_ROUTER.lower():
+                self._seen.add(tx_hash)
+                continue
+            self._seen.add(tx_hash)
+            # Convert BSCScan tx format to web3-like dict
+            tx_web3 = {
+                "hash":     tx_hash,
+                "from":     tx.get("from", ""),
+                "to":       tx.get("to", ""),
+                "input":    tx.get("input", ""),
+                "gasPrice": int(tx.get("gasPrice", 5_000_000_000)),
+            }
+            asyncio.create_task(self._mirror_swap(tx_web3))
+
+        # Trim seen set
         if len(self._seen) > 10_000:
             self._seen = set(list(self._seen)[-5_000:])
 
-        try:
-            tx = await self._w3h.eth.get_transaction(tx_hash)
-        except Exception:
-            return
 
-        if tx is None:
-            return
-
-        # Filter: must be from target wallet to PancakeSwap V2 Router
-        if tx.get("from", "").lower() != self.target_wallet.lower():
-            return
-        if (tx.get("to") or "").lower() != PANCAKE_V2_ROUTER.lower():
-            return
-
-        logger.info("🎯 Target tx detected: %s", tx_hash)
-        await self._mirror_swap(tx)
 
     async def _mirror_swap(self, tx: dict) -> None:
         """Decode the swap calldata and execute a mirrored swap."""

@@ -40,6 +40,7 @@ MY_BSC_PRIVATE_KEY: str = os.getenv("MY_BSC_PRIVATE_KEY", "")
 COPY_TRADE_USDT: float  = float(os.getenv("COPY_TRADE_USDT", "3"))
 COPY_SELLS: bool        = os.getenv("COPY_SELLS", "true").lower() == "true"
 COPY_TRADE_ENABLED: bool = os.getenv("COPY_TRADE_ENABLED", "true").lower() == "true"
+BSCSCAN_API_KEY: str    = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
 
 
 def validate_env() -> None:
