@@ -158,6 +158,27 @@ async def copy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
 
+    # Engine not configured — show setup instructions
+    if _copy_engine is None:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        from telegram.constants import ParseMode
+        await query.edit_message_text(
+            "🔁 *نسخ التجارة — BSC*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "❌ *المحرك غير مُفعَّل*\n\n"
+            "تأكد من وجود هذه المتغيرات في Railway:\n"
+            "• `BSC_HTTP_RPC_URL`\n"
+            "• `MY_BSC_PRIVATE_KEY`\n"
+            "• `BSCSCAN_API_KEY`\n"
+            "• `COPY_TARGET_WALLET`\n\n"
+            "ثم أعد تشغيل البوت.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
+            ]),
+        )
+        return
+
     data = query.data
 
     if data == "copy_status_cb":
@@ -227,13 +248,8 @@ def register_copy_handlers(application) -> None:
     application.add_handler(CommandHandler("copy_start",   cmd_copy_start))
     application.add_handler(CommandHandler("copy_stop",    cmd_copy_stop))
     application.add_handler(CommandHandler("copy_history", cmd_copy_history))
-    # group=-1 ensures these handlers run before menu_bot's fallback (group=0)
     application.add_handler(
-        CallbackQueryHandler(
-            copy_callback,
-            pattern=r"^copy_(status_cb|pause|resume|history_cb)$",
-        ),
-        group=-1,
+        CallbackQueryHandler(copy_callback, pattern=r"^copy_"),
     )
     logger.info("Copy-trade handlers registered")
 

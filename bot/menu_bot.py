@@ -753,6 +753,5 @@ def register_menu_handlers(app: Application) -> None:
         pattern=r"^adjinv_show:",
     ))
     app.add_handler(CallbackQueryHandler(_cb_help, pattern=r"^help:"))
-    app.add_handler(CallbackQueryHandler(_cb_copy_fallback, pattern=r"^copy_"))
 
     logger.info("Grid + Help menu handlers registered")
