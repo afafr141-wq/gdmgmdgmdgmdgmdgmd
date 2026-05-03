@@ -58,13 +58,13 @@ def validate_env() -> None:
     if missing:
         raise EnvironmentError(f"Missing required env vars: {', '.join(missing)}")
 
-    # Warn (don't raise) if copy-trade vars are missing
+    # Warn (don't raise) if required copy-trade vars are missing
+    # BSC_WS_RPC_URL is optional — engine uses BSCScan HTTP polling when absent
     copy_missing = [
         name
         for name, val in [
-            ("BSC_WS_RPC_URL",      BSC_WS_RPC_URL),
-            ("BSC_HTTP_RPC_URL",    BSC_HTTP_RPC_URL),
-            ("MY_BSC_PRIVATE_KEY",  MY_BSC_PRIVATE_KEY),
+            ("BSC_HTTP_RPC_URL",   BSC_HTTP_RPC_URL),
+            ("MY_BSC_PRIVATE_KEY", MY_BSC_PRIVATE_KEY),
         ]
         if not val
     ]
@@ -72,5 +72,7 @@ def validate_env() -> None:
         logger.warning(
             "Copy-trade disabled — missing env vars: %s", ", ".join(copy_missing)
         )
+    elif not BSC_WS_RPC_URL:
+        logger.info("Copy-trade: WSS not set — using BSCScan HTTP polling mode")
 
     logger.info("Environment validated OK")

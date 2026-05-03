@@ -688,6 +688,37 @@ async def _cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _edit(query, text, _kb_help_back())
 
 
+# ── Copy-trade fallback (shown when BSC engine is not configured) ───────────────
+
+async def _cb_copy_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handles copy_* callbacks when copy_bot handlers are not registered
+    (missing BSC env vars). Shows a setup prompt instead of a silent no-op.
+    Registered in group=1 so copy_bot's group=0 handlers take priority when
+    BSC is configured.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    _kb_setup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
+    ])
+    await query.edit_message_text(
+        "🔁 *نسخ التجارة — BSC*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "❌ *المحرك غير مُفعَّل*\n\n"
+        "لتفعيل نسخ التجارة أضف المتغيرات التالية في ملف `.env`:\n"
+        "• `BSC_WS_RPC_URL` — WebSocket RPC (مثال: Ankr)\n"
+        "• `BSC_HTTP_RPC_URL` — HTTP RPC\n"
+        "• `MY_BSC_PRIVATE_KEY` — مفتاح محفظتك الخاصة\n"
+        "• `COPY_TARGET_WALLET` — عنوان المحفظة المراد نسخها\n\n"
+        "ثم أعد تشغيل البوت.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_kb_setup,
+    )
+
+
+
 # ── Registration ───────────────────────────────────────────────────────────────
 
 def register_menu_handlers(app: Application) -> None:
@@ -722,5 +753,7 @@ def register_menu_handlers(app: Application) -> None:
         pattern=r"^adjinv_show:",
     ))
     app.add_handler(CallbackQueryHandler(_cb_help, pattern=r"^help:"))
+    # group=1 gives copy_bot's handlers (group=0) priority when BSC is configured
+    app.add_handler(CallbackQueryHandler(_cb_copy_fallback, pattern=r"^copy_"), group=1)
 
     logger.info("Grid + Help menu handlers registered")
