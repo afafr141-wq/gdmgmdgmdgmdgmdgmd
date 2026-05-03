@@ -42,6 +42,15 @@ GMGN_ROUTER       = "0x1de460f363AF910f51726DEf188F9004276Bf4bc"
 WBNB             = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 USDT_BSC         = "0x55d398326f99059fF775485246999027B3197955"
 BUSD_BSC         = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"
+USDC_BSC         = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+
+# Tokens treated as "base" (payment side) in a buy
+BASE_TOKENS: set[str] = {
+    WBNB.lower(),
+    USDT_BSC.lower(),
+    BUSD_BSC.lower(),
+    USDC_BSC.lower(),
+}
 
 # All routers whose swap txs should be mirrored
 WATCHED_ROUTERS: set[str] = {
@@ -189,11 +198,10 @@ async def _fire(fn: Optional[Callable], *args) -> None:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _is_buy(path: list[str]) -> bool:
-    """Buy = BNB/stable → token (path starts with WBNB or stable)."""
+    """Buy = base token → non-base token (path starts with WBNB or a stable)."""
     if not path:
         return False
-    src = path[0].lower()
-    return src in (WBNB.lower(), USDT_BSC.lower(), BUSD_BSC.lower())
+    return path[0].lower() in BASE_TOKENS
 
 
 def _apply_slippage(amount: int, bps: int = SLIPPAGE_BPS) -> int:
@@ -395,11 +403,10 @@ class CopyTradeEngine:
             return None
 
         wallet = self.target_wallet.lower()
-        wbnb   = WBNB.lower()
 
-        # Collect Transfer events
-        transfers_to_wallet:   list[str] = []  # tokens arriving at wallet
-        transfers_from_wallet: list[str] = []  # tokens leaving wallet
+        # Collect Transfer events: tokens leaving and arriving at the wallet
+        transfers_to_wallet:   list[str] = []  # (token_addr,)
+        transfers_from_wallet: list[str] = []
 
         for log in receipt.get("logs", []):
             topics = log.get("topics", [])
@@ -415,23 +422,38 @@ class CopyTradeEngine:
             frm = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
             to  = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
 
-            if to == wallet and token_addr != wbnb:
+            if to == wallet:
                 transfers_to_wallet.append(token_addr)
-            elif frm == wallet and token_addr != wbnb:
+            elif frm == wallet:
                 transfers_from_wallet.append(token_addr)
 
-        if transfers_to_wallet:
-            # BUY: wallet received a token, paid BNB (tx.value > 0) or a stable
-            token_out = AsyncWeb3.to_checksum_address(transfers_to_wallet[-1])
-            path = [AsyncWeb3.to_checksum_address(WBNB), token_out]
-            logger.info("GMGN BUY detected via logs: token=%s", token_out)
+        # Separate base tokens (payment) from non-base tokens (the traded asset)
+        base_received    = [t for t in transfers_to_wallet   if t in BASE_TOKENS]
+        nonbase_received = [t for t in transfers_to_wallet   if t not in BASE_TOKENS]
+        base_sent        = [t for t in transfers_from_wallet if t in BASE_TOKENS]
+        nonbase_sent     = [t for t in transfers_from_wallet if t not in BASE_TOKENS]
+
+        if nonbase_received:
+            # BUY: wallet received a non-base token
+            token_out = AsyncWeb3.to_checksum_address(nonbase_received[-1])
+            # Determine what was paid: prefer explicit base token sent, else BNB
+            if base_sent:
+                token_in = AsyncWeb3.to_checksum_address(base_sent[0])
+            elif tx_value > 0:
+                token_in = AsyncWeb3.to_checksum_address(WBNB)
+            else:
+                # Fallback: use WBNB — _execute_buy will route via BNB
+                token_in = AsyncWeb3.to_checksum_address(WBNB)
+            path = [token_in, token_out]
+            logger.info("GMGN BUY detected: token_in=%s token_out=%s", token_in, token_out)
             return path, True
 
-        if transfers_from_wallet and self.copy_sells:
-            # SELL: wallet sent a token, received BNB
-            token_in = AsyncWeb3.to_checksum_address(transfers_from_wallet[0])
-            path = [token_in, AsyncWeb3.to_checksum_address(WBNB)]
-            logger.info("GMGN SELL detected via logs: token=%s", token_in)
+        if nonbase_sent and self.copy_sells:
+            # SELL: wallet sent a non-base token, received BNB or stable
+            token_in = AsyncWeb3.to_checksum_address(nonbase_sent[0])
+            token_out = AsyncWeb3.to_checksum_address(base_received[0]) if base_received else AsyncWeb3.to_checksum_address(WBNB)
+            path = [token_in, token_out]
+            logger.info("GMGN SELL detected: token_in=%s token_out=%s", token_in, token_out)
             return path, False
 
         logger.debug("Could not determine swap direction from logs for %s", tx_hash[:20])
@@ -593,48 +615,105 @@ class CopyTradeEngine:
     async def _execute_buy(self, path: list[str], original_tx: dict) -> None:
         """
         Buy `trade_usdt` worth of the target token.
-        Path: WBNB → ... → token  (we send BNB as value)
+
+        Supports two payment modes based on path[0]:
+          - WBNB: sends BNB as tx value via swapExactETHForTokens
+          - Stable (USDT/USDC/BUSD): approves and sends token via swapExactTokensForTokens
         """
-        bnb_price = await self._bnb_price_in_usdt()
-        bnb_amount_wei = int(self.trade_usdt / bnb_price * Decimal(10**18))
-
-        # Check balance before attempting swap
-        if not await self._check_bnb_balance(bnb_amount_wei):
-            return
-
-        # Get expected output via getAmountsOut
-        try:
-            amounts = await self._router.functions.getAmountsOut(
-                bnb_amount_wei, path
-            ).call()
-            amount_out_min = _apply_slippage(amounts[-1])
-        except Exception as exc:
-            logger.warning("getAmountsOut failed: %s — using 0 min", exc)
-            amount_out_min = 0
+        token_in = path[0].lower()
+        is_bnb_buy = token_in == WBNB.lower()
 
         gas_price = int(int(original_tx.get("gasPrice", 5_000_000_000)) * GAS_MULTIPLIER)
         nonce = await self._w3h.eth.get_transaction_count(self.my_address, "pending")
 
-        tx = await self._router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            amount_out_min,
-            path,
-            self.my_address,
-            _deadline(),
-        ).build_transaction({
-            "from":     self.my_address,
-            "value":    bnb_amount_wei,
-            "gas":      300_000,
-            "gasPrice": gas_price,
-            "nonce":    nonce,
-            "chainId":  56,
-        })
+        if is_bnb_buy:
+            bnb_price = await self._bnb_price_in_usdt()
+            amount_in_wei = int(self.trade_usdt / bnb_price * Decimal(10**18))
+
+            if not await self._check_bnb_balance(amount_in_wei):
+                return
+
+            try:
+                amounts = await self._router.functions.getAmountsOut(
+                    amount_in_wei, path
+                ).call()
+                amount_out_min = _apply_slippage(amounts[-1])
+            except Exception as exc:
+                logger.warning("getAmountsOut failed: %s — using 0 min", exc)
+                amount_out_min = 0
+
+            tx = await self._router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
+                amount_out_min,
+                path,
+                self.my_address,
+                _deadline(),
+            ).build_transaction({
+                "from":     self.my_address,
+                "value":    amount_in_wei,
+                "gas":      300_000,
+                "gasPrice": gas_price,
+                "nonce":    nonce,
+                "chainId":  56,
+            })
+        else:
+            # Stable token buy (USDT / USDC / BUSD)
+            decimals = await self._get_decimals(path[0])
+            amount_in_wei = int(self.trade_usdt * Decimal(10 ** decimals))
+
+            # Check stable balance
+            stable_contract = self._w3h.eth.contract(
+                address=AsyncWeb3.to_checksum_address(path[0]),
+                abi=ERC20_ABI,
+            )
+            balance = await stable_contract.functions.balanceOf(self.my_address).call()
+            if balance < amount_in_wei:
+                await _fire(
+                    _notify_copy_err,
+                    f"⚠️ *رصيد غير كافٍ*\n"
+                    f"الرصيد الحالي: `{balance / 10**decimals:.2f}` | المطلوب: `{float(self.trade_usdt):.2f}` ({path[0][:8]}...)",
+                )
+                logger.warning("Insufficient stable balance: have %s, need %s", balance, amount_in_wei)
+                return
+
+            # Approve router if needed
+            allowance = await stable_contract.functions.allowance(
+                self.my_address,
+                AsyncWeb3.to_checksum_address(PANCAKE_V2_ROUTER),
+            ).call()
+            if allowance < amount_in_wei:
+                await self._approve_token(path[0], amount_in_wei)
+                nonce += 1
+
+            try:
+                amounts = await self._router.functions.getAmountsOut(
+                    amount_in_wei, path
+                ).call()
+                amount_out_min = _apply_slippage(amounts[-1])
+            except Exception as exc:
+                logger.warning("getAmountsOut failed: %s — using 0 min", exc)
+                amount_out_min = 0
+
+            tx = await self._router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+                amount_in_wei,
+                amount_out_min,
+                path,
+                self.my_address,
+                _deadline(),
+            ).build_transaction({
+                "from":     self.my_address,
+                "value":    0,
+                "gas":      350_000,
+                "gasPrice": gas_price,
+                "nonce":    nonce,
+                "chainId":  56,
+            })
 
         signed = self.account.sign_transaction(tx)
         tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
         tx_hash_hex = tx_hash.hex()
 
-        logger.info("✅ BUY sent: %s | BNB=%.6f | token=%s",
-                    tx_hash_hex, bnb_amount_wei / 1e18, path[-1])
+        logger.info("✅ BUY sent: %s | amount_in=%s | token_out=%s",
+                    tx_hash_hex, amount_in_wei, path[-1])
 
         token_symbol = path[-1][:8]
         await _fire(
