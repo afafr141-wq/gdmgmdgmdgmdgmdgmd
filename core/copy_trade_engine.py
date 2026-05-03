@@ -38,9 +38,23 @@ logger = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 PANCAKE_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+GMGN_ROUTER       = "0x1de460f363AF910f51726DEf188F9004276Bf4bc"
 WBNB             = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 USDT_BSC         = "0x55d398326f99059fF775485246999027B3197955"
 BUSD_BSC         = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"
+
+# All routers whose swap txs should be mirrored
+WATCHED_ROUTERS: set[str] = {
+    PANCAKE_V2_ROUTER.lower(),
+    GMGN_ROUTER.lower(),
+}
+
+# ERC-20 Transfer topic
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+# WBNB Deposit (BNB → WBNB wrap)
+WBNB_DEPOSIT_TOPIC = "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c"
+# WBNB Withdrawal (WBNB → BNB unwrap)
+WBNB_WITHDRAW_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65"
 
 # 3% slippage tolerance
 SLIPPAGE_BPS = 300   # basis points
@@ -324,10 +338,10 @@ class CopyTradeEngine:
                 tx_to   = (tx.get("to",   "") or "")
                 tx_hash = (tx.get("hash",  b"") or b"")
 
-                # Only care about txs FROM target wallet TO PancakeSwap router
+                # Only care about txs FROM target wallet TO a watched router
                 if tx_from.lower() != self.target_wallet.lower():
                     continue
-                if tx_to.lower() != PANCAKE_V2_ROUTER.lower():
+                if tx_to.lower() not in WATCHED_ROUTERS:
                     continue
 
                 hash_hex = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
@@ -344,10 +358,14 @@ class CopyTradeEngine:
                     "from":     tx_from,
                     "to":       tx_to,
                     "input":    input_data,
+                    "value":    tx.get("value", 0),
                     "gasPrice": tx.get("gasPrice", 5_000_000_000),
                 }
                 logger.info("Found target swap in block %d: %s", block_num, hash_hex[:20])
-                asyncio.create_task(self._mirror_swap(tx_web3))
+                if self.enabled:
+                    asyncio.create_task(self._mirror_swap(tx_web3))
+                else:
+                    logger.debug("Copy trading paused — skipping block tx %s", hash_hex[:20])
 
         self._last_block = to_block
 
@@ -357,8 +375,101 @@ class CopyTradeEngine:
 
 
 
+    async def _extract_swap_from_logs(
+        self, tx_hash: str, tx_value: int
+    ) -> tuple[list[str], bool] | None:
+        """
+        Derive swap path and direction from transaction receipt logs.
+
+        Used for routers with proprietary calldata (e.g. GMGN) where ABI
+        decoding is not possible. Reads ERC-20 Transfer events to find:
+          - token received by the target wallet  → token_out (buy)
+          - token sent from the target wallet    → token_in  (sell)
+
+        Returns (path, is_buy) or None if the swap cannot be determined.
+        """
+        try:
+            receipt = await self._w3h.eth.get_transaction_receipt(tx_hash)
+        except Exception as exc:
+            logger.warning("Could not fetch receipt for %s: %s", tx_hash[:20], exc)
+            return None
+
+        wallet = self.target_wallet.lower()
+        wbnb   = WBNB.lower()
+
+        # Collect Transfer events
+        transfers_to_wallet:   list[str] = []  # tokens arriving at wallet
+        transfers_from_wallet: list[str] = []  # tokens leaving wallet
+
+        for log in receipt.get("logs", []):
+            topics = log.get("topics", [])
+            if not topics:
+                continue
+            topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+            if topic0.lower() != TRANSFER_TOPIC.lower():
+                continue
+            if len(topics) < 3:
+                continue
+
+            token_addr = log["address"].lower()
+            frm = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
+            to  = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
+
+            if to == wallet and token_addr != wbnb:
+                transfers_to_wallet.append(token_addr)
+            elif frm == wallet and token_addr != wbnb:
+                transfers_from_wallet.append(token_addr)
+
+        if transfers_to_wallet:
+            # BUY: wallet received a token, paid BNB (tx.value > 0) or a stable
+            token_out = AsyncWeb3.to_checksum_address(transfers_to_wallet[-1])
+            path = [AsyncWeb3.to_checksum_address(WBNB), token_out]
+            logger.info("GMGN BUY detected via logs: token=%s", token_out)
+            return path, True
+
+        if transfers_from_wallet and self.copy_sells:
+            # SELL: wallet sent a token, received BNB
+            token_in = AsyncWeb3.to_checksum_address(transfers_from_wallet[0])
+            path = [token_in, AsyncWeb3.to_checksum_address(WBNB)]
+            logger.info("GMGN SELL detected via logs: token=%s", token_in)
+            return path, False
+
+        logger.debug("Could not determine swap direction from logs for %s", tx_hash[:20])
+        return None
+
     async def _mirror_swap(self, tx: dict) -> None:
         """Decode the swap calldata and execute a mirrored swap."""
+        if not self.enabled:
+            logger.debug("Copy trading paused — skipping tx %s", tx.get("hash", "")[:20])
+            return
+
+        tx_to = (tx.get("to") or "").lower()
+
+        # GMGN and other non-PancakeSwap routers: derive path from receipt logs
+        if tx_to != PANCAKE_V2_ROUTER.lower():
+            result = await self._extract_swap_from_logs(
+                tx.get("hash", ""), tx.get("value", 0)
+            )
+            if result is None:
+                return
+            path, is_buy = result
+
+            if not is_buy and not self.copy_sells:
+                logger.info("Sell detected but copy_sells=False — skipping")
+                return
+
+            logger.info("Mirroring GMGN %s: path=%s", "BUY" if is_buy else "SELL", path)
+            try:
+                if is_buy:
+                    await self._execute_buy(path, tx)
+                else:
+                    await self._execute_sell(path, tx)
+            except Exception as exc:
+                logger.error("Mirror swap failed: %s", exc)
+                await _fire(_notify_copy_err, f"❌ فشل تنفيذ الصفقة المنسوخة:\n`{exc}`")
+            return
+
+        # PancakeSwap V2: decode calldata directly
         input_data = tx.get("input") or tx.get("data", "")
         if not input_data or len(input_data) < 10:
             return
@@ -385,7 +496,7 @@ class CopyTradeEngine:
             logger.info("Sell detected but copy_sells=False — skipping")
             return
 
-        logger.info("Mirroring %s: path=%s", "BUY" if is_buy else "SELL", path)
+        logger.info("Mirroring PancakeSwap %s: path=%s", "BUY" if is_buy else "SELL", path)
 
         try:
             if is_buy:
