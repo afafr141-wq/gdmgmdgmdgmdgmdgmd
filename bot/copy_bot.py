@@ -33,8 +33,9 @@ def set_copy_engine(engine) -> None:
 
 # ── Keyboards ──────────────────────────────────────────────────────────────────
 
-def _copy_menu_kb() -> InlineKeyboardMarkup:
-    if _copy_engine and _copy_engine.enabled:
+def _copy_menu_kb(engine=None) -> InlineKeyboardMarkup:
+    eng = engine or _copy_engine
+    if eng and eng.enabled:
         toggle_label = "⏸ إيقاف مؤقت"
         toggle_cb    = "copy_pause"
     else:
@@ -45,26 +46,27 @@ def _copy_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 الحالة",       callback_data="copy_status_cb"),
          InlineKeyboardButton("📋 آخر الصفقات",  callback_data="copy_history_cb")],
         [InlineKeyboardButton(toggle_label,       callback_data=toggle_cb),
-         InlineKeyboardButton("🏠 القائمة",       callback_data="menu_main")],
+         InlineKeyboardButton("🏠 القائمة",       callback_data="menu:back")],
     ])
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _status_text() -> str:
-    if _copy_engine is None:
+def _status_text(engine=None) -> str:
+    eng = engine or _copy_engine
+    if eng is None:
         return "❌ محرك النسخ غير مُهيأ."
 
-    state  = "🟢 يعمل" if _copy_engine.is_running() else "🔴 متوقف"
-    active = "✅ مفعّل" if _copy_engine.enabled else "⏸ موقوف مؤقتاً"
+    state  = "🟢 يعمل" if eng.is_running() else "🔴 متوقف"
+    active = "✅ مفعّل" if eng.enabled else "⏸ موقوف مؤقتاً"
     return (
         "🔁 *نسخ التجارة — BSC*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"الحالة:       `{state}`\n"
         f"التنفيذ:      `{active}`\n"
-        f"المحفظة:      `{_copy_engine.target_wallet[:10]}...`\n"
-        f"حجم الصفقة:   `${float(_copy_engine.trade_usdt):.2f} USDT`\n"
-        f"نسخ البيع:    `{'نعم' if _copy_engine.copy_sells else 'لا'}`\n"
+        f"المحفظة:      `{eng.target_wallet[:10]}...`\n"
+        f"حجم الصفقة:   `${float(eng.trade_usdt):.2f} USDT`\n"
+        f"نسخ البيع:    `{'نعم' if eng.copy_sells else 'لا'}`\n"
         f"Slippage:     `3%`\n"
         f"Gas boost:    `+15%`\n"
     )
@@ -158,10 +160,15 @@ async def copy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_allowed(update):
         return await _deny(update)
 
+    # Try bot_data first, fall back to module global
+    engine = ctx.bot_data.get("copy_engine") if ctx and hasattr(ctx, "bot_data") else None
+    if engine is not None and _copy_engine is None:
+        set_copy_engine(engine)
+
+    active_engine = engine or _copy_engine
+
     # Engine not configured — show setup instructions
-    if _copy_engine is None:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        from telegram.constants import ParseMode
+    if active_engine is None:
         await query.edit_message_text(
             "🔁 *نسخ التجارة — BSC*\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -172,7 +179,7 @@ async def copy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "• `BSCSCAN_API_KEY`\n"
             "• `COPY_TARGET_WALLET`\n\n"
             "ثم أعد تشغيل البوت.",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
             ]),
@@ -183,14 +190,13 @@ async def copy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == "copy_status_cb":
         await query.edit_message_text(
-            _status_text(),
+            _status_text(active_engine),
             parse_mode="Markdown",
-            reply_markup=_copy_menu_kb(),
+            reply_markup=_copy_menu_kb(active_engine),
         )
 
     elif data == "copy_pause":
-        if _copy_engine:
-            _copy_engine.enabled = False
+        active_engine.enabled = False
         await query.edit_message_text(
             "⏸ *تم إيقاف التنفيذ مؤقتاً*\nالمراقبة مستمرة.",
             parse_mode="Markdown",
@@ -198,8 +204,7 @@ async def copy_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     elif data == "copy_resume":
-        if _copy_engine:
-            _copy_engine.enabled = True
+        active_engine.enabled = True
         await query.edit_message_text(
             "✅ *تم استئناف نسخ التجارة*",
             parse_mode="Markdown",
