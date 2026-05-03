@@ -29,7 +29,7 @@ ALLOWED_USER_IDS: set[int] = (
 ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
-# ── Copy-trade (BSC / PancakeSwap V2) ─────────────────────────────────────────
+# ── Copy-trade (BSC / PancakeSwap V2 + GMGN) ──────────────────────────────────
 BSC_WS_RPC_URL: str   = os.getenv("BSC_WS_RPC_URL", "")    # Ankr WebSocket endpoint
 BSC_HTTP_RPC_URL: str = os.getenv("BSC_HTTP_RPC_URL", "https://bsc-dataseed1.binance.org/")  # BSC HTTP RPC
 COPY_TARGET_WALLET: str = os.getenv(
