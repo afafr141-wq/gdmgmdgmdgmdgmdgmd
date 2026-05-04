@@ -363,7 +363,11 @@ class CopyTradeEngine:
         # websockets >=11 uses websockets.connect() as async context manager
         ws_connect = getattr(_ws, "connect", None) or getattr(_ws, "client", _ws).connect
 
-        async with ws_connect(self.ws_rpc_url) as ws:
+        async with ws_connect(
+            self.ws_rpc_url,
+            ping_interval=None,   # disable auto-ping — NodeReal rejects it
+            ping_timeout=None,
+        ) as ws:
             # Subscribe to new pending transactions
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
@@ -380,11 +384,11 @@ class CopyTradeEngine:
 
             while self._running:
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
-                    # Send ping to keep connection alive
-                    await ws.ping()
-                    continue
+                    # No messages for 60s — reconnect
+                    logger.info("WS idle 60s — reconnecting")
+                    return
 
                 try:
                     msg = json.loads(raw)
