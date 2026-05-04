@@ -325,7 +325,7 @@ class CopyTradeEngine:
             await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
 
     async def _poll_new_blocks(self) -> None:
-        """Scan new blocks for PancakeSwap txs from the target wallet."""
+        """Scan new blocks for any transaction sent FROM the target wallet."""
         latest = await self._w3h.eth.block_number
         if latest <= self._last_block:
             return
@@ -346,10 +346,12 @@ class CopyTradeEngine:
                 tx_to   = (tx.get("to",   "") or "")
                 tx_hash = (tx.get("hash",  b"") or b"")
 
-                # Only care about txs FROM target wallet TO a watched router
+                # Only care about txs FROM the target wallet
                 if tx_from.lower() != self.target_wallet.lower():
                     continue
-                if tx_to.lower() not in WATCHED_ROUTERS:
+
+                # Skip contract deployments (tx_to is None/empty)
+                if not tx_to:
                     continue
 
                 hash_hex = tx_hash.hex() if isinstance(tx_hash, bytes) else str(tx_hash)
@@ -369,11 +371,12 @@ class CopyTradeEngine:
                     "value":    tx.get("value", 0),
                     "gasPrice": tx.get("gasPrice", 5_000_000_000),
                 }
-                logger.info("Found target swap in block %d: %s", block_num, hash_hex[:20])
+                logger.info("Found target tx in block %d: %s → %s",
+                            block_num, hash_hex[:20], tx_to[:10])
                 if self.enabled:
                     asyncio.create_task(self._mirror_swap(tx_web3))
                 else:
-                    logger.debug("Copy trading paused — skipping block tx %s", hash_hex[:20])
+                    logger.debug("Copy trading paused — skipping tx %s", hash_hex[:20])
 
         self._last_block = to_block
 
@@ -389,12 +392,12 @@ class CopyTradeEngine:
         """
         Derive swap path and direction from transaction receipt logs.
 
-        Used for routers with proprietary calldata (e.g. GMGN) where ABI
-        decoding is not possible. Reads ERC-20 Transfer events to find:
+        Works for any DEX router (GMGN, aggregators, PancakeSwap, etc.) by
+        reading ERC-20 Transfer and WBNB Deposit/Withdrawal events to find:
           - token received by the target wallet  → token_out (buy)
           - token sent from the target wallet    → token_in  (sell)
 
-        Returns (path, is_buy) or None if the swap cannot be determined.
+        Returns (path, is_buy) or None if no swap can be determined.
         """
         try:
             receipt = await self._w3h.eth.get_transaction_receipt(tx_hash)
@@ -402,123 +405,145 @@ class CopyTradeEngine:
             logger.warning("Could not fetch receipt for %s: %s", tx_hash[:20], exc)
             return None
 
+        # Skip failed transactions
+        if receipt.get("status") == 0:
+            logger.debug("Tx %s reverted — skipping", tx_hash[:20])
+            return None
+
         wallet = self.target_wallet.lower()
 
         # Collect Transfer events: tokens leaving and arriving at the wallet
-        transfers_to_wallet:   list[str] = []  # (token_addr,)
+        transfers_to_wallet:   list[str] = []
         transfers_from_wallet: list[str] = []
 
         for log in receipt.get("logs", []):
             topics = log.get("topics", [])
             if not topics:
                 continue
+
             topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
-            if topic0.lower() != TRANSFER_TOPIC.lower():
-                continue
-            if len(topics) < 3:
-                continue
+            topic0 = topic0.lower()
 
             token_addr = log["address"].lower()
-            frm = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
-            to  = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
 
-            if to == wallet:
-                transfers_to_wallet.append(token_addr)
-            elif frm == wallet:
-                transfers_from_wallet.append(token_addr)
+            # ERC-20 Transfer(from, to, value)
+            if topic0 == TRANSFER_TOPIC.lower() and len(topics) >= 3:
+                frm = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
+                to  = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
+                if to == wallet:
+                    transfers_to_wallet.append(token_addr)
+                elif frm == wallet:
+                    transfers_from_wallet.append(token_addr)
 
-        # Separate base tokens (payment) from non-base tokens (the traded asset)
+            # WBNB Deposit(dst, wad) — BNB → WBNB wrap triggered by the wallet
+            elif topic0 == WBNB_DEPOSIT_TOPIC.lower() and len(topics) >= 2:
+                dst = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
+                if dst == wallet:
+                    transfers_to_wallet.append(WBNB.lower())
+
+            # WBNB Withdrawal(src, wad) — WBNB → BNB unwrap
+            elif topic0 == WBNB_WITHDRAW_TOPIC.lower() and len(topics) >= 2:
+                src = ("0x" + (topics[1].hex() if isinstance(topics[1], bytes) else topics[1])[-40:]).lower()
+                if src == wallet:
+                    transfers_from_wallet.append(WBNB.lower())
+
+        # Separate base tokens (payment side) from non-base tokens (traded asset)
         base_received    = [t for t in transfers_to_wallet   if t in BASE_TOKENS]
         nonbase_received = [t for t in transfers_to_wallet   if t not in BASE_TOKENS]
         base_sent        = [t for t in transfers_from_wallet if t in BASE_TOKENS]
         nonbase_sent     = [t for t in transfers_from_wallet if t not in BASE_TOKENS]
 
+        logger.debug(
+            "Logs for %s — nonbase_rcv=%s base_sent=%s nonbase_sent=%s base_rcv=%s",
+            tx_hash[:20], nonbase_received, base_sent, nonbase_sent, base_received,
+        )
+
         if nonbase_received:
             # BUY: wallet received a non-base token
             token_out = AsyncWeb3.to_checksum_address(nonbase_received[-1])
-            # Determine what was paid: prefer explicit base token sent, else BNB
             if base_sent:
                 token_in = AsyncWeb3.to_checksum_address(base_sent[0])
             elif tx_value > 0:
+                # Native BNB sent with tx → route via WBNB
                 token_in = AsyncWeb3.to_checksum_address(WBNB)
             else:
-                # Fallback: use WBNB — _execute_buy will route via BNB
                 token_in = AsyncWeb3.to_checksum_address(WBNB)
             path = [token_in, token_out]
-            logger.info("GMGN BUY detected: token_in=%s token_out=%s", token_in, token_out)
+            logger.info("BUY detected via logs: token_in=%s token_out=%s", token_in, token_out)
             return path, True
 
-        if nonbase_sent and self.copy_sells:
-            # SELL: wallet sent a non-base token, received BNB or stable
-            token_in = AsyncWeb3.to_checksum_address(nonbase_sent[0])
-            token_out = AsyncWeb3.to_checksum_address(base_received[0]) if base_received else AsyncWeb3.to_checksum_address(WBNB)
+        if nonbase_sent:
+            # SELL: wallet sent a non-base token
+            if not self.copy_sells:
+                logger.info("Sell detected but copy_sells=False — skipping")
+                return None
+            token_in  = AsyncWeb3.to_checksum_address(nonbase_sent[0])
+            token_out = (
+                AsyncWeb3.to_checksum_address(base_received[0])
+                if base_received
+                else AsyncWeb3.to_checksum_address(WBNB)
+            )
             path = [token_in, token_out]
-            logger.info("GMGN SELL detected: token_in=%s token_out=%s", token_in, token_out)
+            logger.info("SELL detected via logs: token_in=%s token_out=%s", token_in, token_out)
             return path, False
 
-        logger.debug("Could not determine swap direction from logs for %s", tx_hash[:20])
+        logger.debug("No swap detected in logs for %s", tx_hash[:20])
         return None
 
     async def _mirror_swap(self, tx: dict) -> None:
-        """Decode the swap calldata and execute a mirrored swap."""
+        """Decode the swap and execute a mirrored trade.
+
+        Strategy:
+          1. If tx goes to PancakeSwap V2 router, try ABI calldata decode first.
+          2. For any other router (GMGN, aggregators, etc.) or if calldata decode
+             fails, fall back to receipt-log analysis to determine the swap path.
+        """
         if not self.enabled:
             logger.debug("Copy trading paused — skipping tx %s", tx.get("hash", "")[:20])
             return
 
         tx_to = (tx.get("to") or "").lower()
+        result = None
 
-        # GMGN and other non-PancakeSwap routers: derive path from receipt logs
-        if tx_to != PANCAKE_V2_ROUTER.lower():
+        # Try PancakeSwap V2 calldata decode first (fast path, no extra RPC call)
+        if tx_to == PANCAKE_V2_ROUTER.lower():
+            input_data = tx.get("input") or tx.get("data", "")
+            if input_data and len(input_data) >= 10:
+                selector = input_data[:10].lower()
+                func_map = self._build_selector_map()
+                func_name = func_map.get(selector)
+                if func_name:
+                    try:
+                        decoded = self._decode_calldata(func_name, input_data)
+                        path: list[str] = [
+                            AsyncWeb3.to_checksum_address(a) for a in decoded["path"]
+                        ]
+                        is_buy = _is_buy(path)
+                        result = (path, is_buy)
+                        logger.info("PancakeSwap calldata decoded: %s path=%s",
+                                    "BUY" if is_buy else "SELL", path)
+                    except Exception as exc:
+                        logger.warning("Calldata decode failed for %s: %s — falling back to logs",
+                                       func_name, exc)
+
+        # Fall back to receipt-log analysis for all other routers or decode failures
+        if result is None:
             result = await self._extract_swap_from_logs(
                 tx.get("hash", ""), tx.get("value", 0)
             )
             if result is None:
-                return
-            path, is_buy = result
-
-            if not is_buy and not self.copy_sells:
-                logger.info("Sell detected but copy_sells=False — skipping")
+                logger.debug("No swap detected in tx %s — skipping", tx.get("hash", "")[:20])
                 return
 
-            logger.info("Mirroring GMGN %s: path=%s", "BUY" if is_buy else "SELL", path)
-            try:
-                if is_buy:
-                    await self._execute_buy(path, tx)
-                else:
-                    await self._execute_sell(path, tx)
-            except Exception as exc:
-                logger.error("Mirror swap failed: %s", exc)
-                await _fire(_notify_copy_err, f"❌ فشل تنفيذ الصفقة المنسوخة:\n`{exc}`")
-            return
-
-        # PancakeSwap V2: decode calldata directly
-        input_data = tx.get("input") or tx.get("data", "")
-        if not input_data or len(input_data) < 10:
-            return
-
-        selector = input_data[:10].lower()
-
-        # Build selector → function name map from ABI
-        func_map = self._build_selector_map()
-        func_name = func_map.get(selector)
-        if not func_name:
-            logger.debug("Unknown selector %s — skipping", selector)
-            return
-
-        try:
-            decoded = self._decode_calldata(func_name, input_data)
-        except Exception as exc:
-            logger.warning("Failed to decode %s: %s", func_name, exc)
-            return
-
-        path: list[str] = [AsyncWeb3.to_checksum_address(a) for a in decoded["path"]]
-        is_buy = _is_buy(path)
+        path, is_buy = result
 
         if not is_buy and not self.copy_sells:
             logger.info("Sell detected but copy_sells=False — skipping")
             return
 
-        logger.info("Mirroring PancakeSwap %s: path=%s", "BUY" if is_buy else "SELL", path)
+        router_label = "PancakeSwap" if tx_to == PANCAKE_V2_ROUTER.lower() else tx_to[:10]
+        logger.info("Mirroring %s %s: path=%s",
+                    router_label, "BUY" if is_buy else "SELL", path)
 
         try:
             if is_buy:
