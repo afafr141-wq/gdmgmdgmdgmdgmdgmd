@@ -261,14 +261,38 @@ def register_copy_handlers(application) -> None:
 
 # ── Notification senders (injected into engine) ────────────────────────────────
 
-async def notify_copy_buy(token: str, usdt_amount: float, tx_hash: str) -> None:
+async def notify_copy_buy(
+    token: str,
+    usdt_amount: float,
+    tx_hash: str,
+    my_entry: float | None = None,
+    target_entry: float | None = None,
+) -> None:
+    # Price difference line
+    price_line = ""
+    if my_entry and target_entry and target_entry > 0:
+        diff_pct = (my_entry - target_entry) / target_entry * 100
+        if diff_pct > 0:
+            price_line = f"📊 دخلت *بعده* بـ `+{diff_pct:.2f}%` (أغلى)\n"
+        elif diff_pct < 0:
+            price_line = f"📊 دخلت *قبله* بـ `{diff_pct:.2f}%` (أرخص) ✅\n"
+        else:
+            price_line = f"📊 نفس سعر الدخول\n"
+
+    my_price_line    = f"💰 سعر دخولي:  `${my_entry:.8f}`\n"     if my_entry     else ""
+    target_price_line = f"🎯 سعر دخوله:  `${target_entry:.8f}`\n" if target_entry else ""
+
     await send_notification(
         f"🟢 *نسخ شراء منفذ*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Token:  `{token}`\n"
+        f"🪙 العقد: `{token}`\n"
         f"💵 المبلغ: `${usdt_amount:.2f} USDT`\n"
-        f"🔗 TX: `{tx_hash[:20]}...`\n"
-        f"[BSCScan](https://bscscan.com/tx/{tx_hash})",
+        f"{my_price_line}"
+        f"{target_price_line}"
+        f"{price_line}"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"[📈 GMGN](https://gmgn.ai/bsc/token/{token}) | "
+        f"[🔍 BSCScan](https://bscscan.com/tx/{tx_hash})",
     )
 
 
@@ -276,10 +300,11 @@ async def notify_copy_sell(token: str, amount: float, tx_hash: str) -> None:
     await send_notification(
         f"🔴 *نسخ بيع منفذ*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🪙 Token:  `{token}`\n"
+        f"🪙 العقد: `{token}`\n"
         f"📦 الكمية: `{amount:.4f}`\n"
-        f"🔗 TX: `{tx_hash[:20]}...`\n"
-        f"[BSCScan](https://bscscan.com/tx/{tx_hash})",
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"[📈 GMGN](https://gmgn.ai/bsc/token/{token}) | "
+        f"[🔍 BSCScan](https://bscscan.com/tx/{tx_hash})",
     )
 
 
