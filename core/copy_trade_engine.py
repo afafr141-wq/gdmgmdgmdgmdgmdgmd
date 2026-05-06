@@ -289,6 +289,9 @@ class CopyTradeEngine:
         # Consecutive WS failure counter for exponential backoff
         self._ws_fail_count: int = 0
 
+        # token_address → (my_entry_price_usdt, target_entry_price_usdt, usdt_spent)
+        self._open_positions: dict[str, tuple[float, float, float]] = {}
+
         # BSCScan API key (optional — increases rate limit from 5 to 10 req/s)
         self.bscscan_api_key: str = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
 
@@ -1158,6 +1161,10 @@ class CopyTradeEngine:
         except Exception as exc:
             logger.warning("Could not calculate entry prices: %s", exc)
 
+        # Save position so sell notification can calculate PnL
+        if my_entry:
+            self._open_positions[token_out.lower()] = (my_entry, target_entry or 0.0, trade_usdt)
+
         await _fire(
             _notify_copy_buy,
             token_out,
@@ -1242,7 +1249,17 @@ class CopyTradeEngine:
         logger.info("✅ SELL sent: %s | token=%s amount=%.4f",
                     tx_hash_hex, token_in[:8], token_amount)
 
-        await _fire(_notify_copy_sell, token_in, token_amount, tx_hash_hex)
+        # Retrieve saved buy position for PnL calculation
+        pos = self._open_positions.pop(token_in.lower(), None)
+
+        asyncio.create_task(self._confirm_and_notify_sell(
+            tx_hash=tx_hash,
+            tx_hash_hex=tx_hash_hex,
+            token_in=token_in,
+            token_amount=token_amount,
+            original_tx_hash=original_tx.get("hash", ""),
+            buy_position=pos,
+        ))
 
         await self._record_copy_trade(
             side="sell",
@@ -1251,6 +1268,81 @@ class CopyTradeEngine:
             amount_in_usdt=0.0,
             tx_hash=tx_hash_hex,
             original_tx=original_tx.get("hash", ""),
+        )
+
+    async def _confirm_and_notify_sell(
+        self,
+        tx_hash: bytes,
+        tx_hash_hex: str,
+        token_in: str,
+        token_amount: float,
+        original_tx_hash: str,
+        buy_position: Optional[tuple[float, float, float]],
+    ) -> None:
+        """Wait for SELL confirmation then send enriched notification with PnL."""
+        my_sell_price:     Optional[float] = None
+        target_sell_price: Optional[float] = None
+        my_pnl_usdt:       Optional[float] = None
+        target_pnl_usdt:   Optional[float] = None
+        usdt_received:     Optional[float] = None
+
+        try:
+            receipt = await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            # Calculate USDT received from sell receipt (BNB out → convert)
+            bnb_price = await self._bnb_price_in_usdt()
+            for log in receipt.get("logs", []):
+                topics = log.get("topics", [])
+                if len(topics) < 2:
+                    continue
+                topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+                # WBNB Withdrawal = BNB received
+                if topic0.lower() == WBNB_WITHDRAW_TOPIC.lower():
+                    amt = _parse_transfer_amount(log)
+                    if amt:
+                        usdt_received = float(bnb_price) * amt / 10**18
+                        break
+                # Stable received directly
+                if topic0.lower() == TRANSFER_TOPIC.lower() and len(topics) >= 3:
+                    to = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
+                    if to == self.my_address.lower() and log["address"].lower() in BASE_TOKENS:
+                        dec = await self._get_decimals(log["address"])
+                        usdt_received = _parse_transfer_amount(log) / (10 ** dec)
+                        break
+
+            if usdt_received and token_amount > 0:
+                my_sell_price = usdt_received / token_amount
+
+            # Target's sell price from original tx
+            if original_tx_hash:
+                target_sell_price = await self._get_target_entry_price(
+                    original_tx_hash, token_in, self.target_wallet
+                )
+
+            # PnL calculations
+            if buy_position and usdt_received:
+                my_entry_price, target_entry_price, usdt_spent = buy_position
+                my_pnl_usdt = usdt_received - usdt_spent
+                if target_entry_price and target_sell_price and token_amount > 0:
+                    target_usdt_spent   = target_entry_price * token_amount
+                    target_usdt_received = target_sell_price * token_amount
+                    target_pnl_usdt = target_usdt_received - target_usdt_spent
+
+        except Exception as exc:
+            logger.warning("Could not calculate sell prices: %s", exc)
+
+        await _fire(
+            _notify_copy_sell,
+            token_in,
+            token_amount,
+            tx_hash_hex,
+            usdt_received,
+            my_pnl_usdt,
+            my_sell_price,
+            buy_position[0] if buy_position else None,   # my entry price
+            target_sell_price,
+            buy_position[1] if buy_position else None,   # target entry price
+            target_pnl_usdt,
         )
 
     async def _approve_token(self, token_address: str, amount: int) -> None:
