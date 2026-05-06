@@ -69,7 +69,10 @@ WBNB_WITHDRAW_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95
 SLIPPAGE_BPS = 300   # basis points
 
 # Gas multiplier over target wallet's gas price (front-run)
-GAS_MULTIPLIER = float(os.getenv("COPY_TRADE_GAS_MULTIPLIER", "1.15"))
+# With 48 Club private RPC, transactions bypass the public mempool so a small
+# gas boost (1.05) is enough. Set COPY_TRADE_GAS_MULTIPLIER higher only if
+# not using a private RPC.
+GAS_MULTIPLIER = float(os.getenv("COPY_TRADE_GAS_MULTIPLIER", "1.05"))
 
 # Trade size in USDT equivalent
 TRADE_USDT = Decimal("3")
@@ -245,21 +248,25 @@ class CopyTradeEngine:
         trade_usdt: Decimal = TRADE_USDT,
         copy_sells: bool = True,
         enabled: bool = True,
+        private_rpc_url: str = "https://rpc.48.club",
     ) -> None:
-        self.ws_rpc_url    = ws_rpc_url
-        self.http_rpc_url  = http_rpc_url
-        self.target_wallet = AsyncWeb3.to_checksum_address(target_wallet)
-        self.account       = Account.from_key(my_private_key)
-        self.my_address    = self.account.address
-        self.trade_usdt    = trade_usdt
-        self.copy_sells    = copy_sells
-        self.enabled       = enabled
+        self.ws_rpc_url      = ws_rpc_url
+        self.http_rpc_url    = http_rpc_url
+        self.private_rpc_url = private_rpc_url  # 48 Club — bypasses public mempool
+        self.target_wallet   = AsyncWeb3.to_checksum_address(target_wallet)
+        self.account         = Account.from_key(my_private_key)
+        self.my_address      = self.account.address
+        self.trade_usdt      = trade_usdt
+        self.copy_sells      = copy_sells
+        self.enabled         = enabled
 
         self._running      = False
         self._task: Optional[asyncio.Task] = None
 
-        # HTTP w3 for sending transactions
+        # HTTP w3 for reading (Chainstack)
         self._w3h: Optional[AsyncWeb3] = None
+        # Private w3 for sending transactions (48 Club — bypasses public mempool)
+        self._w3h_private: Optional[AsyncWeb3] = None
         # WebSocket w3 for mempool subscription
         self._w3ws: Optional[AsyncWeb3] = None
 
@@ -315,10 +322,22 @@ class CopyTradeEngine:
     # ── Internal loop ──────────────────────────────────────────────────────────
 
     async def _init_http(self) -> None:
-        """Initialise HTTP Web3 connection."""
+        """Initialise HTTP Web3 connections.
+
+        _w3h        — Chainstack (read: balances, receipts, calls)
+        _w3h_private — 48 Club private RPC (write: send_raw_transaction only)
+                       Transactions sent here bypass the public mempool so
+                       front-runners cannot see them before inclusion.
+        """
         rpc = self.http_rpc_url or "https://bsc-dataseed1.binance.org/"
         self._w3h = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc))
         self._w3h.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+
+        priv_rpc = self.private_rpc_url or "https://rpc.48.club"
+        self._w3h_private = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(priv_rpc))
+        self._w3h_private.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+        logger.info("Private RPC (48 Club): %s", priv_rpc)
+
         self._router  = self._w3h.eth.contract(
             address=AsyncWeb3.to_checksum_address(PANCAKE_V2_ROUTER),
             abi=PANCAKE_ROUTER_ABI,
@@ -1091,7 +1110,7 @@ class CopyTradeEngine:
             })
 
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         tx_hash_hex = tx_hash.hex()
 
         logger.info("✅ BUY sent: %s | amount_in=%s | token_out=%s",
@@ -1215,7 +1234,7 @@ class CopyTradeEngine:
         })
 
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         tx_hash_hex = tx_hash.hex()
 
         decimals = await self._get_decimals(token_in)
@@ -1254,7 +1273,7 @@ class CopyTradeEngine:
             "chainId":  56,
         })
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         logger.info("Approve sent: %s for token %s", tx_hash.hex(), token_address[:10])
         # Must wait — swap will fail if approval isn't confirmed first
         await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
