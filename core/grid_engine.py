@@ -779,25 +779,40 @@ class GridEngine:
         # Max allowed holdings = half the total investment at current fill price
         max_allowed_qty = (state.total_investment / 2) / fill_price
 
+        # Max orders per side = half of grid_count
+        max_per_side = state.params.grid_count // 2
+        current_buys  = sum(1 for m in state.open_orders.values() if m["side"] == "buy")
+        current_sells = sum(1 for m in state.open_orders.values() if m["side"] == "sell")
+
         if side == "buy":
             # Update average cost
             total_cost          = state.avg_buy_price * state.held_qty + fill_price * qty
             state.held_qty     += qty
             state.avg_buy_price = total_cost / state.held_qty if state.held_qty else 0.0
 
-            # Place sell one step above the fill using actual grid spacing
+            # Place sell one step above the fill — only if under sell cap
             sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
-            if self._guard_order_cost(state, sell_price, qty):
+            if current_sells >= max_per_side:
+                logger.info(
+                    "Sell cap reached for %s: %d/%d — skipping new sell order",
+                    state.symbol, current_sells, max_per_side,
+                )
+            elif self._guard_order_cost(state, sell_price, qty):
                 sell_order = await self._client.place_limit_sell(state.symbol, sell_price, qty)
                 if sell_order:
                     state.open_orders[sell_order["id"]] = {"side": "sell", "price": sell_price, "qty": qty}
 
-            # Place next buy one step lower — only if under holdings cap
+            # Place next buy one step lower — only if under holdings cap and buy cap
             next_buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
             if state.held_qty >= max_allowed_qty:
                 logger.warning(
                     "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f (investment/2=%.2f) — buy skipped",
                     state.symbol, state.held_qty, max_allowed_qty, state.total_investment / 2,
+                )
+            elif current_buys >= max_per_side:
+                logger.info(
+                    "Buy cap reached for %s: %d/%d — skipping new buy order",
+                    state.symbol, current_buys, max_per_side,
                 )
             elif (
                 next_buy_price >= state.params.lower
@@ -824,12 +839,21 @@ class GridEngine:
             state.sell_count   += 1
             state.held_qty      = max(0.0, state.held_qty - qty)
 
-            # Place buy one step below the fill — only if under holdings cap
+            # Recalculate after sell fill
+            current_buys  = sum(1 for m in state.open_orders.values() if m["side"] == "buy")
+            current_sells = sum(1 for m in state.open_orders.values() if m["side"] == "sell")
+
+            # Place buy one step below the fill — only if under holdings cap and buy cap
             buy_price = self._client.round_price(state.symbol, fill_price - state.params.grid_spacing)
             if state.held_qty >= max_allowed_qty:
                 logger.warning(
                     "HOLDINGS CAP reached for %s: held=%.6f >= max=%.6f — buy skipped",
                     state.symbol, state.held_qty, max_allowed_qty,
+                )
+            elif current_buys >= max_per_side:
+                logger.info(
+                    "Buy cap reached for %s: %d/%d — skipping new buy order",
+                    state.symbol, current_buys, max_per_side,
                 )
             elif (
                 buy_price >= state.params.lower
@@ -839,9 +863,14 @@ class GridEngine:
                 if buy_order:
                     state.open_orders[buy_order["id"]] = {"side": "buy", "price": buy_price, "qty": state.params.qty_per_grid}
 
-            # Place next sell one step higher
+            # Place next sell one step higher — only if under sell cap
             next_sell_price = self._client.round_price(state.symbol, fill_price + state.params.grid_spacing)
-            if (
+            if current_sells >= max_per_side:
+                logger.info(
+                    "Sell cap reached for %s: %d/%d — skipping new sell order",
+                    state.symbol, current_sells, max_per_side,
+                )
+            elif (
                 next_sell_price <= state.params.upper
                 and self._guard_order_cost(state, next_sell_price, state.params.qty_per_grid)
             ):
