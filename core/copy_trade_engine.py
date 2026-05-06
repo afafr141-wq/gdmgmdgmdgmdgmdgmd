@@ -350,7 +350,13 @@ class CopyTradeEngine:
                         WS_RECONNECT_MAX,
                     )
                     err = str(exc)
-                    is_normal = "1001" in err or "going away" in err.lower()
+                    is_normal = (
+                        "1001" in err
+                        or "going away" in err.lower()
+                        or "no close frame" in err.lower()
+                        or "connection closed" in err.lower()
+                        or "connection reset" in err.lower()
+                    )
                     if is_normal:
                         logger.info("WS closed normally — reconnecting in %ds", delay)
                         self._ws_fail_count = 0
