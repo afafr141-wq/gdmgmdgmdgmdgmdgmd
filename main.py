@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from config.settings import (
     LOG_LEVEL, validate_env,
-    BSC_WS_RPC_URL, BSC_HTTP_RPC_URL,
+    BSC_WS_RPC_URL, BSC_HTTP_RPC_URL, BSC_PRIVATE_RPC_URL,
     COPY_TARGET_WALLET, MY_BSC_PRIVATE_KEY,
     COPY_TRADE_USDT, COPY_SELLS, COPY_TRADE_ENABLED,
 )
@@ -157,13 +157,14 @@ def main() -> None:
         )
 
         copy_engine = CopyTradeEngine(
-            ws_rpc_url    = BSC_WS_RPC_URL,   # empty string → polling mode
-            http_rpc_url  = BSC_HTTP_RPC_URL,
-            target_wallet = COPY_TARGET_WALLET,
-            my_private_key= MY_BSC_PRIVATE_KEY,
-            trade_usdt    = Decimal(str(COPY_TRADE_USDT)),
-            copy_sells    = COPY_SELLS,
-            enabled       = COPY_TRADE_ENABLED,
+            ws_rpc_url      = BSC_WS_RPC_URL,
+            http_rpc_url    = BSC_HTTP_RPC_URL,
+            target_wallet   = COPY_TARGET_WALLET,
+            my_private_key  = MY_BSC_PRIVATE_KEY,
+            trade_usdt      = Decimal(str(COPY_TRADE_USDT)),
+            copy_sells      = COPY_SELLS,
+            enabled         = COPY_TRADE_ENABLED,
+            private_rpc_url = BSC_PRIVATE_RPC_URL,
         )
 
         set_copy_notifiers(

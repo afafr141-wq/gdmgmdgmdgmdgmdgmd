@@ -30,8 +30,10 @@ ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate l
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
 # ── Copy-trade (BSC / PancakeSwap V2 + GMGN) ──────────────────────────────────
-BSC_WS_RPC_URL: str   = os.getenv("BSC_WS_RPC_URL", "")    # Ankr WebSocket endpoint
-BSC_HTTP_RPC_URL: str = os.getenv("BSC_HTTP_RPC_URL", "https://bsc-dataseed1.binance.org/")  # BSC HTTP RPC
+BSC_WS_RPC_URL: str    = os.getenv("BSC_WS_RPC_URL", "")
+BSC_HTTP_RPC_URL: str  = os.getenv("BSC_HTTP_RPC_URL", "https://bsc-dataseed1.binance.org/")
+# 48 Club private RPC — transactions sent here bypass the public mempool
+BSC_PRIVATE_RPC_URL: str = os.getenv("BSC_PRIVATE_RPC_URL", "https://rpc.48.club")
 COPY_TARGET_WALLET: str = os.getenv(
     "COPY_TARGET_WALLET",
     "0x7e8fb0392542812476d9f2d0d71c01d1fa0776c5",

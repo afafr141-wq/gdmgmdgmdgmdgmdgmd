@@ -296,12 +296,58 @@ async def notify_copy_buy(
     )
 
 
-async def notify_copy_sell(token: str, amount: float, tx_hash: str) -> None:
+async def notify_copy_sell(
+    token: str,
+    amount: float,
+    tx_hash: str,
+    usdt_received: float | None = None,
+    my_pnl_usdt: float | None = None,
+    my_sell_price: float | None = None,
+    my_entry_price: float | None = None,
+    target_sell_price: float | None = None,
+    target_entry_price: float | None = None,
+    target_pnl_usdt: float | None = None,
+) -> None:
+    # ── أرقامي ────────────────────────────────────────────────────────────────
+    my_entry_line  = f"💰 دخلت بـ:      `${my_entry_price:.8f}`\n"  if my_entry_price  else ""
+    my_sell_line   = f"💸 بعت بـ:       `${my_sell_price:.8f}`\n"   if my_sell_price   else ""
+    received_line  = f"💵 استلمت:       `${usdt_received:.2f} USDT`\n" if usdt_received else ""
+
+    if my_pnl_usdt is not None:
+        pnl_icon = "🟢" if my_pnl_usdt >= 0 else "🔴"
+        my_pnl_line = f"{pnl_icon} ربحي/خسارتي: `{'+'if my_pnl_usdt>=0 else ''}{my_pnl_usdt:.2f} USDT`\n"
+    else:
+        my_pnl_line = ""
+
+    # ── أرقام المحفظة ─────────────────────────────────────────────────────────
+    tgt_entry_line = f"🎯 دخل هو بـ:    `${target_entry_price:.8f}`\n" if target_entry_price else ""
+    tgt_sell_line  = f"🏁 باع هو بـ:    `${target_sell_price:.8f}`\n"  if target_sell_price  else ""
+
+    if target_pnl_usdt is not None:
+        tgt_icon = "🟢" if target_pnl_usdt >= 0 else "🔴"
+        tgt_pnl_line = f"{tgt_icon} ربحه/خسارته: `{'+'if target_pnl_usdt>=0 else ''}{target_pnl_usdt:.2f} USDT`\n"
+    else:
+        tgt_pnl_line = ""
+
+    has_target = tgt_entry_line or tgt_sell_line or tgt_pnl_line
+    target_block = (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *المحفظة المنسوخة*\n"
+        f"{tgt_entry_line}"
+        f"{tgt_sell_line}"
+        f"{tgt_pnl_line}"
+    ) if has_target else ""
+
     await send_notification(
         f"🔴 *نسخ بيع منفذ*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🪙 العقد: `{token}`\n"
         f"📦 الكمية: `{amount:.4f}`\n"
+        f"{my_entry_line}"
+        f"{my_sell_line}"
+        f"{received_line}"
+        f"{my_pnl_line}"
+        f"{target_block}"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"[📈 GMGN](https://gmgn.ai/bsc/token/{token}) | "
         f"[🔍 BSCScan](https://bscscan.com/tx/{tx_hash})",

@@ -69,7 +69,10 @@ WBNB_WITHDRAW_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95
 SLIPPAGE_BPS = 300   # basis points
 
 # Gas multiplier over target wallet's gas price (front-run)
-GAS_MULTIPLIER = 1.15   # 15% higher
+# With 48 Club private RPC, transactions bypass the public mempool so a small
+# gas boost (1.05) is enough. Set COPY_TRADE_GAS_MULTIPLIER higher only if
+# not using a private RPC.
+GAS_MULTIPLIER = float(os.getenv("COPY_TRADE_GAS_MULTIPLIER", "1.05"))
 
 # Trade size in USDT equivalent
 TRADE_USDT = Decimal("3")
@@ -245,21 +248,25 @@ class CopyTradeEngine:
         trade_usdt: Decimal = TRADE_USDT,
         copy_sells: bool = True,
         enabled: bool = True,
+        private_rpc_url: str = "https://rpc.48.club",
     ) -> None:
-        self.ws_rpc_url    = ws_rpc_url
-        self.http_rpc_url  = http_rpc_url
-        self.target_wallet = AsyncWeb3.to_checksum_address(target_wallet)
-        self.account       = Account.from_key(my_private_key)
-        self.my_address    = self.account.address
-        self.trade_usdt    = trade_usdt
-        self.copy_sells    = copy_sells
-        self.enabled       = enabled
+        self.ws_rpc_url      = ws_rpc_url
+        self.http_rpc_url    = http_rpc_url
+        self.private_rpc_url = private_rpc_url  # 48 Club — bypasses public mempool
+        self.target_wallet   = AsyncWeb3.to_checksum_address(target_wallet)
+        self.account         = Account.from_key(my_private_key)
+        self.my_address      = self.account.address
+        self.trade_usdt      = trade_usdt
+        self.copy_sells      = copy_sells
+        self.enabled         = enabled
 
         self._running      = False
         self._task: Optional[asyncio.Task] = None
 
-        # HTTP w3 for sending transactions
+        # HTTP w3 for reading (Chainstack)
         self._w3h: Optional[AsyncWeb3] = None
+        # Private w3 for sending transactions (48 Club — bypasses public mempool)
+        self._w3h_private: Optional[AsyncWeb3] = None
         # WebSocket w3 for mempool subscription
         self._w3ws: Optional[AsyncWeb3] = None
 
@@ -281,6 +288,9 @@ class CopyTradeEngine:
 
         # Consecutive WS failure counter for exponential backoff
         self._ws_fail_count: int = 0
+
+        # token_address → (my_entry_price_usdt, target_entry_price_usdt, usdt_spent)
+        self._open_positions: dict[str, tuple[float, float, float]] = {}
 
         # BSCScan API key (optional — increases rate limit from 5 to 10 req/s)
         self.bscscan_api_key: str = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
@@ -315,10 +325,22 @@ class CopyTradeEngine:
     # ── Internal loop ──────────────────────────────────────────────────────────
 
     async def _init_http(self) -> None:
-        """Initialise HTTP Web3 connection."""
+        """Initialise HTTP Web3 connections.
+
+        _w3h        — Chainstack (read: balances, receipts, calls)
+        _w3h_private — 48 Club private RPC (write: send_raw_transaction only)
+                       Transactions sent here bypass the public mempool so
+                       front-runners cannot see them before inclusion.
+        """
         rpc = self.http_rpc_url or "https://bsc-dataseed1.binance.org/"
         self._w3h = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc))
         self._w3h.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+
+        priv_rpc = self.private_rpc_url or "https://rpc.48.club"
+        self._w3h_private = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(priv_rpc))
+        self._w3h_private.middleware_onion.inject(async_geth_poa_middleware, layer=0)
+        logger.info("Private RPC (48 Club): %s", priv_rpc)
+
         self._router  = self._w3h.eth.contract(
             address=AsyncWeb3.to_checksum_address(PANCAKE_V2_ROUTER),
             abi=PANCAKE_ROUTER_ABI,
@@ -335,7 +357,7 @@ class CopyTradeEngine:
         if self.ws_rpc_url:
             logger.info("WebSocket RPC detected — using mempool mode")
             await _fire(_notify_copy_err,
-                        "🔍 *نسخ التجارة يعمل*\n⚡ وضع الـ Mempool (WebSocket) — أسرع من الـ blocks")
+                        "✅ *نسخ التجارة يعمل*\n⚡ وضع الـ Mempool (WebSocket) — أسرع من الـ blocks\n🔒 الإرسال عبر 48 Club Private RPC")
             while self._running:
                 try:
                     await self._subscribe_mempool()
@@ -368,7 +390,7 @@ class CopyTradeEngine:
         else:
             logger.info("No WSS URL — using block polling every %ds", BSCSCAN_POLL_INTERVAL)
             await _fire(_notify_copy_err,
-                        "🔍 *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
+                        "✅ *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
             while self._running:
                 try:
                     await self._poll_new_blocks()
@@ -1091,7 +1113,7 @@ class CopyTradeEngine:
             })
 
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         tx_hash_hex = tx_hash.hex()
 
         logger.info("✅ BUY sent: %s | amount_in=%s | token_out=%s",
@@ -1138,6 +1160,10 @@ class CopyTradeEngine:
                 )
         except Exception as exc:
             logger.warning("Could not calculate entry prices: %s", exc)
+
+        # Save position so sell notification can calculate PnL
+        if my_entry:
+            self._open_positions[token_out.lower()] = (my_entry, target_entry or 0.0, trade_usdt)
 
         await _fire(
             _notify_copy_buy,
@@ -1215,7 +1241,7 @@ class CopyTradeEngine:
         })
 
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         tx_hash_hex = tx_hash.hex()
 
         decimals = await self._get_decimals(token_in)
@@ -1223,7 +1249,17 @@ class CopyTradeEngine:
         logger.info("✅ SELL sent: %s | token=%s amount=%.4f",
                     tx_hash_hex, token_in[:8], token_amount)
 
-        await _fire(_notify_copy_sell, token_in, token_amount, tx_hash_hex)
+        # Retrieve saved buy position for PnL calculation
+        pos = self._open_positions.pop(token_in.lower(), None)
+
+        asyncio.create_task(self._confirm_and_notify_sell(
+            tx_hash=tx_hash,
+            tx_hash_hex=tx_hash_hex,
+            token_in=token_in,
+            token_amount=token_amount,
+            original_tx_hash=original_tx.get("hash", ""),
+            buy_position=pos,
+        ))
 
         await self._record_copy_trade(
             side="sell",
@@ -1232,6 +1268,81 @@ class CopyTradeEngine:
             amount_in_usdt=0.0,
             tx_hash=tx_hash_hex,
             original_tx=original_tx.get("hash", ""),
+        )
+
+    async def _confirm_and_notify_sell(
+        self,
+        tx_hash: bytes,
+        tx_hash_hex: str,
+        token_in: str,
+        token_amount: float,
+        original_tx_hash: str,
+        buy_position: Optional[tuple[float, float, float]],
+    ) -> None:
+        """Wait for SELL confirmation then send enriched notification with PnL."""
+        my_sell_price:     Optional[float] = None
+        target_sell_price: Optional[float] = None
+        my_pnl_usdt:       Optional[float] = None
+        target_pnl_usdt:   Optional[float] = None
+        usdt_received:     Optional[float] = None
+
+        try:
+            receipt = await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+            # Calculate USDT received from sell receipt (BNB out → convert)
+            bnb_price = await self._bnb_price_in_usdt()
+            for log in receipt.get("logs", []):
+                topics = log.get("topics", [])
+                if len(topics) < 2:
+                    continue
+                topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+                # WBNB Withdrawal = BNB received
+                if topic0.lower() == WBNB_WITHDRAW_TOPIC.lower():
+                    amt = _parse_transfer_amount(log)
+                    if amt:
+                        usdt_received = float(bnb_price) * amt / 10**18
+                        break
+                # Stable received directly
+                if topic0.lower() == TRANSFER_TOPIC.lower() and len(topics) >= 3:
+                    to = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
+                    if to == self.my_address.lower() and log["address"].lower() in BASE_TOKENS:
+                        dec = await self._get_decimals(log["address"])
+                        usdt_received = _parse_transfer_amount(log) / (10 ** dec)
+                        break
+
+            if usdt_received and token_amount > 0:
+                my_sell_price = usdt_received / token_amount
+
+            # Target's sell price from original tx
+            if original_tx_hash:
+                target_sell_price = await self._get_target_entry_price(
+                    original_tx_hash, token_in, self.target_wallet
+                )
+
+            # PnL calculations
+            if buy_position and usdt_received:
+                my_entry_price, target_entry_price, usdt_spent = buy_position
+                my_pnl_usdt = usdt_received - usdt_spent
+                if target_entry_price and target_sell_price and token_amount > 0:
+                    target_usdt_spent   = target_entry_price * token_amount
+                    target_usdt_received = target_sell_price * token_amount
+                    target_pnl_usdt = target_usdt_received - target_usdt_spent
+
+        except Exception as exc:
+            logger.warning("Could not calculate sell prices: %s", exc)
+
+        await _fire(
+            _notify_copy_sell,
+            token_in,
+            token_amount,
+            tx_hash_hex,
+            usdt_received,
+            my_pnl_usdt,
+            my_sell_price,
+            buy_position[0] if buy_position else None,   # my entry price
+            target_sell_price,
+            buy_position[1] if buy_position else None,   # target entry price
+            target_pnl_usdt,
         )
 
     async def _approve_token(self, token_address: str, amount: int) -> None:
@@ -1254,7 +1365,7 @@ class CopyTradeEngine:
             "chainId":  56,
         })
         signed = self.account.sign_transaction(tx)
-        tx_hash = await self._w3h.eth.send_raw_transaction(signed.raw_transaction)
+        tx_hash = await self._w3h_private.eth.send_raw_transaction(signed.raw_transaction)
         logger.info("Approve sent: %s for token %s", tx_hash.hex(), token_address[:10])
         # Must wait — swap will fail if approval isn't confirmed first
         await self._w3h.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
