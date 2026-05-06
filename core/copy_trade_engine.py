@@ -354,7 +354,7 @@ class CopyTradeEngine:
         if self.ws_rpc_url:
             logger.info("WebSocket RPC detected — using mempool mode")
             await _fire(_notify_copy_err,
-                        "🔍 *نسخ التجارة يعمل*\n⚡ وضع الـ Mempool (WebSocket) — أسرع من الـ blocks")
+                        "✅ *نسخ التجارة يعمل*\n⚡ وضع الـ Mempool (WebSocket) — أسرع من الـ blocks\n🔒 الإرسال عبر 48 Club Private RPC")
             while self._running:
                 try:
                     await self._subscribe_mempool()
@@ -387,7 +387,7 @@ class CopyTradeEngine:
         else:
             logger.info("No WSS URL — using block polling every %ds", BSCSCAN_POLL_INTERVAL)
             await _fire(_notify_copy_err,
-                        "🔍 *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
+                        "✅ *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
             while self._running:
                 try:
                     await self._poll_new_blocks()
