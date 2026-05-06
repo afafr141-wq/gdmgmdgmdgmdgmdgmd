@@ -74,8 +74,12 @@ GAS_MULTIPLIER = 1.15   # 15% higher
 # Trade size in USDT equivalent
 TRADE_USDT = Decimal("3")
 
-# Reconnect delay on WebSocket drop
+# Reconnect delay on WebSocket drop (base — doubles on each consecutive failure)
 WS_RECONNECT_DELAY = 5
+WS_RECONNECT_MAX   = 60   # cap backoff at 60 s
+
+# Max concurrent HTTP RPC calls (guards against 429 on remaining calls)
+RPC_SEMAPHORE_LIMIT = 5
 
 # BSCScan polling interval (seconds) — fallback when WSS unavailable
 BSCSCAN_POLL_INTERVAL = 3
@@ -272,6 +276,12 @@ class CopyTradeEngine:
         # Token decimals cache
         self._decimals_cache: dict[str, int] = {}
 
+        # Semaphore: limits concurrent HTTP RPC calls to avoid 429
+        self._rpc_sem = asyncio.Semaphore(RPC_SEMAPHORE_LIMIT)
+
+        # Consecutive WS failure counter for exponential backoff
+        self._ws_fail_count: int = 0
+
         # BSCScan API key (optional — increases rate limit from 5 to 10 req/s)
         self.bscscan_api_key: str = os.getenv("BSCSCAN_API_KEY", "YourApiKeyToken")
 
@@ -329,18 +339,26 @@ class CopyTradeEngine:
             while self._running:
                 try:
                     await self._subscribe_mempool()
+                    # Clean exit (idle timeout / normal close) — reset backoff
+                    self._ws_fail_count = 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    self._ws_fail_count += 1
+                    delay = min(
+                        WS_RECONNECT_DELAY * (2 ** (self._ws_fail_count - 1)),
+                        WS_RECONNECT_MAX,
+                    )
                     err = str(exc)
                     is_normal = "1001" in err or "going away" in err.lower()
                     if is_normal:
-                        logger.info("WS closed normally — reconnecting")
+                        logger.info("WS closed normally — reconnecting in %ds", delay)
+                        self._ws_fail_count = 0
                     else:
-                        logger.error("WS error: %s — reconnecting in %ds", exc, WS_RECONNECT_DELAY)
+                        logger.error("WS error: %s — reconnecting in %ds", exc, delay)
                         await _fire(_notify_copy_err,
-                                    f"⚠️ انقطع الـ WebSocket: `{exc}`\nإعادة الاتصال...")
-                    await asyncio.sleep(WS_RECONNECT_DELAY)
+                                    f"⚠️ انقطع الـ WebSocket: `{exc}`\nإعادة الاتصال خلال {delay}s...")
+                    await asyncio.sleep(delay)
         else:
             logger.info("No WSS URL — using block polling every %ds", BSCSCAN_POLL_INTERVAL)
             await _fire(_notify_copy_err,
@@ -355,22 +373,34 @@ class CopyTradeEngine:
                 await asyncio.sleep(BSCSCAN_POLL_INTERVAL)
 
     async def _subscribe_mempool(self) -> None:
-        """Subscribe to pending transactions via WebSocket and mirror target wallet swaps."""
+        """Subscribe to pending transactions via WebSocket and mirror target wallet swaps.
+
+        Uses ``newPendingTransactions`` with ``true`` (full-tx mode) so the node
+        delivers complete transaction objects over the WebSocket.  This eliminates
+        the per-tx ``eth_getTransactionByHash`` HTTP calls that caused HTTP 429
+        rate-limit errors when the mempool is busy.
+
+        Fallback: if the node does not support full-tx mode (result is a plain
+        hash string), we fetch the transaction via HTTP but throttle concurrent
+        calls with ``_rpc_sem``.
+        """
         import websockets as _ws
 
         logger.info("Connecting to mempool WebSocket: %s", self.ws_rpc_url[:60])
 
         async with _ws.connect(
             self.ws_rpc_url,
-            ping_interval=None,
-            ping_timeout=None,
+            ping_interval=20,
+            ping_timeout=20,
         ) as ws:
-            # Subscribe to new pending transactions
+            # Request full transaction objects in the subscription result.
+            # Ankr and most BSC nodes support this; plain-hash nodes fall back
+            # gracefully (see handling below).
             await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "eth_subscribe",
-                "params": ["newPendingTransactions"],
+                "params": ["newPendingTransactions", True],
             }))
 
             resp = json.loads(await ws.recv())
@@ -379,55 +409,96 @@ class CopyTradeEngine:
                 raise RuntimeError(f"eth_subscribe failed: {resp}")
             logger.info("Mempool subscription active: %s", sub_id)
 
+            target_lower = self.target_wallet.lower()
+
             while self._running:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60)
                 except asyncio.TimeoutError:
-                    # No messages for 60s — reconnect
                     logger.info("WS idle 60s — reconnecting")
                     return
 
                 try:
                     msg = json.loads(raw)
-                    tx_hash = msg.get("params", {}).get("result")
-                    if not tx_hash or not isinstance(tx_hash, str):
-                        continue
-                    if tx_hash in self._seen:
+                    result = msg.get("params", {}).get("result")
+                    if not result:
                         continue
 
-                    # Fetch full tx to check sender
-                    try:
-                        tx = await self._w3h.eth.get_transaction(tx_hash)
-                    except Exception:
-                        continue
-                    if tx is None:
-                        continue
+                    # ── Full-tx mode: node returned a dict ──────────────────
+                    if isinstance(result, dict):
+                        tx_hash = (result.get("hash") or "").lower()
+                        if not tx_hash or tx_hash in self._seen:
+                            continue
 
-                    tx_from = (tx.get("from") or "").lower()
-                    tx_to   = (tx.get("to")   or "").lower()
+                        tx_from = (result.get("from") or "").lower()
+                        tx_to   = (result.get("to")   or "").lower()
 
-                    if tx_from != self.target_wallet.lower():
-                        continue
-                    if not tx_to:
-                        continue
+                        if tx_from != target_lower or not tx_to:
+                            continue
 
-                    self._seen.add(tx_hash)
+                        self._seen.add(tx_hash)
 
-                    input_data = tx.get("input", b"")
-                    if isinstance(input_data, bytes):
-                        input_data = "0x" + input_data.hex()
+                        input_data = result.get("input", "0x") or "0x"
+                        if isinstance(input_data, bytes):
+                            input_data = "0x" + input_data.hex()
 
-                    tx_web3 = {
-                        "hash":     tx_hash,
-                        "from":     tx.get("from", ""),
-                        "to":       tx.get("to", ""),
-                        "input":    input_data,
-                        "value":    tx.get("value", 0),
-                        "gasPrice": tx.get("gasPrice", 5_000_000_000),
-                    }
-                    logger.info("Mempool: target tx %s → %s", tx_hash[:20], tx_to[:10])
-                    if self.enabled:
-                        asyncio.create_task(self._mirror_swap(tx_web3))
+                        tx_web3 = {
+                            "hash":     result.get("hash", tx_hash),
+                            "from":     result.get("from", ""),
+                            "to":       result.get("to", ""),
+                            "input":    input_data,
+                            "value":    int(result.get("value", "0x0"), 16)
+                                        if isinstance(result.get("value"), str)
+                                        else result.get("value", 0),
+                            "gasPrice": int(result.get("gasPrice", "0x12a05f200"), 16)
+                                        if isinstance(result.get("gasPrice"), str)
+                                        else result.get("gasPrice", 5_000_000_000),
+                        }
+                        logger.info("Mempool (full-tx): target tx %s → %s",
+                                    tx_hash[:20], tx_to[:10])
+                        if self.enabled:
+                            asyncio.create_task(self._mirror_swap(tx_web3))
+
+                    # ── Hash-only mode: node returned a plain string ─────────
+                    elif isinstance(result, str):
+                        tx_hash = result.lower()
+                        if tx_hash in self._seen:
+                            continue
+
+                        # Throttle HTTP fetches to avoid 429
+                        async def _fetch_and_mirror(h: str) -> None:
+                            async with self._rpc_sem:
+                                try:
+                                    tx = await self._w3h.eth.get_transaction(h)
+                                except Exception:
+                                    return
+                            if tx is None:
+                                return
+
+                            tx_from = (tx.get("from") or "").lower()
+                            tx_to   = (tx.get("to")   or "").lower()
+                            if tx_from != target_lower or not tx_to:
+                                return
+
+                            self._seen.add(h)
+                            input_data = tx.get("input", b"")
+                            if isinstance(input_data, bytes):
+                                input_data = "0x" + input_data.hex()
+
+                            tx_web3 = {
+                                "hash":     h,
+                                "from":     tx.get("from", ""),
+                                "to":       tx.get("to", ""),
+                                "input":    input_data,
+                                "value":    tx.get("value", 0),
+                                "gasPrice": tx.get("gasPrice", 5_000_000_000),
+                            }
+                            logger.info("Mempool (hash-only): target tx %s → %s",
+                                        h[:20], tx_to[:10])
+                            if self.enabled:
+                                asyncio.create_task(self._mirror_swap(tx_web3))
+
+                        asyncio.create_task(_fetch_and_mirror(tx_hash))
 
                     # Trim seen set
                     if len(self._seen) > 10_000:
