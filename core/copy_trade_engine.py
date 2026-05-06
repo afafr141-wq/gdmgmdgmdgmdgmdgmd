@@ -69,7 +69,7 @@ WBNB_WITHDRAW_TOPIC = "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95
 SLIPPAGE_BPS = 300   # basis points
 
 # Gas multiplier over target wallet's gas price (front-run)
-GAS_MULTIPLIER = 1.15   # 15% higher
+GAS_MULTIPLIER = float(os.getenv("COPY_TRADE_GAS_MULTIPLIER", "1.15"))
 
 # Trade size in USDT equivalent
 TRADE_USDT = Decimal("3")
