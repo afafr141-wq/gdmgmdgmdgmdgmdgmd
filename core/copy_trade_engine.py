@@ -1156,6 +1156,23 @@ class CopyTradeEngine:
         balance = await token_contract.functions.balanceOf(self.my_address).call()
         if balance == 0:
             logger.info("No balance for %s — skipping sell", token_in)
+            original_tx_hash = original_tx.get("hash", "")
+            tgt_price: Optional[float] = None
+            if original_tx_hash:
+                try:
+                    tgt_price = await self._get_target_entry_price(
+                        original_tx_hash, token_in, self.target_wallet
+                    )
+                except Exception:
+                    pass
+            price_line = f"\n🎯 سعر بيعه: `${tgt_price:.8f}`" if tgt_price else ""
+            await _fire(
+                _notify_copy_err,
+                f"👁 *باع المحفظة — ليس لديك التوكن*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🪙 العقد: `{token_in}`{price_line}\n"
+                f"[📈 GMGN](https://gmgn.ai/bsc/token/{token_in})",
+            )
             return
 
         # Approve router if needed
