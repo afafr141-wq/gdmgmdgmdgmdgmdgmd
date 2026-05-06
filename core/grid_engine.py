@@ -291,7 +291,7 @@ class GridEngine:
                 "(investment=%.2f / %d orders × 2)",
                 state.symbol, cost, max_cost, state.total_investment, state.params.grid_count,
             )
-            asyncio.ensure_future(_fire(
+            asyncio.create_task(_fire(
                 _notify_error and _notify_error(
                     state.symbol,
                     "تجاوز ميزانية الأمر",
@@ -445,7 +445,13 @@ class GridEngine:
         breakout_lower = price < state.params.lower * (1 - state.lower_pct / 100)
 
         if not breakout_upper and not breakout_lower:
-            state._pending_rebuild = False   # price came back — cancel any pending wait
+            if state._pending_rebuild:
+                # Price returned inside range — cancel the pending rebuild task
+                state._pending_rebuild = False
+                if state._rebuild_task and not state._rebuild_task.done():
+                    state._rebuild_task.cancel()
+                    state._rebuild_task = None
+                    logger.info("Breakout cancelled for %s — price returned inside range", state.symbol)
             return
 
         if state._pending_rebuild:
@@ -460,7 +466,7 @@ class GridEngine:
         )
         state._pending_rebuild = True
         # Track the task so it can be cancelled if the grid stops
-        state._rebuild_task = asyncio.ensure_future(self._wait_and_rebuild(state, direction))
+        state._rebuild_task = asyncio.create_task(self._wait_and_rebuild(state, direction))
 
     async def _wait_and_rebuild(self, state: GridState, direction: str) -> None:
         """
