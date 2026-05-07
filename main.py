@@ -149,7 +149,15 @@ def main() -> None:
     app.bot_data["engine"] = engine
 
     # Wire copy-trade engine if all required vars are present
-    # BSC_WS_RPC_URL is optional — engine falls back to BSCScan HTTP polling
+    # BSC_WS_RPC_URL is optional — engine falls back to block polling
+    logger.info("=== COPY TRADE ENV CHECK ===")
+    logger.info("MY_BSC_PRIVATE_KEY : %s", "SET" if MY_BSC_PRIVATE_KEY else "MISSING ❌")
+    logger.info("COPY_TARGET_WALLET : %s", COPY_TARGET_WALLET[:10] + "..." if COPY_TARGET_WALLET else "MISSING ❌")
+    logger.info("BSC_HTTP_RPC_URL   : %s", BSC_HTTP_RPC_URL[:40] + "..." if BSC_HTTP_RPC_URL else "MISSING ❌")
+    logger.info("BSC_WS_RPC_URL     : %s", (BSC_WS_RPC_URL[:40] + "...") if BSC_WS_RPC_URL else "NOT SET (block polling mode)")
+    logger.info("COPY_TRADE_ENABLED : %s", COPY_TRADE_ENABLED)
+    logger.info("============================")
+
     if MY_BSC_PRIVATE_KEY:
         from core.copy_trade_engine import CopyTradeEngine, set_copy_notifiers
         from bot.copy_bot import (
@@ -181,7 +189,7 @@ def main() -> None:
         app.bot_data["copy_engine"] = copy_engine
         logger.info("CopyTradeEngine configured — target: %s", COPY_TARGET_WALLET[:10])
     else:
-        logger.warning("CopyTradeEngine not started — missing BSC env vars")
+        logger.warning("CopyTradeEngine not started — MY_BSC_PRIVATE_KEY is missing")
 
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
