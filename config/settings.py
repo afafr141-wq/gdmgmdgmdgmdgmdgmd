@@ -32,6 +32,9 @@ FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 # ── Copy-trade (BSC / PancakeSwap V2 + GMGN) ──────────────────────────────────
 BSC_WS_RPC_URL: str    = os.getenv("BSC_WS_RPC_URL", "")
 BSC_HTTP_RPC_URL: str  = os.getenv("BSC_HTTP_RPC_URL", "https://bsc-dataseed1.binance.org/")
+# Optional Basic Auth credentials for password-protected WSS endpoints (e.g. Chainstack)
+BSC_WS_USERNAME: str   = os.getenv("BSC_WS_USERNAME", "")
+BSC_WS_PASSWORD: str   = os.getenv("BSC_WS_PASSWORD", "")
 # 48 Club private RPC — transactions sent here bypass the public mempool
 BSC_PRIVATE_RPC_URL: str = os.getenv("BSC_PRIVATE_RPC_URL", "https://rpc.48.club")
 COPY_TARGET_WALLET: str = os.getenv(

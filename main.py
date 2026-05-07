@@ -8,6 +8,7 @@ from decimal import Decimal
 from config.settings import (
     LOG_LEVEL, validate_env,
     BSC_WS_RPC_URL, BSC_HTTP_RPC_URL, BSC_PRIVATE_RPC_URL,
+    BSC_WS_USERNAME, BSC_WS_PASSWORD,
     COPY_TARGET_WALLET, MY_BSC_PRIVATE_KEY,
     COPY_TRADE_USDT, COPY_SELLS, COPY_TRADE_ENABLED,
 )
@@ -165,6 +166,8 @@ def main() -> None:
             copy_sells      = COPY_SELLS,
             enabled         = COPY_TRADE_ENABLED,
             private_rpc_url = BSC_PRIVATE_RPC_URL,
+            ws_username     = BSC_WS_USERNAME,
+            ws_password     = BSC_WS_PASSWORD,
         )
 
         set_copy_notifiers(

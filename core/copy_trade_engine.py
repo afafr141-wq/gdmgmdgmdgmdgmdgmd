@@ -249,9 +249,13 @@ class CopyTradeEngine:
         copy_sells: bool = True,
         enabled: bool = True,
         private_rpc_url: str = "https://rpc.48.club",
+        ws_username: str = "",
+        ws_password: str = "",
     ) -> None:
         self.ws_rpc_url      = ws_rpc_url
         self.http_rpc_url    = http_rpc_url
+        self.ws_username     = ws_username
+        self.ws_password     = ws_password
         self.private_rpc_url = private_rpc_url  # 48 Club — bypasses public mempool
         self.target_wallet   = AsyncWeb3.to_checksum_address(target_wallet)
         self.account         = Account.from_key(my_private_key)
@@ -413,13 +417,25 @@ class CopyTradeEngine:
         calls with ``_rpc_sem``.
         """
         import websockets as _ws
+        import base64
 
         logger.info("Connecting to mempool WebSocket: %s", self.ws_rpc_url[:60])
+
+        # Build optional Basic Auth header for providers like Chainstack
+        # that use password-protected endpoints instead of key-in-URL.
+        extra_headers = {}
+        if self.ws_username and self.ws_password:
+            creds = base64.b64encode(
+                f"{self.ws_username}:{self.ws_password}".encode()
+            ).decode()
+            extra_headers["Authorization"] = f"Basic {creds}"
+            logger.debug("Using Basic Auth for WebSocket connection")
 
         async with _ws.connect(
             self.ws_rpc_url,
             ping_interval=20,
             ping_timeout=20,
+            additional_headers=extra_headers,
         ) as ws:
             # Request full transaction objects in the subscription result.
             # Ankr and most BSC nodes support this; plain-hash nodes fall back
