@@ -358,6 +358,9 @@ class CopyTradeEngine:
         await self._init_http()
         self._last_block = await self._w3h.eth.block_number
 
+        # Max consecutive WS failures before falling back to block polling permanently
+        WS_MAX_FAILURES = 5
+
         if self.ws_rpc_url:
             logger.info("WebSocket RPC detected — using mempool mode")
             await _fire(_notify_copy_err,
@@ -388,13 +391,27 @@ class CopyTradeEngine:
                         self._ws_fail_count = 0
                     else:
                         logger.error("WS error: %s — reconnecting in %ds", exc, delay)
+                        # After too many consecutive failures, fall back to block polling
+                        if self._ws_fail_count >= WS_MAX_FAILURES:
+                            logger.warning(
+                                "WebSocket failed %d times — switching to block polling",
+                                self._ws_fail_count,
+                            )
+                            await _fire(_notify_copy_err,
+                                        f"⚠️ WebSocket فشل {self._ws_fail_count} مرات متتالية\n"
+                                        "🔄 التحويل لـ Block Polling تلقائياً...")
+                            break  # exit WS loop → fall through to block polling below
                         await _fire(_notify_copy_err,
                                     f"⚠️ انقطع الـ WebSocket: `{exc}`\nإعادة الاتصال خلال {delay}s...")
                     await asyncio.sleep(delay)
-        else:
-            logger.info("No WSS URL — using block polling every %ds", BSCSCAN_POLL_INTERVAL)
-            await _fire(_notify_copy_err,
-                        "✅ *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
+
+        # Block polling — used when no WSS URL is set, or after WS fallback
+        if self._running:
+            logger.info("Using block polling every %ds", BSCSCAN_POLL_INTERVAL)
+            if self._ws_fail_count == 0:
+                # Fresh start (no WSS configured)
+                await _fire(_notify_copy_err,
+                            "✅ *نسخ التجارة يعمل*\n🕐 وضع الـ Block Polling كل 3 ثوانٍ")
             while self._running:
                 try:
                     await self._poll_new_blocks()
