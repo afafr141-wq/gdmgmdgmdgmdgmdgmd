@@ -355,8 +355,21 @@ class CopyTradeEngine:
         )
 
     async def _run_loop(self) -> None:
-        await self._init_http()
-        self._last_block = await self._w3h.eth.block_number
+        try:
+            await self._init_http()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("HTTP init failed: %s", exc)
+            return
+
+        try:
+            self._last_block = await self._w3h.eth.block_number
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error("Failed to get block number: %s — using 0", exc)
+            self._last_block = 0
 
         # Max consecutive WS failures before falling back to block polling permanently
         WS_MAX_FAILURES = 5
@@ -452,7 +465,7 @@ class CopyTradeEngine:
             self.ws_rpc_url,
             ping_interval=20,
             ping_timeout=20,
-            additional_headers=extra_headers,
+            extra_headers=extra_headers,
         ) as ws:
             # Request full transaction objects in the subscription result.
             # Ankr and most BSC nodes support this; plain-hash nodes fall back
