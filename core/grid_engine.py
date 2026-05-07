@@ -441,8 +441,8 @@ class GridEngine:
         """
         price = await self._client.get_current_price(state.symbol)
 
-        breakout_upper = price > state.params.upper * (1 + state.upper_pct / 100)
-        breakout_lower = price < state.params.lower * (1 - state.lower_pct / 100)
+        breakout_upper = price > state.params.upper
+        breakout_lower = price < state.params.lower
 
         if not breakout_upper and not breakout_lower:
             state._pending_rebuild = False   # price came back — cancel any pending wait
@@ -453,10 +453,10 @@ class GridEngine:
 
         direction = "العلوي" if breakout_upper else "السفلي"
         logger.info(
-            "Breakout detected for %s: price=%.4f | upper_trigger=%.4f | lower_trigger=%.4f",
+            "Breakout detected for %s: price=%.4f | upper_bound=%.4f | lower_bound=%.4f",
             state.symbol, price,
-            state.params.upper * (1 + state.upper_pct / 100),
-            state.params.lower * (1 - state.lower_pct / 100),
+            state.params.upper,
+            state.params.lower,
         )
         state._pending_rebuild = True
         # Track the task so it can be cancelled if the grid stops
@@ -492,13 +492,13 @@ class GridEngine:
         except Exception:
             close_price = await self._client.get_current_price(state.symbol)
 
-        # Only cancel if price returned fully inside the original grid range
+        # Cancel rebuild only if price closed back inside the grid range
         still_upper = close_price > state.params.upper
         still_lower = close_price < state.params.lower
 
         if not still_upper and not still_lower:
             logger.info(
-                "Breakout cancelled for %s: close_price=%.4f returned inside grid range [%.4f, %.4f]",
+                "Breakout cancelled for %s: close_price=%.4f closed inside grid range [%.4f, %.4f]",
                 state.symbol, close_price, state.params.lower, state.params.upper,
             )
             state._pending_rebuild = False
