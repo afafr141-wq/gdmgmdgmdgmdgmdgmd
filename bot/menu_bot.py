@@ -564,7 +564,8 @@ async def _show_status(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             for sym in active_symbols:
                 try:
                     state  = engine.get_state(sym)
-                    report = engine.calc_profit_report(sym)
+                    price  = await client.get_current_price(sym) if client else 0.0
+                    report = engine.calc_profit_report(state, price) if state else {}
                     pnl    = report.get("realized_pnl", 0)
                     upnl   = report.get("unrealised_pnl", 0)
                     held   = report.get("held_qty", 0)

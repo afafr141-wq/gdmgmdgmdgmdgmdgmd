@@ -1524,7 +1524,7 @@ def build_application(engine, client) -> Application:
 
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|profit:|stop:|grid:|gridrisk:|gridstop:|adjinv:|adjinv_show:|copy_)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridstop:|adjinv:|adjinv_show:|copy_)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app

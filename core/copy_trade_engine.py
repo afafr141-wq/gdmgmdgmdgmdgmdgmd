@@ -1207,9 +1207,35 @@ class CopyTradeEngine:
         except Exception as exc:
             logger.warning("Could not calculate entry prices: %s", exc)
 
-        # Save position so sell notification can calculate PnL
-        if my_entry:
-            self._open_positions[token_out.lower()] = (my_entry, target_entry or 0.0, trade_usdt)
+        # Save position so sell can use exact bought amount and calculate PnL
+        # Fetch actual token amount received from receipt
+        token_amount_wei = 0
+        try:
+            receipt = await self._w3h.eth.get_transaction_receipt(tx_hash, )
+            wallet = self.my_address.lower()
+            token_out_lower = token_out.lower()
+            for log in receipt.get("logs", []):
+                topics = log.get("topics", [])
+                if len(topics) < 3:
+                    continue
+                topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+                if topic0.lower() != TRANSFER_TOPIC.lower():
+                    continue
+                if log["address"].lower() != token_out_lower:
+                    continue
+                to = ("0x" + (topics[2].hex() if isinstance(topics[2], bytes) else topics[2])[-40:]).lower()
+                if to == wallet:
+                    token_amount_wei = _parse_transfer_amount(log)
+                    break
+        except Exception as exc:
+            logger.debug("Could not read token_amount_wei from receipt: %s", exc)
+
+        self._open_positions[token_out.lower()] = {
+            "my_entry":        my_entry or 0.0,
+            "target_entry":    target_entry or 0.0,
+            "trade_usdt":      trade_usdt,
+            "token_amount_wei": token_amount_wei,
+        }
 
         await _fire(
             _notify_copy_buy,
@@ -1231,7 +1257,18 @@ class CopyTradeEngine:
             abi=ERC20_ABI,
         )
 
-        balance = await token_contract.functions.balanceOf(self.my_address).call()
+        # Use only the amount we bought via copy-trade, not the full wallet balance
+        pos = self._open_positions.get(token_in.lower())
+        full_balance = await token_contract.functions.balanceOf(self.my_address).call()
+
+        if pos and pos.get("token_amount_wei", 0) > 0:
+            # Sell exactly what we bought; cap at actual balance in case of rounding
+            sell_amount = min(int(pos["token_amount_wei"]), full_balance)
+        else:
+            sell_amount = full_balance
+
+        balance = sell_amount  # alias used throughout the rest of the function
+
         if balance == 0:
             logger.info("No balance for %s — skipping sell", token_in)
             original_tx_hash = original_tx.get("hash", "")
@@ -1323,7 +1360,7 @@ class CopyTradeEngine:
         token_in: str,
         token_amount: float,
         original_tx_hash: str,
-        buy_position: Optional[tuple[float, float, float]],
+        buy_position: Optional[dict],
     ) -> None:
         """Wait for SELL confirmation then send enriched notification with PnL."""
         my_sell_price:     Optional[float] = None
@@ -1367,10 +1404,12 @@ class CopyTradeEngine:
 
             # PnL calculations
             if buy_position and usdt_received:
-                my_entry_price, target_entry_price, usdt_spent = buy_position
+                my_entry_price    = buy_position.get("my_entry", 0.0)
+                target_entry_price = buy_position.get("target_entry", 0.0)
+                usdt_spent        = buy_position.get("trade_usdt", 0.0)
                 my_pnl_usdt = usdt_received - usdt_spent
                 if target_entry_price and target_sell_price and token_amount > 0:
-                    target_usdt_spent   = target_entry_price * token_amount
+                    target_usdt_spent    = target_entry_price * token_amount
                     target_usdt_received = target_sell_price * token_amount
                     target_pnl_usdt = target_usdt_received - target_usdt_spent
 
@@ -1385,9 +1424,9 @@ class CopyTradeEngine:
             usdt_received,
             my_pnl_usdt,
             my_sell_price,
-            buy_position[0] if buy_position else None,   # my entry price
+            buy_position.get("my_entry")     if buy_position else None,
             target_sell_price,
-            buy_position[1] if buy_position else None,   # target entry price
+            buy_position.get("target_entry") if buy_position else None,
             target_pnl_usdt,
         )
 
@@ -1402,7 +1441,7 @@ class CopyTradeEngine:
 
         tx = await contract.functions.approve(
             AsyncWeb3.to_checksum_address(PANCAKE_V2_ROUTER),
-            2**256 - 1,  # max approval
+            amount,  # approve exact amount only
         ).build_transaction({
             "from":     self.my_address,
             "gas":      100_000,
