@@ -27,7 +27,7 @@ class MEXCClient:
         secret_key: Optional[str] = None,
     ):
         self.api_key = api_key or os.environ.get("MEXC_API_KEY", "")
-        self.secret_key = secret_key or os.environ.get("MEXC_SECRET_KEY", "")
+        self.secret_key = secret_key or os.environ.get("MEXC_API_SECRET", "")
         self.session = requests.Session()
         self.session.headers.update({
             "X-MEXC-APIKEY": self.api_key,

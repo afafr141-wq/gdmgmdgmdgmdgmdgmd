@@ -21,7 +21,11 @@ class MexcClient:
                 "apiKey": MEXC_API_KEY,
                 "secret": MEXC_API_SECRET,
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
+                "options": {
+                    "defaultType": "spot",
+                    "adjustForTimeDifference": True,
+                    "recvWindow": 10000,
+                },
             }
         )
         self._markets: dict = {}
