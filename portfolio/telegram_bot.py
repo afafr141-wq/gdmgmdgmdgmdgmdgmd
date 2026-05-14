@@ -73,7 +73,6 @@ def _kb_main() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 المحافظ",       callback_data="action:portfolios"),
         ],
         [
-            InlineKeyboardButton("📡 بوتات ST+UT",  callback_data="staction:list"),
             InlineKeyboardButton("💰 الرصيد العام",  callback_data="action:balance_all"),
         ],
     ])
@@ -390,8 +389,7 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ إنشاء محفظة جديدة", callback_data="action:create_bot")],
-            [InlineKeyboardButton("📡 بوتات ST+UT",        callback_data="staction:list"),
-             InlineKeyboardButton("💰 الرصيد العام",       callback_data="action:balance_all")],
+            [InlineKeyboardButton("💰 الرصيد العام",       callback_data="action:balance_all")],
         ])
         return text, kb
 
@@ -426,7 +424,6 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("⚙️ الإعدادات",       callback_data=f"psettings:menu:{pid}")],
             [InlineKeyboardButton("➕ محفظة جديدة",    callback_data="action:create_bot"),
              InlineKeyboardButton("💰 الرصيد العام",   callback_data="action:balance_all")],
-            [InlineKeyboardButton("📡 بوتات ST+UT",    callback_data="staction:list")],
         ])
         return text, kb
 
@@ -442,7 +439,6 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton("➕ محفظة جديدة",  callback_data="action:create_bot"),
         InlineKeyboardButton("💰 الرصيد العام", callback_data="action:balance_all"),
     ])
-    rows.append([InlineKeyboardButton("📡 بوتات ST+UT", callback_data="staction:list")])
     text = (
         "┌─────────────────────────┐\n"
         "│  💼  *Portfolio Bot*    │\n"
