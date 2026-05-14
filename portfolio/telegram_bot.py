@@ -545,6 +545,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     elif data == "wizard:confirm:yes":
         await _wizard_save(query, ctx)
 
+    # ── Portfolio home (from grid bot main menu) ───────────────────────────────
+    elif data == "portfolio:home":
+        text, kb = _build_home()
+        await _edit(query, text, kb)
+
     # ── Portfolio detail ───────────────────────────────────────────────────────
     elif data.startswith("portfolio:"):
         pid = int(data.split(":")[1])
