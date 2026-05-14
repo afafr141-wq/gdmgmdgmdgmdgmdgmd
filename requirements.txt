@@ -5,9 +5,5 @@ python-dotenv==1.0.1
 psycopg2-binary==2.9.9
 numpy==1.26.4
 scipy==1.13.1
-# BSC copy-trade
-web3==6.20.3
-eth-abi>=5.0.0
-eth-account>=0.11.0
-websockets==11.0.3
-aiohttp>=3.9.0
+# Portfolio bot
+requests>=2.31.0

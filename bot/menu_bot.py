@@ -80,7 +80,6 @@ def _kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 متابعة وإدارة الشبكات", callback_data="menu:manage")],
         [InlineKeyboardButton("🔄 ترقية الشبكات",        callback_data="settings_upgradeall"),
          InlineKeyboardButton("❓ مساعدة",                callback_data="help:main")],
-        [InlineKeyboardButton("🔁 نسخ التجارة (BSC)",    callback_data="copy_status_cb")],
     ])
 
 
@@ -688,35 +687,6 @@ async def _cb_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if text:
         await _edit(query, text, _kb_help_back())
 
-
-# ── Copy-trade fallback (shown when BSC engine is not configured) ───────────────
-
-async def _cb_copy_fallback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handles copy_* callbacks when copy_bot handlers are not registered
-    (missing BSC env vars). Shows a setup prompt instead of a silent no-op.
-    Registered in group=1 so copy_bot's group=0 handlers take priority when
-    BSC is configured.
-    """
-    query = update.callback_query
-    await query.answer()
-
-    _kb_setup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 القائمة الرئيسية", callback_data="menu:back")],
-    ])
-    await query.edit_message_text(
-        "🔁 *نسخ التجارة — BSC*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "❌ *المحرك غير مُفعَّل*\n\n"
-        "لتفعيل نسخ التجارة أضف المتغيرات التالية في ملف `.env`:\n"
-        "• `BSC_WS_RPC_URL` — WebSocket RPC (مثال: Ankr)\n"
-        "• `BSC_HTTP_RPC_URL` — HTTP RPC\n"
-        "• `MY_BSC_PRIVATE_KEY` — مفتاح محفظتك الخاصة\n"
-        "• `COPY_TARGET_WALLET` — عنوان المحفظة المراد نسخها\n\n"
-        "ثم أعد تشغيل البوت.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_kb_setup,
-    )
 
 
 

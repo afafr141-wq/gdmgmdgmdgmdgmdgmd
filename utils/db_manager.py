@@ -108,17 +108,6 @@ async def _create_tables() -> None:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
-            CREATE TABLE IF NOT EXISTS copy_trades (
-                id              SERIAL PRIMARY KEY,
-                side            TEXT NOT NULL,          -- 'buy' | 'sell'
-                token_in        TEXT NOT NULL,           -- source token address
-                token_out       TEXT NOT NULL,           -- destination token address
-                amount_in_usdt  NUMERIC NOT NULL DEFAULT 0,
-                tx_hash         TEXT NOT NULL,
-                original_tx_hash TEXT NOT NULL DEFAULT '',
-                executed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-
         """)
     logger.debug("Tables verified / created")
 
@@ -320,36 +309,5 @@ async def get_config(key: str, default: str = "") -> str:
         row = await conn.fetchrow("SELECT value FROM bot_config WHERE key = $1", key)
     return row["value"] if row else default
 
-
-# ── copy_trades ────────────────────────────────────────────────────────────────
-
-async def record_copy_trade(
-    side: str,
-    token_in: str,
-    token_out: str,
-    amount_in_usdt: float,
-    tx_hash: str,
-    original_tx_hash: str = "",
-) -> None:
-    pool = get_db()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO copy_trades
-               (side, token_in, token_out, amount_in_usdt, tx_hash, original_tx_hash)
-               VALUES ($1, $2, $3, $4, $5, $6)""",
-            side, token_in, token_out, amount_in_usdt, tx_hash, original_tx_hash,
-        )
-
-
-async def get_copy_trade_history(limit: int = 10) -> list[dict]:
-    pool = get_db()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT * FROM copy_trades
-               ORDER BY executed_at DESC
-               LIMIT $1""",
-            limit,
-        )
-    return [dict(r) for r in rows]
 
 
