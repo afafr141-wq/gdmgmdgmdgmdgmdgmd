@@ -1520,11 +1520,12 @@ def build_application(engine, client) -> Application:
     from bot.menu_bot import register_menu_handlers
     register_menu_handlers(app)
 
-    # Copy-trade handlers registered lazily from main.py via register_copy_handlers()
+    from bot.portfolio_bridge import register_portfolio_handlers
+    register_portfolio_handlers(app)
 
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|profit:|stop:|grid:|gridstop:|adjinv:|adjinv_show:|copy_)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridstop:|adjinv:|adjinv_show:|portfolio:|paction:|psettings:|asset:|confirm:|wizard:|staction:|stbot:|stwizard:|action:)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
