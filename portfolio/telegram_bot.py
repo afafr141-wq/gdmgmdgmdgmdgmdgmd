@@ -388,8 +388,9 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
             "ابدأ بإنشاء محفظة جديدة أو شغّل بوت ST+UT."
         )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ إنشاء محفظة جديدة", callback_data="action:create_bot")],
-            [InlineKeyboardButton("💰 الرصيد العام",       callback_data="action:balance_all")],
+            [InlineKeyboardButton("➕ إنشاء محفظة جديدة",      callback_data="action:create_bot")],
+            [InlineKeyboardButton("💰 الرصيد العام",            callback_data="action:balance_all")],
+            [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية",  callback_data="menu:back")],
         ])
         return text, kb
 
@@ -424,6 +425,7 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("⚙️ الإعدادات",       callback_data=f"psettings:menu:{pid}")],
             [InlineKeyboardButton("➕ محفظة جديدة",    callback_data="action:create_bot"),
              InlineKeyboardButton("💰 الرصيد العام",   callback_data="action:balance_all")],
+            [InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back")],
         ])
         return text, kb
 
@@ -438,6 +440,9 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
     rows.append([
         InlineKeyboardButton("➕ محفظة جديدة",  callback_data="action:create_bot"),
         InlineKeyboardButton("💰 الرصيد العام", callback_data="action:balance_all"),
+    ])
+    rows.append([
+        InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="menu:back"),
     ])
     text = (
         "┌─────────────────────────┐\n"
