@@ -56,31 +56,35 @@ async def _deny(update: Update) -> None:
 # ── Keyboard builders ──────────────────────────────────────────────────────────
 
 def _main_menu_text(ctx=None) -> str:
-    engine = ctx.bot_data.get("engine") if ctx and hasattr(ctx, "bot_data") else None
+    engine  = ctx.bot_data.get("engine") if ctx and hasattr(ctx, "bot_data") else None
     symbols = engine.active_symbols() if engine else []
     active  = len(symbols)
-    status_line = "🟢 يعمل" if active else "⚪ لا توجد شبكات"
-    grids_text  = "\n".join(f"  • `{s}`" for s in symbols) if symbols else "  _لا توجد شبكات نشطة_"
+
+    if active:
+        status_line = f"🟢 *{active}* شبكة نشطة"
+        grids_text  = "\n".join(f"  ▸ `{s}`" for s in symbols)
+    else:
+        status_line = "⚪ لا توجد شبكات نشطة"
+        grids_text  = "  _ابدأ شبكة جديدة من القائمة أدناه_"
+
     return (
-        "╔══════════════════════╗\n"
-        "║   🤖 *AI Grid Bot*   ║\n"
-        "║      *MEXC Spot*     ║\n"
-        "╚══════════════════════╝\n\n"
-        f"📡 الحالة: {status_line}\n"
-        f"📊 شبكات نشطة: `{active}`\n"
+        "┌─────────────────────────┐\n"
+        "│  🤖  *AI Grid Bot*      │\n"
+        "│  📍  *MEXC Spot*        │\n"
+        "└─────────────────────────┘\n\n"
+        f"📡 *الحالة:* {status_line}\n"
         f"{grids_text}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "اختر من القائمة أدناه:"
+        "─────────────────────────"
     )
 
 
 def _kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 شبكة جديدة",           callback_data="menu:grid"),
-         InlineKeyboardButton("📊 متابعة وإدارة الشبكات", callback_data="menu:manage")],
-        [InlineKeyboardButton("🔄 ترقية الشبكات",        callback_data="settings_upgradeall"),
-         InlineKeyboardButton("❓ مساعدة",                callback_data="help:main")],
-        [InlineKeyboardButton("📂 المحافظ",               callback_data="portfolio:home")],
+        [InlineKeyboardButton("🚀 شبكة جديدة",            callback_data="menu:grid"),
+         InlineKeyboardButton("📊 إدارة الشبكات",          callback_data="menu:manage")],
+        [InlineKeyboardButton("🔄 ترقية الشبكات",          callback_data="settings_upgradeall"),
+         InlineKeyboardButton("❓ مساعدة",                  callback_data="help:main")],
+        [InlineKeyboardButton("💼 المحافظ الذكية",          callback_data="portfolio:home")],
     ])
 
 
@@ -189,9 +193,12 @@ async def _cb_gridstop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     try:
         pnl = await engine.stop(symbol, market_sell=True)
-        pnl_str = f"`{pnl:+.2f} USDT`" if pnl is not None else "غير محدد"
+        pnl_str  = f"`{pnl:+.2f} USDT`" if pnl is not None else "غير محدد"
+        pnl_icon = "📈" if (pnl or 0) >= 0 else "📉"
         await _edit(query,
-            f"🛑 *تم إيقاف شبكة `{symbol}`*\n\n💰 الربح/الخسارة: {pnl_str}",
+            f"🛑 *تم إيقاف الشبكة*\n\n"
+            f"🪙 الزوج: `{symbol}`\n"
+            f"{pnl_icon} الربح / الخسارة: {pnl_str}",
             _kb_main(),
         )
     except Exception as exc:
@@ -223,13 +230,14 @@ async def _launch_grid(
         ctx.user_data["grid_last_upper_pct"]  = upper_pct
         ctx.user_data["grid_last_lower_pct"]  = lower_pct
         await _edit(query,
-            f"✅ *شبكة AI مُشغَّلة*\n\n"
-            f"🪙 الزوج: `{pair}`\n"
-            f"💵 الاستثمار: `{amount:.0f} USDT`\n"
-            f"🔢 الشبكات: `{num_grids}×2 = {num_grids*2}` أمر\n"
-            f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{lower_pct}%`\n"
-            f"⚖️ المخاطرة: {risk_labels.get(risk, risk)}\n\n"
-            "البوت يعمل الآن ويضع أوامر الشراء والبيع تلقائياً.",
+            f"✅ *شبكة مُشغَّلة بنجاح*\n\n"
+            f"🪙 الزوج:       `{pair}`\n"
+            f"💵 الاستثمار:   `{amount:.0f} USDT`\n"
+            f"🔢 الأوامر:     `{num_grids}` شراء + `{num_grids}` بيع\n"
+            f"📈 حد علوي:    `+{upper_pct}%`  |  📉 حد سفلي: `-{lower_pct}%`\n"
+            f"⚖️ المخاطرة:    {risk_labels.get(risk, risk)}\n\n"
+            "─────────────────────────\n"
+            "البوت يراقب السوق ويُنفّذ الأوامر تلقائياً.",
             _kb_main(),
         )
     except Exception as exc:
@@ -376,12 +384,13 @@ async def _recv_grid_lower_pct(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
         ctx.user_data["grid_last_upper_pct"]  = upper_pct
         ctx.user_data["grid_last_lower_pct"]  = pct
         await update.message.reply_text(
-            f"✅ *شبكة AI مُشغَّلة*\n\n"
-            f"🪙 الزوج: `{pair}`\n"
-            f"💵 الاستثمار: `{amount:.0f} USDT`\n"
-            f"🔢 الشبكات: `{count}×2 = {count*2}` أمر\n"
-            f"📈 خروج علوي: `+{upper_pct}%` | 📉 خروج سفلي: `-{pct}%`\n\n"
-            "البوت يعمل الآن ويضع أوامر الشراء والبيع تلقائياً.",
+            f"✅ *شبكة مُشغَّلة بنجاح*\n\n"
+            f"🪙 الزوج:       `{pair}`\n"
+            f"💵 الاستثمار:   `{amount:.0f} USDT`\n"
+            f"🔢 الأوامر:     `{count}` شراء + `{count}` بيع\n"
+            f"📈 حد علوي:    `+{upper_pct}%`  |  📉 حد سفلي: `-{pct}%`\n\n"
+            "─────────────────────────\n"
+            "البوت يراقب السوق ويُنفّذ الأوامر تلقائياً.",
             reply_markup=_kb_main(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -427,12 +436,11 @@ async def _show_adjust_inv(query, ctx, symbol: str) -> None:
     current = state.total_investment
     await _edit(
         query,
-        f"💰 *تعديل رصيد شبكة `{symbol}`*\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 الاستثمار الحالي: `{current:.2f}` USDT\n"
-        f"🏦 رصيد USDT المتاح: `{usdt_free:.2f}` USDT\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"اختر خياراً أو اضغط *مبلغ مخصص* لإدخال رقم:",
+        f"💰 *تعديل الاستثمار — `{symbol}`*\n\n"
+        f"📊 الاستثمار الحالي:  `{current:.2f} USDT`\n"
+        f"🏦 الرصيد المتاح:     `{usdt_free:.2f} USDT`\n\n"
+        f"─────────────────────────\n"
+        f"اختر نسبة أو أدخل مبلغاً مخصصاً:",
         _kb_adjust_inv(symbol, current, usdt_free),
     )
 

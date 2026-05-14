@@ -81,10 +81,16 @@ async def _on_startup(application) -> None:
         await _upgrade_existing_grids(engine)
         upgraded = recovered
 
+    status = "🟢 جاهز" if not failed else f"⚠️ جاهز مع `{failed}` خطأ"
     await send_notification(
-        "*Grid Bot* — تم التشغيل بنجاح!\n"
-        f"شبكات مستردة: `{recovered}` | مرقاة: `{upgraded}` | فشلت: `{failed}`\n"
-        "اكتب /menu للقائمة التفاعلية.",
+        f"🤖 *AI Grid Bot — تم التشغيل*\n"
+        f"─────────────────────────\n"
+        f"✅ مستردة:  `{recovered}`\n"
+        f"🔄 مُرقاة:  `{upgraded}`\n"
+        f"❌ فشلت:   `{failed}`\n"
+        f"─────────────────────────\n"
+        f"📡 الحالة: {status}\n"
+        f"اكتب /menu للقائمة.",
         application=application,
     )
     logger.info("Startup complete. Grids=%d", recovered)

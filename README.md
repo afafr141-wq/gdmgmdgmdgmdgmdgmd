@@ -1,51 +1,91 @@
-# Grid Bot — MEXC Spot
+# 🤖 AI Grid Bot — MEXC Spot
 
-Telegram-controlled grid trading bot for MEXC spot market.
+بوت تداول شبكي ذكي يعمل على MEXC Spot، يُدار بالكامل عبر Telegram.
 
-## Quick Start
+---
 
-```bash
+## المميزات
+
+- **Grid Bot** — يضع أوامر شراء وبيع على مستويات سعرية متعددة، ويُعيد البناء تلقائياً عند كسر النطاق
+- **Portfolio Bot** — إعادة توازن تلقائية للمحافظ (نسبي / مجدول)
+- **SuperTrend + UT Bot** — إشارات دخول وخروج مبنية على SuperTrend و UT Bot
+- **واجهة Telegram** — تحكم كامل بالأزرار التفاعلية بدون أوامر نصية
+- **استمرارية** — يحفظ الحالة في PostgreSQL ويستعيدها تلقائياً عند إعادة التشغيل
+
+---
+
+## التشغيل السريع
+
+\`\`\`bash
 cp .env.example .env
-# Fill in MEXC_API_KEY, MEXC_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
+# أضف: MEXC_API_KEY, MEXC_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
 
 pip install -r requirements.txt
 python main.py
-```
+\`\`\`
 
-## Telegram
+ثم أرسل \`/menu\` في Telegram لفتح لوحة التحكم.
 
-Send `/menu` to open the interactive control panel.
+---
 
-| Command | Description |
+## أوامر Telegram
+
+| الأمر | الوظيفة |
 |---|---|
-| `/menu` | Interactive control panel |
-| `/list` | Active grids |
-| `/status BTCUSDT` | Profit report for a grid |
-| `/stop BTCUSDT` | Stop grid and market-sell holdings |
-| `/upgrade` | Rebuild all grids at current price |
+| \`/menu\` | لوحة التحكم التفاعلية |
+| \`/list\` | الشبكات النشطة |
+| \`/status BTCUSDT\` | تقرير أرباح شبكة |
+| \`/stop BTCUSDT\` | إيقاف الشبكة وبيع الكميات |
+| \`/upgrade\` | إعادة بناء جميع الشبكات بالسعر الحالي |
+| \`/pairs\` | عرض الأزواج المحفوظة |
+| \`/addpair SOLUSDT\` | إضافة زوج للقائمة السريعة |
+| \`/removepair SOLUSDT\` | حذف زوج من القائمة السريعة |
+| \`/mute [SYMBOL]\` | كتم إشعارات زوج أو الكل |
+| \`/unmute [SYMBOL]\` | تفعيل الإشعارات |
 
-## How It Works
+---
+
+## آلية العمل
 
 **Grid Bot**
-- User sets: symbol, investment (USDT), grids per side, upper % and lower % range, risk level.
-- Places `n` limit buy orders below price and `n` limit sell orders above, evenly spaced within the range.
-- When a buy fills → places a limit sell one spacing above. When a sell fills → places a limit buy one spacing below.
-- If price breaks out beyond the user-defined range, waits for the 1-minute candle to close then rebuilds the grid around the new price.
-- Balance drift (external purchases) is detected every 60 s and the user is prompted to sync.
+- المستخدم يحدد: الزوج، المبلغ، عدد الشبكات، نسبة النطاق العلوي والسفلي.
+- يضع \`n\` أمر شراء تحت السعر و\`n\` أمر بيع فوقه بفوارق متساوية.
+- عند تنفيذ شراء → يضع بيعاً فوقه بفارق شبكة واحد، والعكس.
+- عند كسر النطاق → ينتظر إغلاق الشمعة الدقيقية ثم يُعيد البناء حول السعر الجديد.
 
-**Price Action Bot**
-- Spot only: buy signals only (no short/sell entries).
-- Detects Equal Highs/Lows, Liquidity Sweep, and confirmation candle (Engulfing/Hammer).
-- Enters with a market buy, places a limit sell at the TP level immediately after.
+**Portfolio Bot**
+- يوزع رأس المال على عملات متعددة بنسب محددة.
+- يُعيد التوازن تلقائياً عند انحراف أي عملة عن نسبتها المستهدفة.
+- يدعم وضع SL/TP لكل عملة.
 
-## Risk Levels
+---
 
-| Level | Effect |
+## مستويات المخاطرة
+
+| المستوى | التأثير |
 |---|---|
-| low | Wider grid spacing, fewer orders |
-| medium | Balanced spacing and order count |
-| high | Tighter spacing, more orders |
+| \`low\` | فوارق أوسع، أوامر أقل |
+| \`medium\` | توازن بين الفوارق والأوامر |
+| \`high\` | فوارق أضيق، أوامر أكثر |
 
-## Deployment
+---
 
-Set environment variables, then run `python main.py`. The `Procfile` runs it as a worker process (Railway/Heroku compatible).
+## متغيرات البيئة
+
+| المتغير | الوصف |
+|---|---|
+| \`MEXC_API_KEY\` | مفتاح MEXC API |
+| \`MEXC_API_SECRET\` | سر MEXC API |
+| \`TELEGRAM_BOT_TOKEN\` | توكن البوت من @BotFather |
+| \`TELEGRAM_CHAT_ID\` | Chat ID المصرح له |
+| \`DATABASE_URL\` | رابط PostgreSQL (Supabase) |
+
+---
+
+## النشر
+
+يعمل على Railway / Heroku عبر \`Procfile\`:
+
+\`\`\`
+worker: python main.py
+\`\`\`

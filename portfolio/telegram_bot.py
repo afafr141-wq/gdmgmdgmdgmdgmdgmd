@@ -294,11 +294,12 @@ def _fmt_portfolio_balance(pid: int) -> str:
     name = cfg.get("bot", {}).get("name", f"محفظة {pid}")
     from portfolio.mexc_client import MEXCClient
     client = MEXCClient()
-    lines = [f"💼 *رصيد {name}:*\n"]
+    lines = [f"💼 *{name}*\n─────────────────────────\n"]
     total = 0.0
     for a in assets:
-        sym = a["symbol"].upper()
-        bal = balances.get(sym, 0.0)
+        sym  = a["symbol"].upper()
+        tgt  = a.get("allocation_pct", 0)
+        bal  = balances.get(sym, 0.0)
         try:
             price = 1.0 if sym == "USDT" else client.get_price(f"{sym}USDT")
         except Exception:
@@ -306,23 +307,23 @@ def _fmt_portfolio_balance(pid: int) -> str:
         val = bal * price
         total += val
         if val > 0:
-            lines.append(f"• `{sym}`: `{val:.2f} USDT`")
+            lines.append(f"▸ `{sym:<6}` `{val:>10.2f} USDT`  _{tgt:.0f}%_")
     if len(lines) == 1:
         lines.append("_لا توجد أرصدة._")
-    lines.append(f"\n💰 *الإجمالي:* `{total:.2f} USDT`")
+    lines.append(f"\n─────────────────────────\n💎 *الإجمالي:* `{total:.2f} USDT`")
     return "\n".join(lines)
 
 def _fmt_all_balances() -> str:
     try:
         balances = _get_balances_fn()
     except Exception as e:
-        return f"❌ خطأ: `{e}`"
+        return f"❌ خطأ في جلب الأرصدة: `{e}`"
     non_zero = {s: b for s, b in balances.items() if b > 0}
     if not non_zero:
-        return "💼 لا توجد أرصدة."
+        return "💼 لا توجد أرصدة في الحساب."
     from portfolio.mexc_client import MEXCClient
     client = MEXCClient()
-    lines = ["💰 *الرصيد العام:*\n"]
+    lines = ["💰 *الرصيد العام*\n─────────────────────────\n"]
     total = 0.0
     for sym, bal in sorted(non_zero.items()):
         try:
@@ -331,8 +332,8 @@ def _fmt_all_balances() -> str:
             price = 0.0
         val = bal * price
         total += val
-        lines.append(f"• `{sym}`: `{val:.2f} USDT`")
-    lines.append(f"\n💰 *الإجمالي:* `{total:.2f} USDT`")
+        lines.append(f"▸ `{sym:<6}` `{val:>10.2f} USDT`")
+    lines.append(f"\n─────────────────────────\n💎 *الإجمالي:* `{total:.2f} USDT`")
     return "\n".join(lines)
 
 def _fmt_wizard_summary(ctx: ContextTypes.DEFAULT_TYPE) -> str:
@@ -379,11 +380,18 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
         p["running"] = _is_running_fn(p["id"])
 
     if not portfolios:
-        text = "🤖 *MEXC Portfolio Rebalancer*\n\nلا توجد محافظ بعد."
+        text = (
+            "┌─────────────────────────┐\n"
+            "│  💼  *Portfolio Bot*    │\n"
+            "│  📍  *MEXC Spot*        │\n"
+            "└─────────────────────────┘\n\n"
+            "⚪ لا توجد محافظ بعد.\n\n"
+            "ابدأ بإنشاء محفظة جديدة أو شغّل بوت ST+UT."
+        )
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ إنشاء بوت", callback_data="action:create_bot")],
-            [InlineKeyboardButton("📡 بوتات ST+UT", callback_data="staction:list")],
-            [InlineKeyboardButton("💰 الرصيد العام", callback_data="action:balance_all")],
+            [InlineKeyboardButton("➕ إنشاء محفظة جديدة", callback_data="action:create_bot")],
+            [InlineKeyboardButton("📡 بوتات ST+UT",        callback_data="staction:list"),
+             InlineKeyboardButton("💰 الرصيد العام",       callback_data="action:balance_all")],
         ])
         return text, kb
 
@@ -392,37 +400,38 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
         pid     = p["id"]
         running = p["running"]
         name    = p.get("name", f"محفظة {pid}")
-        status  = "🟢 شغالة" if running else "⚫ موقوفة"
+        status  = "🟢 تعمل" if running else "⚫ موقوفة"
 
-        if running:
-            service_btn = InlineKeyboardButton("🔴 بيع + وقف الخدمة", callback_data=f"paction:sell_stop:{pid}")
-        else:
-            service_btn = InlineKeyboardButton("🟢 شراء + بدء الخدمة", callback_data=f"paction:buy_start:{pid}")
+        service_btn = (
+            InlineKeyboardButton("🔴 بيع + إيقاف", callback_data=f"paction:sell_stop:{pid}")
+            if running else
+            InlineKeyboardButton("🟢 شراء + تشغيل", callback_data=f"paction:buy_start:{pid}")
+        )
 
-        text = f"🤖 *{name}*\nالحالة: {status}"
+        text = (
+            "┌─────────────────────────┐\n"
+            "│  💼  *Portfolio Bot*    │\n"
+            "└─────────────────────────┘\n\n"
+            f"📁 *{name}*\n"
+            f"📡 الحالة: {status}"
+        )
         kb = InlineKeyboardMarkup([
-            [
-                service_btn,
-                InlineKeyboardButton("🔄 إعادة توازن", callback_data=f"paction:rebalance:{pid}"),
-            ],
-            [
-                InlineKeyboardButton("🟢 شراء",         callback_data=f"paction:buy:{pid}"),
-                InlineKeyboardButton("🔴 بيع",           callback_data=f"paction:sell:{pid}"),
-            ],
-            [
-                InlineKeyboardButton("🗑️ حذف عملة",     callback_data=f"paction:remove:{pid}"),
-                InlineKeyboardButton("🔁 استبدال عملة",  callback_data=f"paction:replace:{pid}"),
-            ],
-            [InlineKeyboardButton("💼 رصيد المحفظة",    callback_data=f"paction:balance:{pid}")],
-            [
-                InlineKeyboardButton("➕ إنشاء بوت",    callback_data="action:create_bot"),
-                InlineKeyboardButton("💰 الرصيد العام", callback_data="action:balance_all"),
-            ],
-            [InlineKeyboardButton("📡 بوتات ST+UT",     callback_data="staction:list")],
+            [service_btn,
+             InlineKeyboardButton("🔄 إعادة توازن",   callback_data=f"paction:rebalance:{pid}")],
+            [InlineKeyboardButton("🟢 شراء",           callback_data=f"paction:buy:{pid}"),
+             InlineKeyboardButton("🔴 بيع",             callback_data=f"paction:sell:{pid}")],
+            [InlineKeyboardButton("🗑️ حذف عملة",       callback_data=f"paction:remove:{pid}"),
+             InlineKeyboardButton("🔁 استبدال عملة",    callback_data=f"paction:replace:{pid}")],
+            [InlineKeyboardButton("💼 رصيد المحفظة",   callback_data=f"paction:balance:{pid}"),
+             InlineKeyboardButton("⚙️ الإعدادات",       callback_data=f"psettings:menu:{pid}")],
+            [InlineKeyboardButton("➕ محفظة جديدة",    callback_data="action:create_bot"),
+             InlineKeyboardButton("💰 الرصيد العام",   callback_data="action:balance_all")],
+            [InlineKeyboardButton("📡 بوتات ST+UT",    callback_data="staction:list")],
         ])
         return text, kb
 
-    # Many portfolios — list them with status, plus create/balance at bottom
+    # Many portfolios
+    running_count = sum(1 for p in portfolios if p["running"])
     rows = []
     for p in portfolios:
         pid  = p["id"]
@@ -430,10 +439,17 @@ def _build_home() -> tuple[str, InlineKeyboardMarkup]:
         icon = "🟢" if p["running"] else "⚫"
         rows.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"portfolio:{pid}")])
     rows.append([
-        InlineKeyboardButton("➕ إنشاء بوت",    callback_data="action:create_bot"),
+        InlineKeyboardButton("➕ محفظة جديدة",  callback_data="action:create_bot"),
         InlineKeyboardButton("💰 الرصيد العام", callback_data="action:balance_all"),
     ])
-    text = "🤖 *MEXC Portfolio Rebalancer*\n\nاختر محفظة:"
+    rows.append([InlineKeyboardButton("📡 بوتات ST+UT", callback_data="staction:list")])
+    text = (
+        "┌─────────────────────────┐\n"
+        "│  💼  *Portfolio Bot*    │\n"
+        "└─────────────────────────┘\n\n"
+        f"📊 المحافظ: `{len(portfolios)}`  |  🟢 تعمل: `{running_count}`\n\n"
+        "اختر محفظة للإدارة:"
+    )
     return text, InlineKeyboardMarkup(rows)
 
 

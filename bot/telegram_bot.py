@@ -151,27 +151,28 @@ def _reports_kb(symbol: str) -> InlineKeyboardMarkup:
 
 
 def _fmt_report(r: dict) -> str:
-    total     = r['total_profit']
-    pnl_icon  = "📈" if total >= 0 else "📉"
-    pnl_sign  = "+" if total >= 0 else ""
+    total      = r['total_profit']
+    pnl_icon   = "📈" if total >= 0 else "📉"
     risk_icons = {"low": "🟢 منخفض", "medium": "🟡 متوسط", "high": "🔴 مرتفع"}
     n = r['grid_count'] // 2
     return (
         f"📊 *{_fmt_symbol(r['symbol'])}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 رصيد مستثمر:  `${r['total_investment']:.2f}` USDT\n"
-        f"⚖️ مخاطرة: {risk_icons.get(r['risk'], r['risk'])}\n\n"
+        f"─────────────────────────\n"
+        f"💵 الاستثمار:   `${r['total_investment']:.2f} USDT`\n"
+        f"⚖️ المخاطرة:    {risk_icons.get(r['risk'], r['risk'])}\n\n"
         f"⚙️ *إعدادات الشبكة*\n"
-        f"شبكات: `{n}` شراء + `{n}` بيع\n"
-        f"نطاق:  ▲ `{r.get('upper_pct', 3):.1f}%` فوق | ▼ `{r.get('lower_pct', 3):.1f}%` تحت\n"
-        f"فارق:  `{r['grid_spacing']:.4f}` | لكل شبكة: `${r.get('qty_per_grid_usdt', 0):.2f}`\n\n"
+        f"الأوامر:  `{n}` شراء + `{n}` بيع\n"
+        f"النطاق:   ▲ `+{r.get('upper_pct', 3):.1f}%`  |  ▼ `-{r.get('lower_pct', 3):.1f}%`\n"
+        f"الفارق:   `{r['grid_spacing']:.4f}`  |  لكل شبكة: `${r.get('qty_per_grid_usdt', 0):.2f}`\n\n"
+        f"─────────────────────────\n"
         f"💹 *السعر الحالي:* `{r['current_price']:.4f}`\n"
-        f"🟢 أوامر شراء: `{r.get('active_buys', 0)}` | 🔴 بيع: `{r.get('active_sells', 0)}`\n"
+        f"🟢 شراء: `{r.get('active_buys', 0)}`  |  🔴 بيع: `{r.get('active_sells', 0)}`\n"
         f"✅ صفقات منفذة: `{r['sell_count']}`\n\n"
-        f"{pnl_icon} *الربح*\n"
-        f"محقق:     `${r['realized_pnl']:+.4f}`\n"
-        f"غير محقق: `${r['unrealised_pnl']:+.4f}`\n"
-        f"*الإجمالي: `${pnl_sign}{r['total_profit']:.4f}`*"
+        f"─────────────────────────\n"
+        f"{pnl_icon} *الأرباح*\n"
+        f"محقق:       `${r['realized_pnl']:+.4f}`\n"
+        f"غير محقق:   `${r['unrealised_pnl']:+.4f}`\n"
+        f"*الإجمالي:  `${total:+.4f}`*"
     )
 
 
@@ -1227,17 +1228,16 @@ async def notify_buy_filled(
         return
     if _dedup_key(symbol, "buy", f"{price:.4f}"):
         return
-    value = price * qty
-    grid_info = f"\n🔢 الشبكة: `{grid_level}` من `{grid_total}`" if grid_total else ""
+    value     = price * qty
+    grid_info = f"\n🔢 الشبكة:  `{grid_level}` / `{grid_total}`" if grid_total else ""
     await _send(
-        f"📥 *تنفيذ شراء*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
-        f"💵 السعر: `{price:,.4f}` USDT\n"
-        f"🪙 الكمية: `{qty:.6f}`\n"
-        f"💰 القيمة: `{value:.2f}` USDT"
+        f"🟢 *شراء مُنفَّذ — {_fmt_symbol(symbol)}*\n"
+        f"─────────────────────────\n"
+        f"💵 السعر:   `{price:,.4f} USDT`\n"
+        f"🪙 الكمية:  `{qty:.6f}`\n"
+        f"💰 القيمة:  `{value:.2f} USDT`"
         f"{grid_info}\n"
-        f"🕐 الوقت: `{_now_str()}`"
+        f"🕐 `{_now_str()}`"
     )
 
 
@@ -1251,17 +1251,16 @@ async def notify_sell_filled(
         return
     if _dedup_key(symbol, "sell", f"{price:.4f}"):
         return
-    value = price * qty
-    pnl_sign = "+" if pnl >= 0 else ""
+    value    = price * qty
+    pnl_icon = "📈" if pnl >= 0 else "📉"
     await _send(
-        f"📤 *تنفيذ بيع*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
-        f"💵 السعر: `{price:,.4f}` USDT\n"
-        f"🪙 الكمية: `{qty:.6f}`\n"
-        f"💰 القيمة: `{value:.2f}` USDT\n"
-        f"💹 الربح: `{pnl_sign}{_fmt_pnl(pnl)}` USDT\n"
-        f"🕐 الوقت: `{_now_str()}`"
+        f"🔴 *بيع مُنفَّذ — {_fmt_symbol(symbol)}*\n"
+        f"─────────────────────────\n"
+        f"💵 السعر:   `{price:,.4f} USDT`\n"
+        f"🪙 الكمية:  `{qty:.6f}`\n"
+        f"💰 القيمة:  `{value:.2f} USDT`\n"
+        f"{pnl_icon} الربح:    `{_fmt_pnl(pnl):>+} USDT`\n"
+        f"🕐 `{_now_str()}`"
     )
 
 
@@ -1277,15 +1276,15 @@ async def notify_grid_rebuild(
 ) -> None:
     if _is_muted(symbol):
         return
+    n = new_grid_count // 2
     await _send(
-        f"🔄 *نقل الشبكة — إعادة التمركز*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
-        f"📌 السبب: {reason}\n"
-        f"📉 السعر عند الخروج: `{old_price:,.4f}`\n"
-        f"📐 النطاق الجديد: `{new_lower:,.4f}` ←→ `{new_upper:,.4f}`\n"
-        f"🔢 الأوامر: `{new_grid_count // 2}` شراء + `{new_grid_count // 2}` بيع\n"
-        f"🕐 الوقت: `{_now_str()}`"
+        f"🔄 *إعادة تمركز — {_fmt_symbol(symbol)}*\n"
+        f"─────────────────────────\n"
+        f"📌 السبب:    {reason}\n"
+        f"📉 السعر:    `{old_price:,.4f}` ← `{new_price:,.4f}`\n"
+        f"📐 النطاق:   `{new_lower:,.4f}` ↔ `{new_upper:,.4f}`\n"
+        f"🔢 الأوامر:  `{n}` شراء + `{n}` بيع\n"
+        f"🕐 `{_now_str()}`"
     )
 
 
@@ -1300,14 +1299,13 @@ async def notify_grid_expansion(
     if _dedup_key(symbol, "expand", f"{direction}{new_price:.4f}"):
         return
     dir_ar  = "⬆️ أعلى" if direction == "up" else "⬇️ أسفل"
-    side_ar = "شراء 🟢" if order_side == "buy" else "بيع 🔴"
+    side_ar = "🟢 شراء" if order_side == "buy" else "🔴 بيع"
     await _send(
-        f"➕ *توسيع الشبكة*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
-        f"🧭 الاتجاه: {dir_ar}\n"
-        f"💵 السعر الجديد: `{new_price:,.4f}`\n"
-        f"📋 نوع الأمر: {side_ar}"
+        f"➕ *توسيع الشبكة — {_fmt_symbol(symbol)}*\n"
+        f"─────────────────────────\n"
+        f"🧭 الاتجاه:  {dir_ar}\n"
+        f"💵 السعر:    `{new_price:,.4f}`\n"
+        f"📋 الأمر:    {side_ar}"
     )
 
 
@@ -1331,12 +1329,12 @@ async def notify_balance_drift(
             chat_id=TELEGRAM_CHAT_ID,
             text=(
                 f"🔄 *مزامنة رصيد — {_fmt_symbol(symbol)}*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📦 رصيد البوت: `{bot_qty:.6f}`\n"
-                f"🏦 رصيد البورصة: `{real_qty:.6f}`\n"
-                f"📈 فرق: `+{drift:.6f}`\n\n"
+                f"─────────────────────────\n"
+                f"📦 رصيد البوت:     `{bot_qty:.6f}`\n"
+                f"🏦 رصيد البورصة:   `{real_qty:.6f}`\n"
+                f"📈 الفرق:          `+{drift:.6f}`\n\n"
                 f"يبدو أنك اشتريت `{_fmt_symbol(symbol)}` خارج البوت.\n"
-                f"هل تريد مزامنة الرصيد مع البورصة؟"
+                f"هل تريد مزامنة الرصيد؟"
             ),
             parse_mode="Markdown",
             reply_markup=kb,
@@ -1353,28 +1351,28 @@ async def notify_error(
     if _dedup_key(symbol, "error", error_type):
         return
     await _send(
-        f"⚠️ *خطأ في البوت*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💱 الزوج: `{_fmt_symbol(symbol)}`\n"
-        f"🔴 نوع الخطأ: {error_type}\n"
-        f"📋 التفاصيل: {details}\n"
-        f"🕐 الوقت: `{_now_str()}`"
+        f"⚠️ *خطأ — {_fmt_symbol(symbol)}*\n"
+        f"─────────────────────────\n"
+        f"🔴 النوع:      {error_type}\n"
+        f"📋 التفاصيل:   {details}\n"
+        f"🕐 `{_now_str()}`"
     )
 
 
 async def notify_hourly_report(symbol: str, report: dict) -> None:
     if _is_muted(symbol):
         return
-    pnl_sign = "+" if report["total_profit"] >= 0 else ""
+    pnl_icon = "📈" if report["total_profit"] >= 0 else "📉"
     await _send(
         f"📊 *تقرير ساعي — {_fmt_symbol(symbol)}*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ صفقات بيع منفذة: `{report['sell_count']}`\n"
-        f"💹 ربح الشبكة: `+{_fmt_pnl(report['grid_profit'])}` USDT\n"
-        f"📈 أرباح غير محققة: `{_fmt_pnl(report['unrealised_pnl'])}` USDT\n"
-        f"🏆 إجمالي الربح: `{pnl_sign}{_fmt_pnl(report['total_profit'])}` USDT\n"
-        f"📊 APY: `{report['apy']:.2f}%`\n"
-        f"🔓 أوامر مفتوحة: `{report['open_orders']}`"
+        f"─────────────────────────\n"
+        f"✅ صفقات منفذة:    `{report['sell_count']}`\n"
+        f"💹 ربح الشبكة:     `{_fmt_pnl(report['grid_profit']):>+} USDT`\n"
+        f"📈 غير محقق:       `{_fmt_pnl(report['unrealised_pnl']):>+} USDT`\n"
+        f"─────────────────────────\n"
+        f"{pnl_icon} الإجمالي:       `{_fmt_pnl(report['total_profit']):>+} USDT`\n"
+        f"📊 APY:            `{report['apy']:.2f}%`\n"
+        f"🔓 أوامر مفتوحة:  `{report['open_orders']}`"
     )
 
 
