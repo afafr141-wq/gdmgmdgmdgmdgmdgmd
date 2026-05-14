@@ -47,7 +47,8 @@ _list_portfolios:     Callable = lambda: []
 _is_running_fn:       Callable = lambda pid: False
 _get_portfolio_fn:    Callable = lambda pid: None
 _save_portfolio_fn:   Callable = lambda name, cfg: None
-_update_portfolio_fn: Callable = lambda pid, cfg: None
+_update_portfolio_fn: Callable  = lambda pid, cfg: None
+_delete_portfolio_fn: Callable  = lambda pid: None
 _buy_fn:              Callable = lambda symbol, usdt: {}
 _sell_fn:             Callable = lambda symbol, amount: {}
 _get_balances_fn:     Callable = lambda: {}
@@ -111,8 +112,30 @@ def _kb_portfolio_detail(pid: int, running: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑️ حذف عملة",    callback_data=f"paction:remove:{pid}"),
             InlineKeyboardButton("🔁 استبدال عملة", callback_data=f"paction:replace:{pid}"),
         ],
-        [InlineKeyboardButton("💼 رصيد المحفظة",   callback_data=f"paction:balance:{pid}")],
-        [InlineKeyboardButton("🔙 رجوع",            callback_data="action:menu")],
+        [
+            InlineKeyboardButton("💼 رصيد المحفظة", callback_data=f"paction:balance:{pid}"),
+            InlineKeyboardButton("⚙️ الإعدادات",    callback_data=f"psettings:menu:{pid}"),
+        ],
+        [InlineKeyboardButton("🔙 رجوع",            callback_data="portfolio:home")],
+    ])
+
+
+def _kb_portfolio_settings(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ تغيير الاسم",    callback_data=f"psettings:rename:{pid}"),
+            InlineKeyboardButton("💵 تغيير الميزانية", callback_data=f"psettings:budget:{pid}"),
+        ],
+        [
+            InlineKeyboardButton("📊 تغيير الانحراف",  callback_data=f"psettings:deviation:{pid}"),
+            InlineKeyboardButton("🔄 وضع التوازن",     callback_data=f"psettings:mode:{pid}"),
+        ],
+        [
+            InlineKeyboardButton("📋 عرض الإعدادات",   callback_data=f"psettings:view:{pid}"),
+            InlineKeyboardButton("📤 تصدير الإعدادات", callback_data=f"psettings:export:{pid}"),
+        ],
+        [InlineKeyboardButton("🗑️ حذف المحفظة",       callback_data=f"psettings:delete:{pid}")],
+        [InlineKeyboardButton("🔙 رجوع",               callback_data=f"portfolio:{pid}")],
     ])
 
 # ── Wizard keyboards ───────────────────────────────────────────────────────────
@@ -1212,6 +1235,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             ]),
         )
 
+    elif data.startswith("psettings:"):
+        await _handle_psettings(query, ctx, data)
+
     elif data.startswith("stbot:confirm_delete:"):
         bid = int(data.split(":")[2])
         if _st_is_running(bid):
@@ -1249,6 +1275,148 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
             )
         except Exception as e:
             await _edit(query, f"❌ فشل الحذف: `{e}`", _kb_portfolio_detail(pid, _is_running_fn(pid)))
+
+# ── Portfolio settings ─────────────────────────────────────────────────────────
+
+def _fmt_portfolio_settings(pid: int) -> str:
+    cfg = _get_portfolio_fn(pid)
+    if not cfg:
+        return "❌ المحفظة غير موجودة."
+    name   = cfg.get("bot", {}).get("name", f"محفظة {pid}")
+    budget = cfg.get("portfolio", {}).get("total_usdt", 0)
+    assets = cfg.get("portfolio", {}).get("assets", [])
+    reb    = cfg.get("rebalance", {})
+    mode   = {"proportional": "نسبي 📊", "timed": "مجدول 🕐", "unbalanced": "يدوي ✋"}.get(reb.get("mode", ""), "—")
+    dev    = reb.get("proportional", {}).get("min_deviation_to_execute_pct", "—")
+    paper  = "📄 ورقي" if cfg.get("paper_trading") else "💰 حقيقي"
+    sl     = cfg.get("risk", {}).get("stop_loss_pct")
+    tp     = cfg.get("risk", {}).get("take_profit_pct")
+    sl_str = f"`{sl}%`" if sl else "غير مفعّل"
+    tp_str = f"`{tp}%`" if tp else "غير مفعّل"
+    asset_lines = "\n".join(f"  • `{a['symbol']}` — `{a['allocation_pct']}%`" for a in assets)
+    return (
+        f"⚙️ *إعدادات {name}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"الاسم:        `{name}`\n"
+        f"الميزانية:    `{budget} USDT`\n"
+        f"وضع التوازن:  {mode}\n"
+        f"الانحراف:     `{dev}%`\n"
+        f"وضع التداول:  {paper}\n"
+        f"وقف الخسارة:  {sl_str}\n"
+        f"جني الأرباح:  {tp_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"*الأصول:*\n{asset_lines}"
+    )
+
+
+async def _handle_psettings(query, ctx, data: str) -> None:
+    parts  = data.split(":")
+    action = parts[1]
+    pid    = int(parts[2])
+
+    if action in ("menu", "view"):
+        await _edit(query, _fmt_portfolio_settings(pid), _kb_portfolio_settings(pid))
+
+    elif action == "export":
+        import json as _json
+        cfg = _get_portfolio_fn(pid)
+        if not cfg:
+            await query.answer("المحفظة غير موجودة.", show_alert=True)
+            return
+        text = f"```json\n{_json.dumps(cfg, ensure_ascii=False, indent=2)}\n```"
+        await _edit(query, text, _kb_portfolio_settings(pid))
+
+    elif action == "rename":
+        ctx.user_data["state"]        = "settings_rename"
+        ctx.user_data["settings_pid"] = pid
+        await _edit(query, "✏️ *تغيير اسم المحفظة*\n\nأرسل الاسم الجديد:", _kb_back(f"psettings:menu:{pid}"))
+
+    elif action == "budget":
+        cfg = _get_portfolio_fn(pid)
+        cur = cfg.get("portfolio", {}).get("total_usdt", 0) if cfg else 0
+        ctx.user_data["state"]        = "settings_budget"
+        ctx.user_data["settings_pid"] = pid
+        await _edit(query, f"💵 *تغيير الميزانية*\n\nالحالية: `{cur} USDT`\n\nأرسل الميزانية الجديدة:", _kb_back(f"psettings:menu:{pid}"))
+
+    elif action == "deviation":
+        cfg = _get_portfolio_fn(pid)
+        cur = cfg.get("rebalance", {}).get("proportional", {}).get("min_deviation_to_execute_pct", 3) if cfg else 3
+        await _edit(
+            query,
+            f"📊 *تغيير نسبة الانحراف*\n\nالحالية: `{cur}%`\n\nاختر نسبة:",
+            InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("1%",  callback_data=f"psettings:dev_set:{pid}:1"),
+                    InlineKeyboardButton("3%",  callback_data=f"psettings:dev_set:{pid}:3"),
+                    InlineKeyboardButton("5%",  callback_data=f"psettings:dev_set:{pid}:5"),
+                    InlineKeyboardButton("10%", callback_data=f"psettings:dev_set:{pid}:10"),
+                ],
+                [InlineKeyboardButton("✏️ مخصص", callback_data=f"psettings:dev_custom:{pid}")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data=f"psettings:menu:{pid}")],
+            ]),
+        )
+
+    elif action == "dev_set":
+        val = float(parts[3])
+        cfg = _get_portfolio_fn(pid)
+        if cfg:
+            cfg.setdefault("rebalance", {}).setdefault("proportional", {})
+            cfg["rebalance"]["proportional"]["threshold_pct"]               = val
+            cfg["rebalance"]["proportional"]["min_deviation_to_execute_pct"] = val
+            _update_portfolio_fn(pid, cfg)
+        await _edit(query, f"✅ تم تغيير الانحراف إلى `{val}%`", _kb_portfolio_settings(pid))
+
+    elif action == "dev_custom":
+        ctx.user_data["state"]        = "settings_deviation"
+        ctx.user_data["settings_pid"] = pid
+        await _edit(query, "📊 أرسل نسبة الانحراف المخصصة (مثال: `2.5`):", _kb_back(f"psettings:menu:{pid}"))
+
+    elif action == "mode":
+        await _edit(
+            query,
+            "🔄 *وضع إعادة التوازن*\n\nاختر الوضع:",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("📊 نسبي (عند الانحراف)",  callback_data=f"psettings:mode_set:{pid}:proportional")],
+                [InlineKeyboardButton("🕐 مجدول (يومي/أسبوعي)", callback_data=f"psettings:mode_set:{pid}:timed")],
+                [InlineKeyboardButton("✋ يدوي (بدون تلقائي)",   callback_data=f"psettings:mode_set:{pid}:unbalanced")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data=f"psettings:menu:{pid}")],
+            ]),
+        )
+
+    elif action == "mode_set":
+        new_mode = parts[3]
+        cfg = _get_portfolio_fn(pid)
+        if cfg:
+            cfg.setdefault("rebalance", {})["mode"] = new_mode
+            _update_portfolio_fn(pid, cfg)
+        names = {"proportional": "نسبي 📊", "timed": "مجدول 🕐", "unbalanced": "يدوي ✋"}
+        await _edit(query, f"✅ تم تغيير وضع التوازن إلى *{names.get(new_mode, new_mode)}*", _kb_portfolio_settings(pid))
+
+    elif action == "delete":
+        cfg  = _get_portfolio_fn(pid)
+        name = cfg.get("bot", {}).get("name", f"محفظة {pid}") if cfg else f"محفظة {pid}"
+        await _edit(
+            query,
+            f"🗑️ *حذف المحفظة*\n\nهل تريد حذف *{name}*؟\n\n"
+            "⚠️ سيتم حذف المحفظة وكل سجلاتها نهائياً.\n_لن يتم بيع العملات تلقائياً._",
+            InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ تأكيد الحذف", callback_data=f"psettings:confirm_delete:{pid}"),
+                InlineKeyboardButton("❌ إلغاء",        callback_data=f"psettings:menu:{pid}"),
+            ]]),
+        )
+
+    elif action == "confirm_delete":
+        cfg  = _get_portfolio_fn(pid)
+        name = cfg.get("bot", {}).get("name", f"محفظة {pid}") if cfg else f"محفظة {pid}"
+        if _is_running_fn(pid):
+            _stop_fn(pid)
+        try:
+            _delete_portfolio_fn(pid)
+            text, kb = _build_home()
+            await _edit(query, f"✅ *تم حذف المحفظة `{name}` بنجاح.*\n\n" + text, kb)
+        except Exception as e:
+            await _edit(query, f"❌ فشل الحذف: `{e}`", _kb_portfolio_settings(pid))
+
 
 # ── Wizard save helper ─────────────────────────────────────────────────────────
 async def _wizard_save(query, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1525,6 +1693,59 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         ctx.user_data.clear()
 
     # ── SuperTrend wizard: step 1 — name ──────────────────────────────────────
+    # ── Settings: rename ──────────────────────────────────────────────────────
+    elif state == "settings_rename":
+        pid = ctx.user_data.get("settings_pid")
+        cfg = _get_portfolio_fn(pid)
+        if not cfg:
+            await _reply(update, "❌ المحفظة غير موجودة.", _kb_main())
+            ctx.user_data.clear()
+            return
+        cfg.setdefault("bot", {})["name"] = text
+        _update_portfolio_fn(pid, cfg)
+        ctx.user_data.clear()
+        await _reply(update, f"✅ تم تغيير الاسم إلى *{text}*", _kb_portfolio_settings(pid))
+
+    # ── Settings: budget ──────────────────────────────────────────────────────
+    elif state == "settings_budget":
+        pid = ctx.user_data.get("settings_pid")
+        try:
+            amount = float(text)
+            assert amount > 0
+        except Exception:
+            await _reply(update, "⚠️ أرسل مبلغاً صحيحاً (مثال: `500`).", _kb_cancel())
+            return
+        cfg = _get_portfolio_fn(pid)
+        if not cfg:
+            await _reply(update, "❌ المحفظة غير موجودة.", _kb_main())
+            ctx.user_data.clear()
+            return
+        cfg.setdefault("portfolio", {})["total_usdt"] = amount
+        _update_portfolio_fn(pid, cfg)
+        ctx.user_data.clear()
+        await _reply(update, f"✅ تم تغيير الميزانية إلى `{amount} USDT`", _kb_portfolio_settings(pid))
+
+    # ── Settings: deviation custom ────────────────────────────────────────────
+    elif state == "settings_deviation":
+        pid = ctx.user_data.get("settings_pid")
+        try:
+            val = float(text)
+            assert 0 < val <= 50
+        except Exception:
+            await _reply(update, "⚠️ أرسل رقماً بين 0.1 و 50.", _kb_cancel())
+            return
+        cfg = _get_portfolio_fn(pid)
+        if not cfg:
+            await _reply(update, "❌ المحفظة غير موجودة.", _kb_main())
+            ctx.user_data.clear()
+            return
+        cfg.setdefault("rebalance", {}).setdefault("proportional", {})
+        cfg["rebalance"]["proportional"]["threshold_pct"]               = val
+        cfg["rebalance"]["proportional"]["min_deviation_to_execute_pct"] = val
+        _update_portfolio_fn(pid, cfg)
+        ctx.user_data.clear()
+        await _reply(update, f"✅ تم تغيير الانحراف إلى `{val}%`", _kb_portfolio_settings(pid))
+
     elif state == "st_wizard_name":
         if not text:
             await _reply(update, "⚠️ أرسل اسماً صحيحاً.", _kb_cancel())
