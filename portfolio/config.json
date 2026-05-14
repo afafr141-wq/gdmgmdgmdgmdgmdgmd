@@ -1,0 +1,39 @@
+{
+  "bot": {
+    "name": "My MEXC Portfolio"
+  },
+  "portfolio": {
+    "assets": [
+      { "symbol": "BTC", "allocation_pct": 50.0, "entry_price_usdt": null },
+      { "symbol": "ETH", "allocation_pct": 50.0, "entry_price_usdt": null }
+    ],
+    "total_usdt": 19,
+    "initial_value_usdt": 19,
+    "allocation_mode": "ai_balance"
+  },
+  "rebalance": {
+    "mode": "proportional",
+    "proportional": {
+      "threshold_pct": 5,
+      "check_interval_minutes": 5,
+      "min_deviation_to_execute_pct": 3
+    },
+    "timed": {
+      "frequency": "daily",
+      "hour": 10
+    },
+    "unbalanced": {}
+  },
+  "risk": {
+    "stop_loss_pct": null,
+    "take_profit_pct": null
+  },
+  "termination": {
+    "sell_at_termination": false
+  },
+  "asset_transfer": {
+    "enable_asset_transfer": false
+  },
+  "paper_trading": false,
+  "last_rebalance": null
+}

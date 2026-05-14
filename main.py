@@ -1,17 +1,15 @@
 """
 Entry point. Validates env, initialises DB + MEXC client, wires the
 GridEngine to the Telegram bot, then starts long-polling.
+
+Portfolio bot (PORTFOLIO_BOT_TOKEN) runs in a background thread with its
+own asyncio event loop so both bots operate independently.
 """
 import logging
-from decimal import Decimal
+import os
+import threading
 
-from config.settings import (
-    LOG_LEVEL, validate_env,
-    BSC_WS_RPC_URL, BSC_HTTP_RPC_URL, BSC_PRIVATE_RPC_URL,
-    BSC_WS_USERNAME, BSC_WS_PASSWORD,
-    COPY_TARGET_WALLET, MY_BSC_PRIVATE_KEY,
-    COPY_TRADE_USDT, COPY_SELLS, COPY_TRADE_ENABLED,
-)
+from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
 from core.grid_engine import GridEngine, set_notifiers as grid_set_notifiers
 from bot.telegram_bot import (
@@ -61,12 +59,6 @@ async def _on_startup(application) -> None:
     client = application.bot_data["client"]
     await client.load_markets()
 
-    # Start copy-trade engine if configured
-    copy_engine = application.bot_data.get("copy_engine")
-    if copy_engine is not None:
-        await copy_engine.start()
-        logger.info("CopyTradeEngine started")
-
     engine: GridEngine = application.bot_data["engine"]
     active = await get_all_active_grids()
     recovered, upgraded, failed = 0, 0, 0
@@ -112,13 +104,87 @@ async def _on_shutdown(application) -> None:
         except Exception as exc:
             logger.error("Error stopping grid %s: %s", symbol, exc)
 
-    copy_engine = application.bot_data.get("copy_engine")
-    if copy_engine is not None:
-        await copy_engine.stop()
-
     await client.close()
     await close_db()
     logger.info("Shutdown complete.")
+
+
+def _start_portfolio_bot() -> None:
+    """Start the portfolio bot in a background thread if PORTFOLIO_BOT_TOKEN is set."""
+    token = os.environ.get("PORTFOLIO_BOT_TOKEN", "").strip()
+    if not token:
+        logger.info("PORTFOLIO_BOT_TOKEN not set — portfolio bot disabled")
+        return
+
+    def _run() -> None:
+        import asyncio
+        from portfolio.database import init_db as portfolio_init_db, get_running_portfolios, get_portfolio, set_bot_running, list_portfolios, save_portfolio, update_portfolio_config, create_supertrend_bot, get_supertrend_bot, list_supertrend_bots, update_supertrend_bot_config, delete_supertrend_bot, get_running_supertrend_bots, get_supertrend_signals
+        from portfolio.engine import start_portfolio_loop, stop_portfolio_loop, is_portfolio_running, start_supertrend_loop, stop_supertrend_loop, is_supertrend_running, get_supertrend_loop_info
+        from portfolio.smart_portfolio import execute_rebalance
+        from portfolio.mexc_client import MEXCClient as PortfolioMEXCClient
+        from portfolio.telegram_bot import run_bot
+
+        portfolio_init_db()
+
+        for pid in get_running_portfolios():
+            cfg = get_portfolio(pid)
+            if cfg is None:
+                set_bot_running(pid, False)
+                continue
+            logger.info("Resuming portfolio loop %d", pid)
+            start_portfolio_loop(pid)
+
+        for st_id in get_running_supertrend_bots():
+            if get_supertrend_bot(st_id) is None:
+                continue
+            logger.info("Resuming SuperTrend bot %d", st_id)
+            start_supertrend_loop(st_id)
+
+        def _rebalance_fn(portfolio_id: int) -> list:
+            cfg = get_portfolio(portfolio_id)
+            if cfg is None:
+                return []
+            return execute_rebalance(PortfolioMEXCClient(), cfg, portfolio_id=portfolio_id)
+
+        def _buy_fn(symbol: str, usdt_amount: float) -> dict:
+            return PortfolioMEXCClient().place_market_buy(symbol, usdt_amount)
+
+        def _sell_fn(symbol: str, base_amount: float) -> dict:
+            return PortfolioMEXCClient().place_market_sell(symbol, base_amount)
+
+        def _get_balances_fn() -> dict:
+            return PortfolioMEXCClient().get_all_balances()
+
+        # Override token so run_bot picks up PORTFOLIO_BOT_TOKEN
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+
+        run_bot(
+            start_fn=start_portfolio_loop,
+            stop_fn=stop_portfolio_loop,
+            rebalance_fn=_rebalance_fn,
+            list_portfolios_fn=list_portfolios,
+            is_running_fn=is_portfolio_running,
+            get_portfolio_fn=get_portfolio,
+            save_portfolio_fn=save_portfolio,
+            update_portfolio_fn=update_portfolio_config,
+            buy_fn=_buy_fn,
+            sell_fn=_sell_fn,
+            get_balances_fn=_get_balances_fn,
+            st_start_fn=start_supertrend_loop,
+            st_stop_fn=stop_supertrend_loop,
+            st_is_running_fn=is_supertrend_running,
+            st_create_fn=create_supertrend_bot,
+            st_get_fn=get_supertrend_bot,
+            st_list_fn=list_supertrend_bots,
+            st_update_fn=update_supertrend_bot_config,
+            st_delete_fn=delete_supertrend_bot,
+            st_signals_fn=get_supertrend_signals,
+            st_loop_info_fn=get_supertrend_loop_info,
+        )
+
+    t = threading.Thread(target=_run, daemon=True, name="portfolio-bot")
+    t.start()
+    logger.info("Portfolio bot thread started")
 
 
 def main() -> None:
@@ -148,51 +214,10 @@ def main() -> None:
     app.bot_data["client"] = client
     app.bot_data["engine"] = engine
 
-    # Wire copy-trade engine if all required vars are present
-    # BSC_WS_RPC_URL is optional — engine falls back to block polling
-    logger.info("=== COPY TRADE ENV CHECK ===")
-    logger.info("MY_BSC_PRIVATE_KEY : %s", "SET" if MY_BSC_PRIVATE_KEY else "MISSING ❌")
-    logger.info("COPY_TARGET_WALLET : %s", COPY_TARGET_WALLET[:10] + "..." if COPY_TARGET_WALLET else "MISSING ❌")
-    logger.info("BSC_HTTP_RPC_URL   : %s", BSC_HTTP_RPC_URL[:40] + "..." if BSC_HTTP_RPC_URL else "MISSING ❌")
-    logger.info("BSC_WS_RPC_URL     : %s", (BSC_WS_RPC_URL[:40] + "...") if BSC_WS_RPC_URL else "NOT SET (block polling mode)")
-    logger.info("COPY_TRADE_ENABLED : %s", COPY_TRADE_ENABLED)
-    logger.info("============================")
-
-    if MY_BSC_PRIVATE_KEY:
-        from core.copy_trade_engine import CopyTradeEngine, set_copy_notifiers
-        from bot.copy_bot import (
-            register_copy_handlers, set_copy_engine,
-            notify_copy_buy, notify_copy_sell, notify_copy_err,
-        )
-
-        copy_engine = CopyTradeEngine(
-            ws_rpc_url      = BSC_WS_RPC_URL,
-            http_rpc_url    = BSC_HTTP_RPC_URL,
-            target_wallet   = COPY_TARGET_WALLET,
-            my_private_key  = MY_BSC_PRIVATE_KEY,
-            trade_usdt      = Decimal(str(COPY_TRADE_USDT)),
-            copy_sells      = COPY_SELLS,
-            enabled         = COPY_TRADE_ENABLED,
-            private_rpc_url = BSC_PRIVATE_RPC_URL,
-            ws_username     = BSC_WS_USERNAME,
-            ws_password     = BSC_WS_PASSWORD,
-        )
-
-        set_copy_notifiers(
-            buy  = notify_copy_buy,
-            sell = notify_copy_sell,
-            err  = notify_copy_err,
-        )
-        set_copy_engine(copy_engine)
-        register_copy_handlers(app)
-
-        app.bot_data["copy_engine"] = copy_engine
-        logger.info("CopyTradeEngine configured — target: %s", COPY_TARGET_WALLET[:10])
-    else:
-        logger.warning("CopyTradeEngine not started — MY_BSC_PRIVATE_KEY is missing")
-
     app.post_init     = _on_startup
     app.post_shutdown = _on_shutdown
+
+    _start_portfolio_bot()
 
     logger.info("Starting Telegram long-polling...")
     app.run_polling(drop_pending_updates=True)
