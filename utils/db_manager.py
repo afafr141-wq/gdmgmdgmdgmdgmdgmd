@@ -108,6 +108,18 @@ async def _create_tables() -> None:
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
 
+            CREATE TABLE IF NOT EXISTS scalp_trades (
+                id          SERIAL PRIMARY KEY,
+                symbol      TEXT NOT NULL,
+                side        TEXT NOT NULL,          -- 'buy' | 'sell'
+                price       NUMERIC NOT NULL,
+                qty         NUMERIC NOT NULL,
+                pnl         NUMERIC NOT NULL DEFAULT 0,
+                reason      TEXT,
+                paper       BOOLEAN NOT NULL DEFAULT TRUE,
+                executed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
         """)
     logger.debug("Tables verified / created")
 
@@ -308,6 +320,52 @@ async def get_config(key: str, default: str = "") -> str:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM bot_config WHERE key = $1", key)
     return row["value"] if row else default
+
+
+# ── scalp_trades ───────────────────────────────────────────────────────────────
+
+async def insert_scalp_trade(
+    symbol: str,
+    side: str,
+    price: float,
+    qty: float,
+    pnl: float = 0.0,
+    reason: str = "",
+    paper: bool = True,
+) -> None:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO scalp_trades (symbol, side, price, qty, pnl, reason, paper)
+               VALUES ($1, $2, $3::numeric, $4::numeric, $5::numeric, $6, $7)""",
+            symbol, side, price, qty, pnl, reason, paper,
+        )
+
+
+async def get_scalp_trades(symbol: str, limit: int = 50) -> list[dict]:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM scalp_trades WHERE symbol = $1
+               ORDER BY executed_at DESC LIMIT $2::integer""",
+            symbol, limit,
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_scalp_summary(symbol: str) -> dict:
+    pool = get_db()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT
+                COUNT(*)                          AS trade_count,
+                COALESCE(SUM(pnl::numeric), 0)    AS total_pnl,
+                COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses
+               FROM scalp_trades WHERE symbol = $1""",
+            symbol,
+        )
+    return dict(row) if row else {"trade_count": 0, "total_pnl": 0, "wins": 0, "losses": 0}
 
 
 

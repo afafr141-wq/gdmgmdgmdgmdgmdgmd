@@ -25,8 +25,13 @@ core/
 bot/
   telegram_bot.py        Command handlers, auth guard, notification senders
   menu_bot.py            ConversationHandler for interactive inline-keyboard menus
+  portfolio_bridge.py    Template for adding new strategies to the Application
 utils/
   db_manager.py          asyncpg pool, schema creation, all DB queries
+portfolio/
+  supertrend_bot.py      Reusable pure-Python indicators: SuperTrend, UT Bot, combined signal
+  engine.py              Portfolio rebalancing loop
+  database.py            Portfolio-specific DB layer (SQLite, separate from asyncpg pool)
 tests/
   test_grid_engine.py    Unit tests for grid parameter derivation and fill guards
 .ona/skills/             Ona agent skill files (multi-ai-market-scanner)
@@ -42,6 +47,17 @@ tests/
 
 ### Notifier injection
 `grid_engine.py` does not import from `bot/`. Notification callbacks are injected at startup via `set_notifiers()`. Never add a direct import of `telegram_bot` or `menu_bot` inside `core/`.
+
+Any new strategy engine in `core/` must follow the same pattern: define a `set_notifiers(**callbacks)` function that accepts callables, and call those callables instead of importing from `bot/`.
+
+### Bridge pattern for new strategies
+`bot/portfolio_bridge.py` is the canonical template for integrating a new strategy into the single `Application` instance. When adding a strategy (e.g. scalping):
+
+1. Create `bot/scalp_bridge.py` mirroring `portfolio_bridge.py`.
+2. Use a unique callback prefix (e.g. `scalp:`) to avoid collisions with grid (`grid:`) and portfolio callbacks.
+3. Register handlers at a distinct group number (grid=0, portfolio=5/10, scalp=6/11).
+4. Inject all engine functions into the strategy's Telegram module via module-level variables (see `_ptb._start_fn = ...` pattern in `portfolio_bridge.py`). Do not import the engine directly inside handler functions.
+5. Call `register_scalp_handlers(app)` from `main.py` after `register_portfolio_handlers(app)`.
 
 ### Single process
 The engine runs in the asyncio event loop started by `python-telegram-bot`'s `Application.run_polling()`. Do not introduce threads or subprocess calls.
@@ -102,6 +118,22 @@ Always pass symbols in `BASE/QUOTE` format (e.g. `BTC/USDT`) to ccxt. Use `_norm
 
 ### Grid rebuild guard
 `_pending_rebuild` is set when price breaks out of range. The actual rebuild waits for the 1-minute candle to close (`_wait_and_rebuild`). Always cancel `_rebuild_task` in `engine.stop()` to avoid orphaned tasks.
+
+### Candle-close confirmation
+Signal strategies must evaluate `candles[-2]` (the last *closed* candle), never `candles[-1]` (the still-forming candle). This applies to all indicator reads: SuperTrend direction, UT Bot signal, and any derived combined signal. `get_combined_signal()` in `portfolio/supertrend_bot.py` enforces this with `idx = len(st_data) - 2`.
+
+### asyncpg explicit type casts
+asyncpg cannot infer the PostgreSQL type of `$N` parameters when the column type is `NUMERIC` or `INTEGER`. Every query parameter for a numeric column must include an explicit cast:
+
+```sql
+-- correct
+INSERT INTO my_table (price, qty) VALUES ($1::numeric, $2::numeric)
+
+-- wrong — raises "could not determine data type of parameter $1"
+INSERT INTO my_table (price, qty) VALUES ($1, $2)
+```
+
+See `db_manager.upsert_grid()` for the established pattern. Apply the same casts in any new table queries added for scalping or other strategies.
 
 ---
 

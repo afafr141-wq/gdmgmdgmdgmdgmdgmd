@@ -1521,9 +1521,12 @@ def build_application(engine, client) -> Application:
     from bot.portfolio_bridge import register_portfolio_handlers
     register_portfolio_handlers(app)
 
+    from bot.scalp_bridge import register_scalp_handlers
+    register_scalp_handlers(app)
+
     app.add_handler(CallbackQueryHandler(
         handle_callback,
-        pattern=r"^(?!menu:|profit:|stop:|grid:|gridstop:|adjinv:|adjinv_show:|portfolio:|paction:|psettings:|asset:|confirm:|wizard:|staction:|stbot:|stwizard:|action:)",
+        pattern=r"^(?!menu:|profit:|stop:|grid:|gridstop:|adjinv:|adjinv_show:|portfolio:|paction:|psettings:|asset:|confirm:|wizard:|staction:|stbot:|stwizard:|action:|scalp:)",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return app
