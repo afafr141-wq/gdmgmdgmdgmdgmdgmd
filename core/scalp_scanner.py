@@ -36,7 +36,7 @@ MARKET_CACHE_TTL    = 300   # seconds
 
 ANALYST_MODELS = [
     ("LLaMA-70B",   "meta-llama/llama-3.3-70b-instruct:free"),
-    ("Gemma-12B",   "google/gemma-3-12b-it:free"),
+    ("Gemma-27B",   "google/gemma-3-27b-it:free"),
     ("GPT-OSS-20B", "openai/gpt-oss-20b:free"),
 ]
 JUDGE_MODEL = "openai/gpt-oss-120b:free"
@@ -452,11 +452,13 @@ async def scan(coin_count: int = SCAN_COIN_COUNT) -> ScanResult:
     merged      = _merge_reports(reports)
     final_picks = await asyncio.to_thread(_run_judge_sync, merged, reports)
 
-    # Best BUY pick for auto-entry
+    # Best BUY pick for auto-entry — format as BASE/USDT for ccxt
     top_symbol = None
     for pick in final_picks:
-        if pick.signal == "BUY":
-            top_symbol = pick.symbol
+        if pick.signal == "BUY" and pick.symbol:
+            sym = pick.symbol.upper().replace("USDT", "").strip()
+            if sym:
+                top_symbol = f"{sym}/USDT"
             break
 
     return ScanResult(
