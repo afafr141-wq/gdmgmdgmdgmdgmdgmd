@@ -255,7 +255,50 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     action = parts[1] if len(parts) > 1 else ""
     symbol = parts[2] if len(parts) > 2 else ""
 
-    if action == "stop":
+    if action == "menu":
+        symbols = engine.active_symbols()
+        active_text = (
+            "\n".join(f"  ▸ `{s}`" for s in symbols)
+            if symbols else "  _لا يوجد Scalp نشط حالياً_"
+        )
+        await q.message.reply_text(
+            f"🎯 *Scalp Bot*\n"
+            f"─────────────────────────\n"
+            f"📡 النشط: {len(symbols)} بوت\n"
+            f"{active_text}\n"
+            f"─────────────────────────",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 مسح السوق (AI)", callback_data="scalp:rescan")],
+                [InlineKeyboardButton("📊 حالة البوتات",   callback_data="scalp:statusall")],
+                [InlineKeyboardButton("⛔ إيقاف الكل",     callback_data="scalp:stopall")],
+            ]),
+        )
+
+    elif action == "statusall":
+        symbols = engine.active_symbols()
+        if not symbols:
+            await q.message.reply_text("ℹ️ لا يوجد Scalp بوت يعمل حالياً.")
+            return
+        lines = ["📊 *بوتات Scalp النشطة:*", ""]
+        for sym in symbols:
+            s = engine.status(sym)
+            if not s:
+                continue
+            pos = f"✅ في صفقة @ `{s['entry_price']:.6f}`" if s["in_position"] else "⏳ ينتظر إشارة"
+            lines += [f"🪙 *{sym}*", f"  {pos}", f"  💹 ربح: `{s['realized_pnl']:+.4f} USDT`", ""]
+        await q.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    elif action == "stopall":
+        symbols = engine.active_symbols()
+        if not symbols:
+            await q.message.reply_text("ℹ️ لا يوجد شيء يعمل.")
+            return
+        for sym in list(symbols):
+            await engine.stop(sym)
+        await q.message.reply_text(f"⛔ تم إيقاف {len(symbols)} بوت.")
+
+    elif action == "stop":
         await _do_stop(q.message, symbol)
 
     elif action == "status":
