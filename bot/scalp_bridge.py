@@ -224,7 +224,8 @@ async def _auto_scan_loop() -> None:
                 if len(active) + len(started) >= MAX_AUTO_SYMBOLS:
                     break
                 from bot.telegram_bot import _normalize_symbol
-                symbol = _normalize_symbol(pick.symbol + "USDT")
+                raw    = pick.symbol.upper().replace("USDT", "").replace("/", "").strip()
+                symbol = _normalize_symbol(raw + "USDT")
                 if symbol in active:
                     continue
                 # تحقق أن الرمز موجود فعلاً على MEXC قبل الدخول
