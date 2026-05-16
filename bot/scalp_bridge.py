@@ -298,23 +298,31 @@ def _safe(t: str) -> str:
 
 
 def _build_scan_report(result: scanner.ScanResult) -> str:
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    lines  = [
+    medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
+    buy_picks  = [p for p in result.final_picks if p.signal == "BUY"]
+    hold_picks = [p for p in result.final_picks if p.signal == "HOLD"]
+    other_picks = [p for p in result.final_picks if p.signal not in ("BUY", "HOLD")]
+
+    lines = [
         "🔍 *Scalp Scanner — نتائج المسح*",
-        f"📊 `{result.coins_scanned}` عملة | ⏱️ `{result.scan_duration_s:.0f}` ثانية",
+        f"📊 `{result.coins_scanned}` عملة | ⏱️ `{result.scan_duration_s:.0f}` ثانية"
+        f" | 🎯 `{len(buy_picks)}` فرصة شراء",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    for pick in result.final_picks:
-        medal    = medals[pick.rank - 1] if pick.rank <= 5 else f"{pick.rank}."
+
+    all_picks = buy_picks + hold_picks + other_picks
+    for i, pick in enumerate(all_picks):
+        medal    = medals[i] if i < len(medals) else f"{i+1}."
         sig_icon = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⚪"}.get(pick.signal, "⚪")
         analysts = " & ".join(pick.analysts) if pick.analysts else "—"
         lines += [
             f"{medal} *{_safe(pick.name)}* (`{pick.symbol}`)",
             f"  {sig_icon} `{pick.signal}` | {_conf_bar(pick.confidence)} `{pick.confidence}%`",
-            f"  💬 _{_safe(pick.reason[:70])}_",
+            f"  💬 _{_safe(pick.reason[:80])}_",
             f"  👥 `{analysts}`",
             "",
         ]
+
     lines += [
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         "⚠️ _تحليل AI فقط — ليس نصيحة مالية._",
