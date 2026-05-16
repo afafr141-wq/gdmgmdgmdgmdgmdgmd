@@ -425,7 +425,7 @@ async def _scalp_loop(client, state: ScalpState) -> None:
                     symbol, price, qty, sig["rsi"], sig["adx"], tp, sl, state.paper,
                 )
                 if not state.paper:
-                    await client.market_buy(symbol, qty)
+                    await client.market_buy(symbol, qty, price=price)
 
                 if _notify_entry:
                     await _notify_entry(
