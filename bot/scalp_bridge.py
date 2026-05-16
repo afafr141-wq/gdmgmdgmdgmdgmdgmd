@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 DEFAULT_CAPITAL_USDT   = 20.0
-DEFAULT_TIMEFRAME      = "3m"
+DEFAULT_TIMEFRAME      = "5m"
 AUTO_SCAN_INTERVAL_MIN = 30
 MAX_AUTO_SYMBOLS       = 2
 
@@ -210,7 +210,7 @@ async def _auto_scan_loop() -> None:
         f"🤖 *الوضع التلقائي نشط*\n"
         f"💼 مبلغ الصفقة: `{_capital_usdt:.2f} USDT`\n"
         f"⏱️ مسح كل `{AUTO_SCAN_INTERVAL_MIN}` دقيقة\n"
-        f"{\"📄 وضع ورقي\" if _paper_mode else \"💰 وضع حقيقي ⚡\"}\n"
+        ("📄 وضع ورقي — لا صفقات حقيقية" if _paper_mode else "💰 وضع حقيقي ⚡ — صفقات فعلية") + "\n"
         f"🔍 جاري أول مسح الآن…"
     )
     while _auto_enabled:
@@ -227,6 +227,15 @@ async def _auto_scan_loop() -> None:
                 from bot.telegram_bot import _normalize_symbol
                 symbol = _normalize_symbol(pick.symbol + "USDT")
                 if symbol in active:
+                    continue
+                # تحقق أن الرمز موجود فعلاً على MEXC قبل الدخول
+                try:
+                    test_price = await _client.get_current_price(symbol)
+                    if not test_price or test_price <= 0:
+                        log.warning("Auto-scan: %s not available on MEXC — skipped", symbol)
+                        continue
+                except Exception as _sym_exc:
+                    log.warning("Auto-scan: %s validation failed (%s) — skipped", symbol, _sym_exc)
                     continue
                 try:
                     await engine.start(
@@ -508,7 +517,7 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 f"✅ *الوضع التلقائي شُغِّل*\n"
                 f"💼 مبلغ الصفقة: `{_capital_usdt:.2f} USDT`\n"
                 f"⏱️ مسح كل `{AUTO_SCAN_INTERVAL_MIN}` دقيقة\n"
-                f"{\"📄 وضع ورقي\" if _paper_mode else \"💰 وضع حقيقي ⚡\"}\n"
+                ("📄 وضع ورقي" if _paper_mode else "💰 وضع حقيقي ⚡") + "\n"
                 f"🔍 جاري أول مسح الآن…",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -609,6 +618,15 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         symbol = _normalize_symbol(arg + "USDT")
         if not _client:
             await q.message.reply_text("❌ الـ client غير جاهز.")
+            return
+        # تحقق أن الرمز موجود على MEXC
+        try:
+            _test = await _client.get_current_price(symbol)
+            if not _test or _test <= 0:
+                await q.message.reply_text(f"❌ الرمز `{symbol}` غير موجود على MEXC.", parse_mode=ParseMode.MARKDOWN, reply_markup=_back_kb())
+                return
+        except Exception as _ve:
+            await q.message.reply_text(f"❌ `{symbol}` غير متاح: `{str(_ve)[:100]}`", parse_mode=ParseMode.MARKDOWN, reply_markup=_back_kb())
             return
         try:
             state = await engine.start(
