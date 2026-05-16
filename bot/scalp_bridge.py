@@ -40,8 +40,8 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CAPITAL_USDT   = 20.0
 DEFAULT_TIMEFRAME      = "5m"
-AUTO_SCAN_INTERVAL_MIN = 30
-MAX_AUTO_SYMBOLS       = 2
+AUTO_SCAN_INTERVAL_MIN = 15   # كان 30 — مسح كل 15 دقيقة عشان يلحق الفرص أسرع
+MAX_AUTO_SYMBOLS       = 5    # كان 2 — بيشتغل على 5 عملات في نفس الوقت
 
 # ── Conversation states ────────────────────────────────────────────────────────
 WAIT_CAPITAL = 1
