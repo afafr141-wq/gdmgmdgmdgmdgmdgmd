@@ -7,10 +7,10 @@ Scalping Engine v2 — EMA Ribbon + RSI + MACD + ADX + ATR + Supertrend + Volume
 Strategy:
   Entry BUY:
     - EMA8 > EMA13 > EMA21            (bullish ribbon)
-    - 40 <= RSI14 <= 68               (momentum, not overbought)
+    - 35 <= RSI14 <= 72               (momentum, not overbought)
     - MACD line > Signal line          (bullish momentum)
-    - ADX > 20                         (avoid ranging markets)
-    - Volume spike > avg × VOLUME_SPIKE_MULT
+    - ADX > 18                         (avoid ranging markets)
+    - Volume spike > avg × VOLUME_SPIKE_MULT (معلومة فقط، مش شرط إجباري)
     - Supertrend direction = UP        (macro trend filter)
     - ATR > MIN_ATR_PCT of price       (minimum volatility to scalp)
 
@@ -53,15 +53,15 @@ TP_ATR_MULT              = 2.0
 SL_ATR_MULT              = 1.0
 TRAIL_ATR_MULT           = 1.2
 
-VOLUME_SPIKE_MULT        = 1.4
+VOLUME_SPIKE_MULT        = 1.1   # مش شرط إجباري، بس بيُستخدم كمعلومة في الإشعارات
 
 RSI_PERIOD               = 14
-RSI_BUY_LOW              = 40
-RSI_BUY_HIGH             = 68
-RSI_OVERBOUGHT           = 72
+RSI_BUY_LOW              = 35   # كان 40 — تم تخفيفه عشان يجيب صفقات أكتر
+RSI_BUY_HIGH             = 72   # كان 68 — تم توسيعه
+RSI_OVERBOUGHT           = 75   # كان 72
 
 ADX_PERIOD               = 14
-ADX_MIN                  = 20
+ADX_MIN                  = 18   # كان 20 — تم تخفيفه
 
 ATR_PERIOD               = 14
 MIN_ATR_PCT              = 0.002
@@ -306,9 +306,9 @@ def _compute_signals(candles_raw: list) -> dict:
         and RSI_BUY_LOW <= rsi_val <= RSI_BUY_HIGH
         and macd_bullish
         and strong_trend
-        and vol_spike
         and trend_up
         and atr_pct >= MIN_ATR_PCT
+        # vol_spike اتشال من الشروط الإجبارية — بيظهر في الإشعارات كمعلومة بس
     )
     sell_signal = bearish_ribbon or rsi_val > RSI_OVERBOUGHT or trend_down
 
