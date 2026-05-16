@@ -52,6 +52,7 @@ _app_ref: dict = {}
 _capital_usdt: float = DEFAULT_CAPITAL_USDT
 _auto_enabled:  bool = False
 _auto_task: Optional[asyncio.Task] = None
+_paper_mode: bool = True   # True=ورقي | False=حقيقي
 
 
 # ── Init ───────────────────────────────────────────────────────────────────────
@@ -92,6 +93,12 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton("⛔ إيقاف الكل",        callback_data="scalp:stop_all"),
             InlineKeyboardButton("🔄 تحديث القائمة",     callback_data="scalp:refresh_menu"),
         ],
+        [
+            InlineKeyboardButton(
+                "💰 تفعيل الحقيقي 🔓" if _paper_mode else "📄 العودة للورقي 🔒",
+                callback_data="scalp:toggle_paper",
+            ),
+        ],
     ])
 
 
@@ -99,7 +106,7 @@ def _scan_result_kb(top_symbol: str | None) -> InlineKeyboardMarkup:
     rows = []
     if top_symbol:
         rows.append([InlineKeyboardButton(
-            f"🚀 ابدأ ورقي على {top_symbol}",
+            f"🚀 ابدأ {'ورقي' if _paper_mode else 'حقيقي'} على {top_symbol}",
             callback_data=f"scalp:autostart:{top_symbol}",
         )])
     rows += [
@@ -134,6 +141,7 @@ def _menu_text() -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━",
         f"💼 مبلغ الصفقة:    `{_capital_usdt:.2f} USDT`",
         f"🤖 الوضع التلقائي: {auto_txt}",
+        f"🔄 وضع التداول:    {'📄 ورقي' if _paper_mode else '💰 حقيقي ⚡'}",
         f"📊 عملات نشطة:     `{len(active)}`",
     ]
     if active:
@@ -202,7 +210,7 @@ async def _auto_scan_loop() -> None:
         f"🤖 *الوضع التلقائي نشط*\n"
         f"💼 مبلغ الصفقة: `{_capital_usdt:.2f} USDT`\n"
         f"⏱️ مسح كل `{AUTO_SCAN_INTERVAL_MIN}` دقيقة\n"
-        f"📄 وضع ورقي — لا صفقات حقيقية\n"
+        f"{\"📄 وضع ورقي\" if _paper_mode else \"💰 وضع حقيقي ⚡\"}\n"
         f"🔍 جاري أول مسح الآن…"
     )
     while _auto_enabled:
@@ -225,11 +233,12 @@ async def _auto_scan_loop() -> None:
                         _client, symbol,
                         capital_usdt=_capital_usdt,
                         timeframe=DEFAULT_TIMEFRAME,
-                        paper=True,
+                        paper=_paper_mode,
                     )
                     started.append(symbol)
+                    _mode_tag = '📄 ورقي' if _paper_mode else '💰 حقيقي'
                     await _send(
-                        f"🚀 *دخول تلقائي — ورقي*\n"
+                        f"🚀 *دخول تلقائي — {_mode_tag}*\n"
                         f"─────────────────────────\n"
                         f"🪙 `{symbol}` | 💼 `{_capital_usdt:.2f} USDT`\n"
                         f"🤖 `{pick.analysts[0] if pick.analysts else 'AI'}` | ثقة: `{pick.confidence}%`\n"
@@ -499,7 +508,7 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 f"✅ *الوضع التلقائي شُغِّل*\n"
                 f"💼 مبلغ الصفقة: `{_capital_usdt:.2f} USDT`\n"
                 f"⏱️ مسح كل `{AUTO_SCAN_INTERVAL_MIN}` دقيقة\n"
-                f"📄 وضع ورقي دائماً\n"
+                f"{\"📄 وضع ورقي\" if _paper_mode else \"💰 وضع حقيقي ⚡\"}\n"
                 f"🔍 جاري أول مسح الآن…",
                 parse_mode=ParseMode.MARKDOWN,
             )
@@ -556,6 +565,45 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         # يُعالَج بواسطة ConversationHandler — هنا فقط تأكيد
         pass  # ConversationHandler يمسك هذا الـ callback
 
+    # ── تبديل وضع التداول (ورقي ↔ حقيقي) ─────────────────────────────────────
+    elif action == "toggle_paper":
+        global _paper_mode
+        if _paper_mode:
+            await q.message.edit_text(
+                "⚠️ *تحذير — الوضع الحقيقي*\n\n"
+                "سيتم تنفيذ صفقات *حقيقية* بأموال حقيقية.\n"
+                "─────────────────────────\n"
+                "✅ تأكد أن مفاتيح MEXC API نشطة.\n"
+                "✅ تأكد من وجود USDT كافٍ في حسابك.\n"
+                f"✅ رصيد كل صفقة: `{_capital_usdt:.2f} USDT`\n"
+                "─────────────────────────\n"
+                "⚡ هل تريد التحويل للوضع الحقيقي؟",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ نعم، تحويل للحقيقي", callback_data="scalp:confirm_real")],
+                    [InlineKeyboardButton("❌ إلغاء، أبقِ ورقياً",  callback_data="scalp:menu")],
+                ]),
+            )
+        else:
+            _paper_mode = True
+            await q.message.edit_text(
+                "📄 *تم التحويل للوضع الورقي*\n_لا توجد صفقات حقيقية._",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=_main_menu_kb(),
+            )
+
+    # ── تأكيد الوضع الحقيقي ─────────────────────────────────────────────────
+    elif action == "confirm_real":
+        _paper_mode = False
+        await q.message.edit_text(
+            "💰 *تم تفعيل الوضع الحقيقي* ⚡\n\n"
+            "⚠️ الصفقات القادمة *حقيقية* بأموال حقيقية.\n"
+            f"💼 مبلغ الصفقة: `{_capital_usdt:.2f} USDT`\n\n"
+            "_للعودة للورقي: افتح السكالبنج ← اضغط زر الورقي_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_back_kb(),
+        )
+
     # ── دخول تلقائي من نتيجة المسح ─────────────────────────────────────────
     elif action == "autostart":
         symbol = _normalize_symbol(arg + "USDT")
@@ -567,10 +615,11 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 _client, symbol,
                 capital_usdt=_capital_usdt,
                 timeframe=DEFAULT_TIMEFRAME,
-                paper=True,
+                paper=_paper_mode,
             )
+            _mode_lbl = '📄 ورقي' if _paper_mode else '💰 حقيقي'
             await q.message.reply_text(
-                f"✅ *Scalp بدأ — 📄 ورقي*\n"
+                f"✅ *Scalp بدأ — {_mode_lbl}*\n"
                 f"🪙 `{symbol}` | 💼 `{_capital_usdt:.2f} USDT` | ⏱️ `{state.timeframe}`\n"
                 f"📋 ستصلك إشعارات عند كل دخول وخروج.",
                 parse_mode=ParseMode.MARKDOWN,
