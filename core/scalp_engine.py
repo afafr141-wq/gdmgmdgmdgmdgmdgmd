@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 CANDLE_LIMIT             = 100
-POLL_INTERVAL_S          = 15
+POLL_INTERVAL_S          = 10   # كان 15 — فحص أسرع
 
 TP_ATR_MULT              = 2.0
 SL_ATR_MULT              = 1.0
@@ -61,7 +61,7 @@ RSI_BUY_HIGH             = 72   # كان 68 — تم توسيعه
 RSI_OVERBOUGHT           = 75   # كان 72
 
 ADX_PERIOD               = 14
-ADX_MIN                  = 18   # كان 20 — تم تخفيفه
+ADX_MIN                  = 15   # كان 20 — تم تخفيفه أكتر
 
 ATR_PERIOD               = 14
 MIN_ATR_PCT              = 0.002
@@ -295,7 +295,7 @@ def _compute_signals(candles_raw: list) -> dict:
 
     bullish_ribbon = e8 > e13 > e21 and e21 > 0
     bearish_ribbon = e8 < e13
-    macd_bullish   = macd_line[idx] > sig_line[idx] and histogram[idx] > 0
+    macd_bullish   = macd_line[idx] > sig_line[idx]   # اتشال histogram > 0
     trend_up       = st_val == 1
     trend_down     = st_val == -1
     strong_trend   = adx_val >= ADX_MIN
@@ -306,9 +306,9 @@ def _compute_signals(candles_raw: list) -> dict:
         and RSI_BUY_LOW <= rsi_val <= RSI_BUY_HIGH
         and macd_bullish
         and strong_trend
-        and trend_up
         and atr_pct >= MIN_ATR_PCT
-        # vol_spike اتشال من الشروط الإجبارية — بيظهر في الإشعارات كمعلومة بس
+        # trend_up (Supertrend) اتشال — بطيء جداً وبيحجب كتير من الصفقات
+        # vol_spike اتشال — بيظهر في الإشعارات كمعلومة بس
     )
     sell_signal = bearish_ribbon or rsi_val > RSI_OVERBOUGHT or trend_down
 
