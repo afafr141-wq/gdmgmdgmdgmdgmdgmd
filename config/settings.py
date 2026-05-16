@@ -26,7 +26,7 @@ ALLOWED_USER_IDS: set[int] = (
 )
 
 # ── Order management ───────────────────────────────────────────────────────────
-ORDER_SLEEP_SECONDS: float = 0.25   # pause between REST calls to respect rate limits
+ORDER_SLEEP_SECONDS: float = 0.05   # pause between REST calls — reduced from 0.25
 FILL_POLL_INTERVAL: int = 10        # seconds between fill-check cycles
 
 
