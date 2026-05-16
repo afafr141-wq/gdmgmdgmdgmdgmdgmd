@@ -84,7 +84,8 @@ def _kb_main() -> InlineKeyboardMarkup:
          InlineKeyboardButton("📊 إدارة الشبكات",          callback_data="menu:manage")],
         [InlineKeyboardButton("🔄 ترقية الشبكات",          callback_data="settings_upgradeall"),
          InlineKeyboardButton("❓ مساعدة",                  callback_data="help:main")],
-        [InlineKeyboardButton("💼 المحافظ الذكية",          callback_data="portfolio:home")],
+        [InlineKeyboardButton("⚡ سكالبنج",                callback_data="scalp:menu"),
+         InlineKeyboardButton("💼 المحافظ الذكية",          callback_data="portfolio:home")],
     ])
 
 
