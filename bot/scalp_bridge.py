@@ -204,7 +204,6 @@ async def _notify_error(*, symbol, error, **_) -> None:
 # ── Auto-scan loop ─────────────────────────────────────────────────────────────
 
 async def _auto_scan_loop() -> None:
-    global _auto_enabled
     log.info("Auto-scan loop started")
     await _send(
         f"🤖 *الوضع التلقائي نشط*\n"
@@ -424,6 +423,7 @@ async def _conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 # ── Callback handler ───────────────────────────────────────────────────────────
 
 async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global _auto_enabled, _paper_mode
     from bot.telegram_bot import _is_allowed, _deny, _normalize_symbol
     q = update.callback_query
     await q.answer()
@@ -497,7 +497,6 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── تشغيل/إيقاف التلقائي ───────────────────────────────────────────────
     elif action == "toggle_auto":
-        global _auto_enabled
         if _auto_enabled:
             _stop_auto_loop()
             active = engine.active_symbols()
@@ -576,7 +575,6 @@ async def _scalp_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     # ── تبديل وضع التداول (ورقي ↔ حقيقي) ─────────────────────────────────────
     elif action == "toggle_paper":
-        global _paper_mode
         if _paper_mode:
             await q.message.edit_text(
                 "⚠️ *تحذير — الوضع الحقيقي*\n\n"
