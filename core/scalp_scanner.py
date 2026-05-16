@@ -27,10 +27,10 @@ log = logging.getLogger(__name__)
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
-SCAN_COIN_COUNT     = 50
-PROMPT_COIN_LIMIT   = 20
-SCAN_TOP_PICKS      = 5
-SCAN_FINAL_TOP      = 3
+SCAN_COIN_COUNT     = 200
+PROMPT_COIN_LIMIT   = 60
+SCAN_TOP_PICKS      = 15
+SCAN_FINAL_TOP      = 15
 ANALYST_DELAY_S     = 3
 MARKET_CACHE_TTL    = 300   # seconds
 
