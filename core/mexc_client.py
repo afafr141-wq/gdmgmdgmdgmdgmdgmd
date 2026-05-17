@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 MEXC_REST = "https://api.mexc.com"
 
 _TF_MAP = {
-    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "1m": "1m", "3m": "5m", "5m": "5m", "15m": "15m",
     "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d",
 }
 
@@ -88,7 +88,7 @@ class MexcClient:
             resp.raise_for_status()
             return float((await resp.json())["price"])
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = "3m", limit: int = 100) -> list:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = "5m", limit: int = 100) -> list:
         """
         جلب الشموع مباشرة من MEXC REST بدل ccxt — أسرع بـ 3-5×.
         يُرجع: [[ts, open, high, low, close, volume], ...]
