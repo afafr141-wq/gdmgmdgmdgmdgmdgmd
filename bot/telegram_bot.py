@@ -1259,7 +1259,7 @@ async def notify_sell_filled(
         f"💵 السعر:   `{price:,.4f} USDT`\n"
         f"🪙 الكمية:  `{qty:.6f}`\n"
         f"💰 القيمة:  `{value:.2f} USDT`\n"
-        f"{pnl_icon} الربح:    `{_fmt_pnl(pnl):>+} USDT`\n"
+        f"{pnl_icon} الربح:    `{pnl:+.4f} USDT`\n"
         f"🕐 `{_now_str()}`"
     )
 
@@ -1367,10 +1367,10 @@ async def notify_hourly_report(symbol: str, report: dict) -> None:
         f"📊 *تقرير ساعي — {_fmt_symbol(symbol)}*\n"
         f"─────────────────────────\n"
         f"✅ صفقات منفذة:    `{report['sell_count']}`\n"
-        f"💹 ربح الشبكة:     `{_fmt_pnl(report['grid_profit']):>+} USDT`\n"
-        f"📈 غير محقق:       `{_fmt_pnl(report['unrealised_pnl']):>+} USDT`\n"
+        f"💹 ربح الشبكة:     `{float(report['grid_profit'] or 0):+.4f} USDT`\n"
+        f"📈 غير محقق:       `{float(report['unrealised_pnl'] or 0):+.4f} USDT`\n"
         f"─────────────────────────\n"
-        f"{pnl_icon} الإجمالي:       `{_fmt_pnl(report['total_profit']):>+} USDT`\n"
+        f"{pnl_icon} الإجمالي:       `{float(report['total_profit'] or 0):+.4f} USDT`\n"
         f"📊 APY:            `{report['apy']:.2f}%`\n"
         f"🔓 أوامر مفتوحة:  `{report['open_orders']}`"
     )
