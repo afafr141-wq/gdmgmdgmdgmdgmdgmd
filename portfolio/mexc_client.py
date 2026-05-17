@@ -265,17 +265,36 @@ class MEXCClient:
 
         interval: 1m, 5m, 15m, 30m, 1h, 4h, 8h, 1d
         Returns list of dicts with keys: open_time, open, high, low, close, volume.
+        Retries up to 3 times with exponential backoff on HTTP 400/429 errors.
         """
         mexc_interval = self._INTERVAL_MAP.get(interval, interval)
-        raw = self._get("/api/v3/klines", {"symbol": symbol, "interval": mexc_interval, "limit": limit})
-        candles = []
-        for c in raw:
-            candles.append({
-                "open_time": int(c[0]),
-                "open":      float(c[1]),
-                "high":      float(c[2]),
-                "low":       float(c[3]),
-                "close":     float(c[4]),
-                "volume":    float(c[5]),
-            })
-        return candles
+        params = {
+            "symbol":   str(symbol).upper().replace("/", ""),
+            "interval": str(mexc_interval),
+            "limit":    int(limit),
+        }
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                raw = self._get("/api/v3/klines", params)
+                candles = []
+                for c in raw:
+                    candles.append({
+                        "open_time": int(c[0]),
+                        "open":      float(c[1]),
+                        "high":      float(c[2]),
+                        "low":       float(c[3]),
+                        "close":     float(c[4]),
+                        "volume":    float(c[5]),
+                    })
+                return candles
+            except Exception as exc:
+                last_exc = exc
+                import time as _time
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                log.warning(
+                    "get_klines %s %s attempt %d/%d failed: %s — retry in %ds",
+                    symbol, interval, attempt + 1, 3, exc, wait,
+                )
+                _time.sleep(wait)
+        raise last_exc
