@@ -9,7 +9,6 @@ import logging
 from config.settings import LOG_LEVEL, validate_env
 from core.mexc_client import MexcClient
 from core.grid_engine import GridEngine, set_notifiers as grid_set_notifiers
-from bot.scalp_bridge import register_scalp_handlers, init_scalp, set_app as scalp_set_app
 from bot.telegram_bot import (
     build_application,
     send_notification,
@@ -113,7 +112,6 @@ async def _on_shutdown(application) -> None:
     logger.info("Shutdown complete.")
 
 
-
 def main() -> None:
     validate_env()
 
@@ -128,9 +126,6 @@ def main() -> None:
 
     app = build_application(engine, client)
     _notify_ref["app"] = app
-
-    init_scalp(client)
-    scalp_set_app(app)
 
     grid_set_notifiers(
         buy_filled     = notify_buy_filled,
