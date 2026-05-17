@@ -1521,8 +1521,6 @@ def build_application(engine, client) -> Application:
     from bot.portfolio_bridge import register_portfolio_handlers
     register_portfolio_handlers(app)
 
-    from bot.scalp_bridge import register_scalp_handlers
-    register_scalp_handlers(app)
 
     app.add_handler(CallbackQueryHandler(
         handle_callback,
