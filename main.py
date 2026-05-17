@@ -19,6 +19,11 @@ from bot.telegram_bot import (
     notify_error,
     notify_balance_drift,
 )
+from bot.smart_scalp_bridge import (
+    register_smart_scalp_handlers,
+    init_smart_scalp,
+    set_app as smart_scalp_set_app,
+)
 from utils.db_manager import (
     init_db, close_db,
     get_all_active_grids,
@@ -90,7 +95,8 @@ async def _on_startup(application) -> None:
         f"❌ فشلت:   `{failed}`\n"
         f"─────────────────────────\n"
         f"📡 الحالة: {status}\n"
-        f"اكتب /menu للقائمة.",
+        f"اكتب /menu للقائمة الرئيسية.\n"
+        f"اكتب /quick_menu لاستراتيجية SmartScalp.",
         application=application,
     )
     logger.info("Startup complete. Grids=%d", recovered)
@@ -126,6 +132,10 @@ def main() -> None:
 
     app = build_application(engine, client)
     _notify_ref["app"] = app
+
+    init_smart_scalp(client)
+    smart_scalp_set_app(app)
+    register_smart_scalp_handlers(app)
 
     grid_set_notifiers(
         buy_filled     = notify_buy_filled,
